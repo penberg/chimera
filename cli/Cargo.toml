@@ -1,0 +1,17 @@
+[package]
+name = "chimera-cli"
+version = "0.0.1"
+edition = "2024"
+description = "Command-line front end for the Chimera sandbox."
+license = "MIT"
+readme = "../README.md"
+repository = "https://github.com/penberg/chimera"
+homepage = "https://github.com/penberg/chimera"
+
+[[bin]]
+name = "chimera"
+path = "main.rs"
+
+[dependencies]
+chimera-runtime = { path = "../runtime" }
+argh = "0.1.19"
