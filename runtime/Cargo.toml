@@ -1,0 +1,24 @@
+[package]
+name = "chimera-runtime"
+version = "0.0.1"
+edition = "2024"
+description = "Chimera's same-ISA dynamic binary translation runtime."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/penberg/chimera"
+homepage = "https://github.com/penberg/chimera"
+
+[lib]
+name = "chimera"
+path = "lib.rs"
+
+[dependencies]
+libc = "0.2.186"
+thiserror = "2"
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info"] }
+
+[dev-dependencies]
+argh = "0.1.19"
+regex = "1"
