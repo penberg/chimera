@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/penberg/chimera/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/penberg/chimera/ci.yml?branch=main&style=flat-square&logo=github&label=CI"></a>
   <a href="https://www.rust-lang.org"><img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-rust-orange?style=flat-square&logo=rust"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-green?style=flat-square"></a>
 </p>
