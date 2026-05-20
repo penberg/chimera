@@ -120,8 +120,8 @@ pub fn start_thread(rip: u64, rsp: u64, mut handler: Box<dyn SystemCalls>) -> Re
         (*ts_ptr).regs[RSP] = rsp;
         (*ts_ptr).rip = rip;
     }
-    let block_exit = exit_block as usize as u64;
-    let syscall_exit = exit_syscall as usize as u64;
+    let block_exit = exit_block as *const () as usize as u64;
+    let syscall_exit = exit_syscall as *const () as usize as u64;
 
     loop {
         let rip = unsafe { (*ts_ptr).rip };
@@ -138,10 +138,10 @@ pub fn start_thread(rip: u64, rsp: u64, mut handler: Box<dyn SystemCalls>) -> Re
             (*ts_ptr).exit_kind = EXIT_KIND_BLOCK;
             dispatch(ts_ptr, host_pc);
         }
-        if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL {
-            if let Some(code) = handle_syscall(ts_ptr, handler.as_mut()) {
-                return Ok(code);
-            }
+        if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL
+            && let Some(code) = handle_syscall(ts_ptr, handler.as_mut())
+        {
+            return Ok(code);
         }
     }
 }

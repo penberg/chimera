@@ -40,6 +40,7 @@ impl SystemCall {
         self.return_value
     }
 
+    #[allow(dead_code)] // Read only by the Darwin/arm64 dispatcher.
     pub(crate) fn is_error(&self) -> bool {
         self.is_error
     }

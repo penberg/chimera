@@ -307,7 +307,7 @@ mod linux {
     }
 
     fn format_ret(name: &str, ret: i64) -> String {
-        if ret < 0 && ret >= -4095 {
+        if (-4095..0).contains(&ret) {
             let errno = -ret as i32;
             return format!("-1 {} ({})", errno_name(errno), errno_text(errno));
         }
