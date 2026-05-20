@@ -60,17 +60,20 @@ impl SystemCalls for Tracer {
     }
 }
 
-fn main() {
-    let mut sandbox = Sandbox::new("/bin/echo").unwrap();
+fn main() -> Result<(), chimera::Error> {
+    let mut sandbox = Sandbox::new("/bin/echo")?;
     sandbox.args(["hello"]).system_calls(Tracer);
-    sandbox.run().unwrap();
+    sandbox.run()?;
+    Ok(())
 }
 ```
 
 Worked examples live under [`runtime/examples/`](runtime/examples):
-[`sandbox`](runtime/examples/sandbox/README.md) is an allowlist-based
-system-call sandbox, and [`strace`](runtime/examples/strace/README.md)
-reimplements `strace(1)` on top of the same trait.
+
+- [`sandbox`](runtime/examples/sandbox/README.md) — an allowlist-based
+  system-call sandbox.
+- [`strace`](runtime/examples/strace/README.md) — reimplements
+  `strace(1)` on top of the same trait.
 
 ## Design
 
