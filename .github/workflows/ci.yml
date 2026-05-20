@@ -33,7 +33,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: build
-        run: cargo build --workspace --locked
+        run: cargo build --workspace --all-targets --locked
 
       - name: test
         run: cargo test --workspace --locked
