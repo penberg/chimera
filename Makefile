@@ -1,4 +1,5 @@
-RUNNER ?= $(CURDIR)/target/debug/chimera run
+CARGO_TARGET_DIR := $(shell $(CURDIR)/scripts/cargo-target-dir)
+RUNNER ?= $(CARGO_TARGET_DIR)/debug/chimera run
 
 build:
 	cargo build --quiet
