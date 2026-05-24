@@ -38,14 +38,14 @@ dispatch:
     mov eax, 0xe7
     xor edx, edx
     xrstor64 [rdi + {TS_FPSTATE}]
-    // Load guest GPRs from *ctx (rdi). rdi itself is loaded last because we
-    // still need it as the base register.
+    // Load guest GPRs from *ctx (rdi). rdi and rsp are loaded last: rdi is
+    // still needed as the base register, and rsp must stay on Chimera's stack
+    // until after the rflags restore below.
     mov rbx, [rdi + {TS_RBX}]
     mov rcx, [rdi + {TS_RCX}]
     mov rdx, [rdi + {TS_RDX}]
     mov rsi, [rdi + {TS_RSI}]
     mov rbp, [rdi + {TS_RBP}]
-    mov rsp, [rdi + {TS_RSP}]   // switch to the guest stack
     mov r8,  [rdi + {TS_R8}]
     mov r9,  [rdi + {TS_R9}]
     mov r10, [rdi + {TS_R10}]
@@ -54,10 +54,15 @@ dispatch:
     mov r13, [rdi + {TS_R13}]
     mov r14, [rdi + {TS_R14}]
     mov r15, [rdi + {TS_R15}]
-    // rflags: push then popfq uses the guest stack briefly.
+    // Restore rflags via push/popfq while rsp is still Chimera's stack. Doing
+    // this after switching to the guest stack would write [guest_rsp-8] and
+    // clobber the guest's red zone (the 128 bytes below rsp the System V ABI
+    // reserves for leaf functions).
     push qword ptr [rdi + {TS_RFLAGS}]
     popfq
-    // rax and rdi loaded last.
+    // Now switch to the guest stack and load the last registers. None of these
+    // touch flags, so the rflags just restored survive to the jump.
+    mov rsp, [rdi + {TS_RSP}]
     mov rax, [rdi + {TS_RAX}]
     mov rdi, [rdi + {TS_RDI}]
     // Jump to host_pc, which we stashed in TS_HOST_PC.
@@ -88,8 +93,12 @@ exit_block:
     mov gs:[{TS_R13}], r13
     mov gs:[{TS_R14}], r14
     mov gs:[{TS_R15}], r15
-    // Capture the guest's rflags before the XSAVE mask setup below: `xor
-    // edx, edx` clobbers flags, so this must happen first.
+    // Switch to Chimera's stack before capturing rflags: a pushfq on the guest
+    // stack would write [guest_rsp-8] and clobber the guest's red zone. The
+    // guest rsp is already saved in TS_RSP, and the moves above leave flags
+    // (still the guest's) untouched. Capturing rflags must also precede the
+    // XSAVE mask setup, whose `xor edx, edx` clobbers flags.
+    mov rsp, gs:[{TS_CHIMERA_RSP}]
     pushfq
     pop rax
     mov gs:[{TS_RFLAGS}], rax
@@ -102,7 +111,6 @@ exit_block:
     // Restore Chimera's FS base so Rust TLS works again.
     mov rax, gs:[{TS_CHIMERA_FS}]
     wrfsbase rax
-    mov rsp, gs:[{TS_CHIMERA_RSP}]
     pop r15
     pop r14
     pop r13

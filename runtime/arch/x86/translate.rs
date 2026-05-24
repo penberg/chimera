@@ -336,36 +336,41 @@ fn extract_memory_operand(t: &Instruction) -> MemoryOperand {
     )
 }
 
-/// For a conditional branch, materialize `taken` into `rbx` and `fallthrough`
-/// into `rax`, then `cmovcc rax, rbx` to pick the right one based on the
-/// guest's flags. The flags are preserved up to the `cmov` because every
-/// instruction we emit before it (`mov` to memory, `movabs reg, imm64`)
-/// leaves flags untouched.
+/// For a conditional branch, select between `taken` and `fallthrough` with a
+/// `cmov`, without ever touching the guest stack. A `push`/`pop` here would
+/// write `[rsp-8]` and clobber the guest's red zone — the 128 bytes below
+/// `rsp` that the System V ABI reserves for a leaf function's own use.
+///
+/// Instead, `taken` is stashed in the context's rbx slot (`gs:[8]`) and the
+/// `cmov` reads it straight from memory. The guest's rbx *register* is never
+/// touched, so it stays live; `exit_block` then saves that live rbx over the
+/// slot on the way out, overwriting the scratch value. The flags set by the
+/// block's compare survive up to the `cmov` because every instruction emitted
+/// here (`mov` to memory, `movabs reg, imm64`) leaves flags untouched.
 fn emit_cond_select(
     instrs: &mut Vec<Instruction>,
     jcc_code: Code,
     taken: u64,
     fallthrough: u64,
 ) -> Result<(), Error> {
-    // Use rbx as scratch around a cmov. The original rbx is preserved by
-    // push/pop on the guest stack — saving it to a `gs:[]` slot would conflict
-    // with `exit_trampoline`, which itself writes the *current* rbx into
-    // `gs:[8]` and would lose the original.
+    // gs:[8] is the rbx slot; see the `gs_qword(0)` rax slot in `emit_save_rax`.
+    const RBX_SLOT: i64 = 8;
     let cmov = jcc_to_cmov(jcc_code)?;
     emit_save_rax(instrs)?;
-    instrs.push(mkinstr(Instruction::with1(Code::Push_r64, Register::RBX))?);
-    emit_load_rax_imm(instrs, fallthrough)?;
+    // gs:[rbx] <- taken, staged through rax (there is no `mov m64, imm64`).
+    emit_load_rax_imm(instrs, taken)?;
     instrs.push(mkinstr(Instruction::with2(
-        Code::Mov_r64_imm64,
-        Register::RBX,
-        taken,
+        Code::Mov_rm64_r64,
+        gs_qword(RBX_SLOT),
+        Register::RAX,
     ))?);
+    // rax <- fallthrough, then pull in `taken` from gs:[rbx] if the condition holds.
+    emit_load_rax_imm(instrs, fallthrough)?;
     instrs.push(mkinstr(Instruction::with2(
         cmov,
         Register::RAX,
-        Register::RBX,
+        gs_qword(RBX_SLOT),
     ))?);
-    instrs.push(mkinstr(Instruction::with1(Code::Pop_r64, Register::RBX))?);
     Ok(())
 }
 
