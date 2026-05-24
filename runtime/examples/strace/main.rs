@@ -18,6 +18,14 @@
 //! and Mach traps) is intentionally smaller — it prints names and raw
 //! args, leaving full decoding for later.
 
+use mimalloc::MiMalloc;
+
+/// Route this embedder's allocations through mimalloc's `mmap`-backed
+/// segments, keeping Chimera's heap off the guest libc's shared `brk`.
+/// A `#[global_allocator]` is per-binary, so every embedder needs its own.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn main() -> std::process::ExitCode {
     eprintln!("strace example only supports Linux and macOS hosts");
