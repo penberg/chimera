@@ -15,6 +15,11 @@ use crate::Error;
 const CACHE_SIZE: usize = 16 * 1024 * 1024;
 const MAX_BLOCK_GUEST_BYTES: usize = 4096;
 
+/// `gs:[]` displacement of the guest's rbx slot (`regs[1]`). Terminators that
+/// need a scratch memory slot borrow it: `exit_block` re-saves the live rbx
+/// over the slot on the way out, so the guest's rbx register is preserved.
+const RBX_SLOT: i64 = 8;
+
 /// A bump-allocated RWX region into which `translate()` emits blocks.
 pub struct CodeCache {
     base: *mut u8,
@@ -218,18 +223,25 @@ fn emit_terminator(
             emit_load_rax_from_op0(instrs, t)?;
         }
         FlowControl::IndirectCall => {
-            // Reading the operand can use rax (if op0 is rax) or other regs.
-            // Push the return address first; then load the target.
+            // Read the target with the *original* rsp, before pushing the
+            // return address: hardware computes `CALL m`'s target, then
+            // pushes. Pushing first would evaluate an rsp-relative operand
+            // (e.g. `call [rsp+0x58]`) against the post-push rsp, reading 8
+            // bytes off. rax still holds the guest's rax at this point, so an
+            // operand that uses rax (e.g. `call [rax+8]`) also reads correctly.
             emit_save_rax(instrs)?;
+            emit_load_rax_from_op0(instrs, t)?;
+            // Stash the target in the rbx slot, push the return address, then
+            // reload the target. The rbx register is untouched, so the guest's
+            // rbx survives via exit_block's save.
+            instrs.push(mkinstr(Instruction::with2(
+                Code::Mov_rm64_r64,
+                gs_qword(RBX_SLOT),
+                Register::RAX,
+            ))?);
             emit_load_rax_imm(instrs, next_ip)?;
             emit_push_rax(instrs)?;
-            // op0 might refer to rax, but we've already saved it to gs:[0]
-            // and clobbered the live rax. Reload from gs:[0] before reading
-            // op0 if it uses rax.
-            if op0_reads_rax(t) {
-                emit_load_rax_from_gs(instrs, 0)?;
-            }
-            emit_load_rax_from_op0(instrs, t)?;
+            emit_load_rax_from_gs(instrs, RBX_SLOT)?;
         }
         FlowControl::Return => {
             emit_save_rax(instrs)?;
@@ -316,14 +328,6 @@ fn emit_load_rax_from_op0(instrs: &mut Vec<Instruction>, t: &Instruction) -> Res
     Ok(())
 }
 
-fn op0_reads_rax(t: &Instruction) -> bool {
-    match t.op0_kind() {
-        OpKind::Register => t.op0_register() == Register::RAX,
-        OpKind::Memory => t.memory_base() == Register::RAX || t.memory_index() == Register::RAX,
-        _ => false,
-    }
-}
-
 fn extract_memory_operand(t: &Instruction) -> MemoryOperand {
     MemoryOperand::new(
         t.memory_base(),
@@ -353,8 +357,6 @@ fn emit_cond_select(
     taken: u64,
     fallthrough: u64,
 ) -> Result<(), Error> {
-    // gs:[8] is the rbx slot; see the `gs_qword(0)` rax slot in `emit_save_rax`.
-    const RBX_SLOT: i64 = 8;
     let cmov = jcc_to_cmov(jcc_code)?;
     emit_save_rax(instrs)?;
     // gs:[rbx] <- taken, staged through rax (there is no `mov m64, imm64`).
