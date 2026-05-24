@@ -112,9 +112,27 @@ mod host {
     /// kernel would terminate Chimera itself, so they no-op and return 0. The
     /// runtime captures the requested exit code from the syscall's first
     /// argument and ends the run cleanly after the handler returns.
+    ///
+    /// `execve` and `execveat` are intercepted and refused with `-EPERM`.
+    /// Forwarding either to the host kernel would replace the whole process
+    /// image — Chimera's runtime, code cache, and translation map included —
+    /// with an untranslated program that then runs natively, outside the
+    /// sandbox entirely. That is a sandbox escape, not a feature, so the
+    /// stop-gap is to deny it and log the attempt. (A real implementation
+    /// would re-enter Chimera on the new image; see `ARCHITECTURE.md`.)
     pub fn host_syscall(call: &SystemCall) -> i64 {
         if call.number == libc::SYS_exit_group as u64 || call.number == libc::SYS_exit as u64 {
             return 0;
+        }
+
+        if call.number == libc::SYS_execve as u64 || call.number == libc::SYS_execveat as u64 {
+            let name = if call.number == libc::SYS_execve as u64 {
+                "execve"
+            } else {
+                "execveat"
+            };
+            eprintln!("chimera: blocked {name} (would escape the sandbox); returning EPERM");
+            return -(libc::EPERM as i64);
         }
 
         if call.number == libc::SYS_arch_prctl as u64 {
