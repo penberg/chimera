@@ -30,8 +30,14 @@ dispatch:
     // Install the guest's FS base. rax is free at this point.
     mov rax, [rdi + {TS_GUEST_FS}]
     wrfsbase rax
-    // Restore guest FP/SIMD state from ts.fpstate. rdi still holds ctx.
-    fxrstor64 [rdi + {TS_FPSTATE}]
+    // Restore guest extended FP/SIMD state from ts.fpstate via XRSTOR. FXRSTOR
+    // would touch only x87+SSE and leave the upper 128 bits of every YMM (and
+    // all ZMM/opmask) register untouched. EDX:EAX is the state-component mask
+    // (0xe7 = x87|SSE|AVX|opmask|ZMM_Hi256|Hi16_ZMM), intersected with XCR0 by
+    // the CPU. rdi still holds ctx; eax/edx are reloaded from ctx further down.
+    mov eax, 0xe7
+    xor edx, edx
+    xrstor64 [rdi + {TS_FPSTATE}]
     // Load guest GPRs from *ctx (rdi). rdi itself is loaded last because we
     // still need it as the base register.
     mov rbx, [rdi + {TS_RBX}]
@@ -82,10 +88,17 @@ exit_block:
     mov gs:[{TS_R13}], r13
     mov gs:[{TS_R14}], r14
     mov gs:[{TS_R15}], r15
-    fxsave64 gs:[{TS_FPSTATE}]
+    // Capture the guest's rflags before the XSAVE mask setup below: `xor
+    // edx, edx` clobbers flags, so this must happen first.
     pushfq
     pop rax
     mov gs:[{TS_RFLAGS}], rax
+    // Save guest extended FP/SIMD state via XSAVE (see dispatch for why and
+    // for the 0xe7 component mask). rax holds no live guest value here (the
+    // exit stub already stashed guest rax in gs:[TS_RAX]) and rdx is saved.
+    mov eax, 0xe7
+    xor edx, edx
+    xsave64 gs:[{TS_FPSTATE}]
     // Restore Chimera's FS base so Rust TLS works again.
     mov rax, gs:[{TS_CHIMERA_FS}]
     wrfsbase rax
@@ -126,7 +139,13 @@ exit_syscall:
     mov gs:[{TS_R13}], r13
     mov gs:[{TS_R14}], r14
     mov gs:[{TS_R15}], r15
-    fxsave64 gs:[{TS_FPSTATE}]
+    // Save guest extended FP/SIMD state via XSAVE (see dispatch for the 0xe7
+    // component mask). rax is free (the exit stub stashed guest rax) and rdx
+    // is already saved; both are clobbered by the mask setup. No flags are
+    // captured here, so the flag-clobbering `xor` is harmless.
+    mov eax, 0xe7
+    xor edx, edx
+    xsave64 gs:[{TS_FPSTATE}]
     // TS_RFLAGS materialized by the per-block stub.
     mov qword ptr gs:[{TS_EXIT_KIND}], {EXIT_KIND_SYSCALL}
     // Restore Chimera's FS base.
