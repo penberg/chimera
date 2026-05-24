@@ -15,3 +15,4 @@ path = "main.rs"
 [dependencies]
 chimera-runtime = { path = "../runtime" }
 argh = "0.1.19"
+mimalloc = "0.1.52"

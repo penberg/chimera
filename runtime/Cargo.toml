@@ -21,4 +21,5 @@ iced-x86 = { version = "1.21", default-features = false, features = ["std", "dec
 
 [dev-dependencies]
 argh = "0.1.19"
+mimalloc = "0.1.52"
 regex = "1"

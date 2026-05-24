@@ -7,8 +7,16 @@ use std::{
 };
 
 use chimera::Sandbox;
+use mimalloc::MiMalloc;
 
 use opts::{Command, Opts, RunCmd};
+
+/// Route every Chimera-side allocation through mimalloc, whose segments are
+/// `mmap`-backed and never touch `brk`. This keeps Chimera's heap clear of the
+/// guest libc's `brk`-managed `main_arena`, which shares the one process-wide
+/// program break.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() -> ExitCode {
     let opts: Opts = argh::from_env();
