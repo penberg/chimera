@@ -23,7 +23,8 @@ pub fn execv(
 
     let rsp = build_stack(program, args, envs, &main, interp_base)?;
 
-    dispatch::start_thread(rip, rsp, handler)
+    let mut thread = dispatch::Thread::new(rip, rsp)?;
+    thread.run(handler)
 }
 
 unsafe fn push_bytes(p: &mut u64, b: &[u8]) -> u64 {

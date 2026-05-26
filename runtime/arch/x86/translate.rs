@@ -63,6 +63,17 @@ impl CodeCache {
         self.used += bytes.len();
         Ok(())
     }
+
+    pub fn reset(&mut self) {
+        self.used = 0;
+    }
+}
+
+impl Drop for CodeCache {
+    fn drop(&mut self) {
+        let ret = unsafe { libc::munmap(self.base.cast(), self.size) };
+        debug_assert_eq!(ret, 0, "code cache munmap failed");
+    }
 }
 
 /// `gs:[disp]` with a 32-bit displacement, qword-sized.

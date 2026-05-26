@@ -4,10 +4,10 @@
 //! point at it via `arch_prctl`, so translated code can reach any field with a
 //! plain `gs:[disp]` access — no reserved GPR required.
 //!
-//! [`start_thread`] is the loop: translate the next block if it isn't already cached,
-//! enter the cache through [`dispatch`], handle whatever caused the cache to
-//! exit (a block boundary or a syscall), and repeat until the guest issues
-//! `exit_group` or `exit`. The boundary-crossing assembly lives in
+//! [`Thread::run`] is the loop: translate the next block if it isn't already
+//! cached, enter the cache through [`dispatch`], handle whatever caused the
+//! cache to exit (a block boundary or a syscall), and repeat until the guest
+//! issues `exit_group` or `exit`. The boundary-crossing assembly lives in
 //! [`super::trampoline`].
 
 use std::{arch::asm, collections::HashMap};
@@ -31,6 +31,87 @@ pub const EXIT_KIND_SYSCALL: u64 = 1;
 /// trampoline saves/restores with the `0xe7` component mask, which never
 /// selects AMX, so the area size is bounded regardless of the host's XCR0.
 const XSAVE_AREA_SIZE: usize = 4096;
+
+/// The `Thread` struct represents a guest thread: the register state and the
+/// address space it runs in. The purpose of this struct is similar to the
+/// `task_struct` in the Linux kernel.
+pub struct Thread {
+    state: Box<ThreadState>,
+    addr_space: AddressSpace,
+}
+
+impl Thread {
+    /// Create a new guest thread.
+    pub fn new(rip: u64, rsp: u64) -> Result<Self, Error> {
+        let mut thread = Self {
+            state: Box::new(ThreadState {
+                regs: [0; 16],
+                rip: 0,
+                rflags: 0,
+                chimera_rsp: 0,
+                host_pc_target: 0,
+                exit_kind: 0,
+                guest_fs_base: 0,
+                chimera_fs_base: 0,
+                _align_fpstate: [0; 1],
+                fpstate: [0; XSAVE_AREA_SIZE],
+            }),
+            addr_space: AddressSpace::new()?,
+        };
+        thread.reset(rip, rsp);
+        Ok(thread)
+    }
+
+    /// Reset the thread to a new entry point and a stack.
+    pub fn reset(&mut self, rip: u64, rsp: u64) {
+        self.addr_space.reset();
+        self.state.reset(rip, rsp);
+    }
+
+    /// Run the guest using the thread's current entry state. Returns the
+    /// guest's exit code when it issues `exit_group` or `exit`; the syscall
+    /// itself is not forwarded to the host kernel (that would terminate
+    /// Chimera). The handler still observes the call before the run ends.
+    pub fn run(&mut self, mut handler: Box<dyn SystemCalls>) -> Result<i32, Error> {
+        self.setup_gs()?;
+        self.state.setup_fs();
+
+        let ts_ptr: *mut ThreadState = &mut *self.state;
+        let block_exit = exit_block as *const () as usize as u64;
+        let syscall_exit = exit_syscall as *const () as usize as u64;
+
+        loop {
+            let rip = unsafe { (*ts_ptr).rip };
+            let host_pc = match self.addr_space.map.get(&rip) {
+                Some(&hpc) => hpc,
+                None => {
+                    let hpc = translate(&mut self.addr_space.cache, rip, block_exit, syscall_exit)
+                        .unwrap_or_else(|e| panic!("translate failed at {:#x}: {}", rip, e));
+                    self.addr_space.map.insert(rip, hpc);
+                    hpc
+                }
+            };
+            unsafe {
+                (*ts_ptr).exit_kind = EXIT_KIND_BLOCK;
+                dispatch(ts_ptr, host_pc);
+            }
+            if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL
+                && let Some(code) = handle_syscall(ts_ptr, handler.as_mut())
+            {
+                return Ok(code);
+            }
+        }
+    }
+
+    fn setup_gs(&self) -> Result<(), Error> {
+        let state_addr = &*self.state as *const ThreadState as usize;
+        let ret = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_GS, state_addr) };
+        if ret != 0 {
+            return Err(Error::last_os_error("arch_prctl(ARCH_SET_GS)"));
+        }
+        Ok(())
+    }
+}
 
 /// Guest register file plus a few bookkeeping slots. The exact byte layout is
 /// load-bearing: the offsets are consumed by `trampoline.S` (via `offset_of!`
@@ -59,9 +140,9 @@ pub struct ThreadState {
     /// from the FS MSR on every exit. Updated by `host_syscall` when it
     /// intercepts `arch_prctl(ARCH_SET_FS, ...)`.
     pub guest_fs_base: u64,
-    /// Chimera's FS base, captured once at the start of [`start_thread`]. Restored on
-    /// every exit so the runtime's own TLS works after the guest has
-    /// changed FS.
+    /// Chimera's FS base, captured on the host thread immediately before
+    /// guest execution starts. Restored on every exit so the runtime's own
+    /// TLS works after the guest has changed FS.
     pub chimera_fs_base: u64,
     /// Padding so `fpstate` lands at offset 192 (a 64-byte boundary).
     _align_fpstate: [u64; 1],
@@ -79,20 +160,46 @@ const _: () = assert!(
     "ThreadState::fpstate must be 64-byte aligned for XSAVE/XRSTOR"
 );
 
-impl Default for ThreadState {
-    fn default() -> Self {
-        Self {
-            regs: [0; 16],
-            rip: 0,
-            rflags: 0,
-            chimera_rsp: 0,
-            host_pc_target: 0,
-            exit_kind: 0,
-            guest_fs_base: 0,
-            chimera_fs_base: 0,
-            _align_fpstate: [0; 1],
-            fpstate: [0; XSAVE_AREA_SIZE],
+impl ThreadState {
+    fn reset(&mut self, rip: u64, rsp: u64) {
+        self.regs = [0; 16];
+        self.rip = 0;
+        self.rflags = 0;
+        self.chimera_rsp = 0;
+        self.host_pc_target = 0;
+        self.exit_kind = 0;
+        self.guest_fs_base = 0;
+        self.chimera_fs_base = 0;
+        self._align_fpstate = [0; 1];
+        self.fpstate.fill(0);
+
+        // XRSTOR loads MXCSR from the legacy region (bytes 24..28) of the save
+        // area on every entry, regardless of XSTATE_BV. A zeroed area would load
+        // MXCSR = 0, which unmasks every SSE floating-point exception and turns
+        // ordinary float math into a SIGFPE. Seed it with the ABI default
+        // 0x1f80 (all exceptions masked) — the value the Linux kernel gives a
+        // fresh process — for the first entry. After that the guest's own MXCSR
+        // round-trips through XSAVE/XRSTOR. The x87 control word and all vector
+        // registers initialize correctly from the zeroed XSTATE_BV.
+        self.fpstate[24..28].copy_from_slice(&0x0000_1f80u32.to_le_bytes());
+        self.regs[RSP] = rsp;
+        self.rip = rip;
+    }
+
+    fn setup_fs(&mut self) {
+        // Capture the executing host thread's FS base immediately before the
+        // guest starts. A fresh guest inherits that value until it issues its
+        // own `arch_prctl(ARCH_SET_FS, ...)`.
+        let chimera_fs: u64;
+        unsafe {
+            asm!(
+                "rdfsbase {0}",
+                out(reg) chimera_fs,
+                options(nomem, nostack, preserves_flags),
+            );
         }
+        self.chimera_fs_base = chimera_fs;
+        self.guest_fs_base = chimera_fs;
     }
 }
 
@@ -120,86 +227,10 @@ impl AddressSpace {
             map: HashMap::new(),
         })
     }
-}
 
-/// Run the guest, starting with `rsp` and `rip` as given. Returns the guest's
-/// exit code when it issues `exit_group` or `exit`; the syscall itself is not
-/// forwarded to the host kernel (that would terminate Chimera). The handler
-/// still observes the call before the run ends.
-pub fn start_thread(rip: u64, rsp: u64, mut handler: Box<dyn SystemCalls>) -> Result<i32, Error> {
-    // The trampolines save and restore guest extended FP/SIMD state with
-    // XSAVE/XRSTOR, which the OS must have enabled in user mode (CR4.OSXSAVE,
-    // reported by CPUID.1:ECX bit 27). Every x86-64 host with AVX qualifies;
-    // fail cleanly on the rare one that does not rather than #UD inside the
-    // trampoline.
-    if std::arch::x86_64::__cpuid(1).ecx & (1 << 27) == 0 {
-        return Err(Error::Unsupported(
-            "host CPU lacks OSXSAVE; XSAVE-based FP/SIMD context switching unavailable".into(),
-        ));
-    }
-
-    let mut addr_space = AddressSpace::new()?;
-    let mut ts = Box::new(ThreadState::default());
-
-    // XRSTOR loads MXCSR from the legacy region (bytes 24..28) of the save
-    // area on every entry, regardless of XSTATE_BV. A zeroed area would load
-    // MXCSR = 0, which unmasks every SSE floating-point exception and turns
-    // ordinary float math into a SIGFPE. Seed it with the ABI default
-    // 0x1f80 (all exceptions masked) — the value the Linux kernel gives a
-    // fresh process — for the first entry. After that the guest's own MXCSR
-    // round-trips through XSAVE/XRSTOR. The x87 control word and all vector
-    // registers initialize correctly from the zeroed XSTATE_BV.
-    ts.fpstate[24..28].copy_from_slice(&0x0000_1f80u32.to_le_bytes());
-
-    // Install the ThreadState pointer as this thread's GS base.
-    let ts_addr = &*ts as *const ThreadState as usize;
-    let ret = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_GS, ts_addr) };
-    if ret != 0 {
-        return Err(Error::last_os_error("arch_prctl(ARCH_SET_GS)"));
-    }
-
-    // Capture Chimera's FS base. The trampolines restore it on every exit,
-    // and a fresh guest starts with the same value (until its first
-    // `arch_prctl(ARCH_SET_FS, ...)`, which `host_syscall` intercepts).
-    let chimera_fs: u64;
-    unsafe {
-        asm!(
-            "rdfsbase {0}",
-            out(reg) chimera_fs,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    ts.chimera_fs_base = chimera_fs;
-    ts.guest_fs_base = chimera_fs;
-
-    let ts_ptr: *mut ThreadState = &mut *ts as *mut ThreadState;
-    unsafe {
-        (*ts_ptr).regs[RSP] = rsp;
-        (*ts_ptr).rip = rip;
-    }
-    let block_exit = exit_block as *const () as usize as u64;
-    let syscall_exit = exit_syscall as *const () as usize as u64;
-
-    loop {
-        let rip = unsafe { (*ts_ptr).rip };
-        let host_pc = match addr_space.map.get(&rip) {
-            Some(&hpc) => hpc,
-            None => {
-                let hpc = translate(&mut addr_space.cache, rip, block_exit, syscall_exit)
-                    .unwrap_or_else(|e| panic!("translate failed at {:#x}: {}", rip, e));
-                addr_space.map.insert(rip, hpc);
-                hpc
-            }
-        };
-        unsafe {
-            (*ts_ptr).exit_kind = EXIT_KIND_BLOCK;
-            dispatch(ts_ptr, host_pc);
-        }
-        if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL
-            && let Some(code) = handle_syscall(ts_ptr, handler.as_mut())
-        {
-            return Ok(code);
-        }
+    fn reset(&mut self) {
+        self.cache.reset();
+        self.map.clear();
     }
 }
 
