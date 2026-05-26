@@ -78,18 +78,18 @@ pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
 /// An ELF image read and validated, but not yet mapped. Producing one touches
 /// no memory, so a malformed image is reported as a recoverable error rather
 /// than after the loader has started committing mappings.
-struct ParsedElf {
+pub struct ParsedElf {
     bytes: Vec<u8>,
     ehdr: Ehdr,
     phdrs: Vec<Phdr>,
-    interp: Option<PathBuf>,
+    pub interp: Option<PathBuf>,
     lo: u64,
     hi: u64,
 }
 
 /// Read an ELF image and validate that Chimera can run it, without mapping
 /// anything.
-fn parse_elf(path: &Path) -> Result<ParsedElf, Error> {
+pub fn parse_elf(path: &Path) -> Result<ParsedElf, Error> {
     let bytes = fs::read(path).map_err(|e| Error::io(format!("reading {}", path.display()), e))?;
     if bytes.len() < std::mem::size_of::<Ehdr>() {
         return Err(Error::BadBinary(format!(
@@ -169,7 +169,7 @@ fn parse_elf(path: &Path) -> Result<ParsedElf, Error> {
 
 /// Map a parsed ELF image into memory. The commit phase: the reservation and
 /// `PT_LOAD` mappings it makes cannot be rolled back.
-fn map_elf(parsed: &ParsedElf) -> Result<LoadedElf, Error> {
+pub fn map_elf(parsed: &ParsedElf) -> Result<LoadedElf, Error> {
     let ParsedElf {
         bytes,
         ehdr,

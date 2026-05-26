@@ -180,13 +180,12 @@ mod host {
     /// `running == false` on its next iteration and returns `exit_code`).
     /// Forwarding either to the host kernel would terminate Chimera itself.
     ///
-    /// `execve`/`execveat` are refused with `EPERM`. Forwarding either would
-    /// have the host kernel replace the whole process image — Chimera's
-    /// runtime, code cache, and translation map included — with an
-    /// untranslated program that then runs natively, outside the sandbox
-    /// entirely. The stop-gap is to deny it and log the attempt; a complete
-    /// implementation would re-enter Chimera on the new image (see
-    /// `ARCHITECTURE.md`).
+    /// `execve`/`execveat` are intercepted and never forwarded to the host
+    /// kernel: forwarding either would have the host replace the whole process
+    /// image — Chimera's runtime, code cache, and translation map included —
+    /// with an untranslated program that then runs natively, outside the
+    /// sandbox entirely. Instead the dispatch loop tears down the old image and
+    /// re-enters the translator on the new one (see `crate::sys::linux::exec`).
     ///
     /// `arch_prctl` is virtualized: Chimera owns the real FS base for its own
     /// TLS and reserves GS for the thread-context pointer, so the guest's view
@@ -211,13 +210,14 @@ mod host {
         }
 
         if call.number == libc::SYS_execve as u64 || call.number == libc::SYS_execveat as u64 {
-            let name = if call.number == libc::SYS_execve as u64 {
-                "execve"
-            } else {
-                "execveat"
-            };
-            eprintln!("chimera: blocked {name} (would escape the sandbox); returning EPERM");
-            call.set_result(SyscallResult::Error(libc::EPERM));
+            // Intercepted, never forwarded to the host kernel: forwarding would
+            // have the host replace Chimera's whole process image — runtime,
+            // code cache, and translation map included — with an untranslated
+            // program running natively, outside the sandbox. The dispatch loop
+            // tears down the old image and re-enters the translator on the new
+            // one (see `crate::sys::linux::exec`); report success so observers
+            // see the allowed call.
+            call.set_result(SyscallResult::Ok(0));
             handler.post_syscall(call);
             return;
         }
