@@ -105,6 +105,23 @@ pub const R8: usize = 8;
 pub const R9: usize = 9;
 pub const R10: usize = 10;
 
+/// A guest address space: the cache of translated blocks and the map from
+/// guest PC to the host PC where each block begins. Mirrors the Linux kernel's
+/// `mm_struct`.
+pub struct AddressSpace {
+    cache: CodeCache,
+    map: HashMap<u64, u64>,
+}
+
+impl AddressSpace {
+    pub fn new() -> Result<Self, Error> {
+        Ok(Self {
+            cache: CodeCache::new()?,
+            map: HashMap::new(),
+        })
+    }
+}
+
 /// Run the guest, starting with `rsp` and `rip` as given. Returns the guest's
 /// exit code when it issues `exit_group` or `exit`; the syscall itself is not
 /// forwarded to the host kernel (that would terminate Chimera). The handler
@@ -121,8 +138,7 @@ pub fn start_thread(rip: u64, rsp: u64, mut handler: Box<dyn SystemCalls>) -> Re
         ));
     }
 
-    let mut cache = CodeCache::new()?;
-    let mut map: HashMap<u64, u64> = HashMap::new();
+    let mut addr_space = AddressSpace::new()?;
     let mut ts = Box::new(ThreadState::default());
 
     // XRSTOR loads MXCSR from the legacy region (bytes 24..28) of the save
@@ -166,12 +182,12 @@ pub fn start_thread(rip: u64, rsp: u64, mut handler: Box<dyn SystemCalls>) -> Re
 
     loop {
         let rip = unsafe { (*ts_ptr).rip };
-        let host_pc = match map.get(&rip) {
+        let host_pc = match addr_space.map.get(&rip) {
             Some(&hpc) => hpc,
             None => {
-                let hpc = translate(&mut cache, rip, block_exit, syscall_exit)
+                let hpc = translate(&mut addr_space.cache, rip, block_exit, syscall_exit)
                     .unwrap_or_else(|e| panic!("translate failed at {:#x}: {}", rip, e));
-                map.insert(rip, hpc);
+                addr_space.map.insert(rip, hpc);
                 hpc
             }
         };
