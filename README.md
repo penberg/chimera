@@ -22,7 +22,7 @@ at the shell, and a Rust library for embedding the same runtime in your own
 program. Library users specify a system-call handler that decide what every
 guest syscall does: forward it to the host kernel, log it, or virtualize it.
 
-Chimera currently supports **Darwin/arm64** and **Linux/x86** targets.
+Chimera currently supports **Linux/x86** target with work-in-progress port to **Darwin/arm64**.
 
 ## Command-line tool
 
