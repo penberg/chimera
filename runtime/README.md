@@ -19,8 +19,7 @@ struct Passthrough;
 
 impl SystemCalls for Passthrough {
     fn handle(&mut self, call: &mut SystemCall) {
-        let ret = syscall(call);
-        call.set_return(ret);
+        call.set_result(syscall(call));
     }
 }
 
@@ -29,10 +28,13 @@ sandbox.args(["hello"]).system_calls(Passthrough);
 sandbox.run()?;
 ```
 
-`syscall(call)` issues the syscall on the host kernel;
-`call.set_return(v)` writes `v` into the guest's `rax` on resume. A
-handler is free to do anything in between — log, deny, rewrite
-arguments, fabricate a return value, or skip the kernel entirely.
+`syscall(call)` issues the syscall on the host kernel and returns a
+`SyscallResult` — `Ok(value)` on success, `Error(errno)` on failure.
+`call.set_result(r)` writes `r` back to the guest in the host's
+return-ABI (Linux: `-errno` in `rax`; Darwin: `errno` plus the carry
+flag). A handler is free to do anything in between — log, deny,
+rewrite arguments, fabricate a return value, or skip the kernel
+entirely.
 
 If no handler is installed, the runtime uses a `Passthrough` default
 equivalent to the snippet above.

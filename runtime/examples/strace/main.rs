@@ -43,7 +43,7 @@ mod linux {
 
     use std::{env, fmt::Write, process::ExitCode, ptr};
 
-    use chimera::{Sandbox, SystemCall, SystemCalls, syscall};
+    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls, syscall};
 
     pub fn main() -> ExitCode {
         let mut argv = env::args_os().skip(1);
@@ -86,13 +86,17 @@ mod linux {
                 return;
             }
 
-            let ret = syscall(call);
+            let result = syscall(call);
+            let ret = match result {
+                SyscallResult::Ok(v) => v,
+                SyscallResult::Error(e) => -(e as i64),
+            };
             eprintln!(
                 "{:<40} = {}",
                 format_call(name, call, ret),
-                format_ret(name, ret),
+                format_ret(name, result),
             );
-            call.set_return(ret);
+            call.set_result(result);
         }
     }
 
@@ -314,14 +318,15 @@ mod linux {
         }
     }
 
-    fn format_ret(name: &str, ret: i64) -> String {
-        if (-4095..0).contains(&ret) {
-            let errno = -ret as i32;
-            return format!("-1 {} ({})", errno_name(errno), errno_text(errno));
-        }
-        match name {
-            "mmap" | "brk" => format!("{:#x}", ret as u64),
-            _ => ret.to_string(),
+    fn format_ret(name: &str, result: SyscallResult) -> String {
+        match result {
+            SyscallResult::Error(errno) => {
+                format!("-1 {} ({})", errno_name(errno), errno_text(errno))
+            }
+            SyscallResult::Ok(v) => match name {
+                "mmap" | "brk" => format!("{:#x}", v as u64),
+                _ => v.to_string(),
+            },
         }
     }
 
@@ -757,7 +762,7 @@ mod darwin {
 
     use std::{env, process::ExitCode};
 
-    use chimera::{Sandbox, SystemCall, SystemCalls, syscall_full};
+    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls, syscall};
 
     pub fn main() -> ExitCode {
         let mut argv = env::args_os().skip(1);
@@ -801,15 +806,13 @@ mod darwin {
                 return;
             }
 
-            let result = syscall_full(call);
-            let ret_str = if result.is_error {
-                format!("-1 (errno {})", result.value)
-            } else {
-                format!("{:#x}", result.value)
+            let result = syscall(call);
+            let ret_str = match result {
+                SyscallResult::Error(errno) => format!("-1 (errno {})", errno),
+                SyscallResult::Ok(v) => format!("{:#x}", v),
             };
             eprintln!("{:<48} = {}", line, ret_str);
-            call.set_return(result.value);
-            call.set_error(result.is_error);
+            call.set_result(result);
         }
     }
 

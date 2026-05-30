@@ -39,19 +39,21 @@ impl SystemCalls for Strace {
         let line = format!("{}({})", name, format_args(name, call));
 
         // Forward to the host kernel.
-        let ret = syscall(call);
-        eprintln!("{:<40} = {}", line, format_ret(name, ret));
+        let result = syscall(call);
+        eprintln!("{:<40} = {}", line, format_ret(name, result));
 
-        // Hand the kernel's return value back to the guest.
-        call.set_return(ret);
+        // Hand the kernel's result back to the guest in the host's ABI.
+        call.set_result(result);
     }
 }
 ```
 
-`syscall(call)` issues the syscall on the host. `call.set_return(...)`
-controls the value the guest sees in `rax` on resume. A handler is free to
-do anything in between: log, deny, rewrite arguments, fabricate a return
-value, or skip the kernel entirely.
+`syscall(call)` issues the syscall on the host and returns a
+`SyscallResult` — `Ok(value)` on success, `Error(errno)` on failure.
+`call.set_result(r)` writes `r` back to the guest in the host's
+return-ABI. A handler is free to do anything in between: log, deny,
+rewrite arguments, fabricate a return value, or skip the kernel
+entirely.
 
 The Chimera runtime intercepts `arch_prctl(ARCH_SET_FS, ...)` inside
 `syscall` so the guest's TLS setup doesn't disturb the runtime's

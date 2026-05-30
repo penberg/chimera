@@ -1,6 +1,6 @@
 //! Guest system-call interception: the `SystemCall` value handed to embedder
-//! handlers, the `SystemCalls` trait, the free [`syscall`]
-//! function, and the default [`Passthrough`] handler.
+//! handlers, the `SystemCalls` trait, the free [`syscall`] function, and the
+//! default [`Passthrough`] handler.
 
 /// A single guest system call, presented to a [`SystemCalls`] handler.
 ///
@@ -8,7 +8,8 @@
 /// (`rax` on x86-64, `x16` on Darwin/arm64). `args` contains the six argument
 /// registers in the guest ABI's syscall order. The handler decides what the
 /// call should do — forward it to the host kernel via [`syscall`],
-/// synthesize an answer with [`SystemCall::set_return`], or both.
+/// synthesize an answer with [`SystemCall::set_result`] or
+/// [`SystemCall::set_return`], or both.
 pub struct SystemCall {
     /// The syscall number.
     pub number: u64,
@@ -19,11 +20,40 @@ pub struct SystemCall {
 }
 
 impl SystemCall {
+    /// Write `result` into this `SystemCall` in the host's syscall-return ABI.
+    /// On Linux, `Error(errno)` is encoded as `-errno` in the return slot with
+    /// the error flag clear; on Darwin, it's encoded as positive `errno` with
+    /// the error flag set so the dispatcher can drive the NZCV carry bit. Use
+    /// this in preference to a separate `set_return`/`set_error` pair when the
+    /// handler is forwarding a [`SyscallResult`] verbatim.
+    pub fn set_result(&mut self, result: SyscallResult) {
+        match result {
+            SyscallResult::Ok(value) => {
+                self.set_return(value);
+                self.set_error(false);
+            }
+            SyscallResult::Error(errno) => {
+                #[cfg(target_os = "macos")]
+                {
+                    self.set_return(errno as i64);
+                    self.set_error(true);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    self.set_return(-(errno as i64));
+                    self.set_error(false);
+                }
+            }
+        }
+    }
+
     /// Set the value the guest will see in its return register after this
     /// syscall. On hosts that use a negative-errno convention (Linux), the
     /// caller writes `-errno` here; on hosts that use a separate error flag
     /// (Darwin's NZCV carry bit), the caller pairs this with
-    /// [`SystemCall::set_error`].
+    /// [`SystemCall::set_error`]. Most handlers should use
+    /// [`SystemCall::set_result`] instead, which encodes the host's
+    /// convention for you.
     pub fn set_return(&mut self, value: i64) {
         self.return_value = value;
     }
@@ -72,58 +102,65 @@ pub struct Passthrough;
 
 impl SystemCalls for Passthrough {
     fn handle(&mut self, call: &mut SystemCall) {
-        let HostResult { value, is_error } = syscall_full(call);
-        call.set_return(value);
-        call.set_error(is_error);
+        call.set_result(syscall(call));
     }
 }
 
-/// Result of `syscall_full`: the kernel's return value plus a flag for
-/// hosts (Darwin) that signal errors out-of-band rather than as `-errno`.
-pub struct HostResult {
-    pub value: i64,
-    pub is_error: bool,
+/// The outcome [`syscall`] reports.
+///
+/// `Ok(value)` is what the kernel returned on success; `Error(errno)` carries
+/// the positive errno on failure. The ABI difference between Linux's "errors
+/// are encoded as `-errno` in the return value" and Darwin's "errors are
+/// flagged by the NZCV carry bit and `x0` carries the positive errno" lives
+/// inside [`syscall`] (which produces the right variant) and
+/// [`SystemCall::set_result`] (which writes it back in the host's
+/// convention); handlers see one portable shape either way.
+#[derive(Copy, Clone)]
+pub enum SyscallResult {
+    /// The kernel reported success and produced this value.
+    Ok(i64),
+    /// The kernel reported failure with this errno.
+    Error(i32),
 }
 
 // === Host-specific passthrough implementation ===
 //
-// `syscall` is the bridge from a `SystemCall` to the host kernel. The
-// shape of that bridge depends on both the host ISA (which registers carry
-// which arguments) and the host kernel (which numbers mean what, which
-// syscalls the runtime must intercept rather than forward). It therefore
-// lives in per-host modules selected by `cfg`.
+// `syscall` is the bridge from a `SystemCall` to the host kernel. The shape
+// of that bridge depends on both the host ISA (which registers carry which
+// arguments) and the host kernel (which numbers mean what, which syscalls the
+// runtime must intercept rather than forward). It therefore lives in per-host
+// modules selected by `cfg`.
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod host {
     use std::arch::asm;
 
-    use super::{HostResult, SystemCall};
+    use super::{SyscallResult, SystemCall};
     use crate::sys::linux::syscall::host_syscall;
 
-    /// Forward `call` to the host kernel verbatim and return the kernel's
-    /// result.
+    /// Forward `call` to the host kernel and return the result.
     ///
     /// `arch_prctl` is intercepted: the guest's FS base is virtualized
     /// (Chimera owns the real FS for its own TLS), and GS is reserved for
     /// Chimera. `ARCH_SET_FS` records the requested value into the per-thread
     /// state and returns success without touching the kernel; `ARCH_GET_FS`
-    /// reads it back; `ARCH_SET_GS` and `ARCH_GET_GS` return `-EINVAL`.
+    /// reads it back; `ARCH_SET_GS` and `ARCH_GET_GS` return `EINVAL`.
     ///
     /// `exit` and `exit_group` are intercepted: forwarding them to the host
     /// kernel would terminate Chimera itself, so they no-op and return 0. The
     /// runtime captures the requested exit code from the syscall's first
     /// argument and ends the run cleanly after the handler returns.
     ///
-    /// `execve` and `execveat` are intercepted and refused with `-EPERM`.
+    /// `execve` and `execveat` are intercepted and refused with `EPERM`.
     /// Forwarding either to the host kernel would replace the whole process
     /// image — Chimera's runtime, code cache, and translation map included —
     /// with an untranslated program that then runs natively, outside the
     /// sandbox entirely. That is a sandbox escape, not a feature, so the
     /// stop-gap is to deny it and log the attempt. (A real implementation
     /// would re-enter Chimera on the new image; see `ARCHITECTURE.md`.)
-    pub fn syscall(call: &SystemCall) -> i64 {
+    pub fn syscall(call: &SystemCall) -> SyscallResult {
         if call.number == libc::SYS_exit_group as u64 || call.number == libc::SYS_exit as u64 {
-            return 0;
+            return SyscallResult::Ok(0);
         }
 
         if call.number == libc::SYS_execve as u64 || call.number == libc::SYS_execveat as u64 {
@@ -133,7 +170,7 @@ mod host {
                 "execveat"
             };
             eprintln!("chimera: blocked {name} (would escape the sandbox); returning EPERM");
-            return -(libc::EPERM as i64);
+            return SyscallResult::Error(libc::EPERM);
         }
 
         if call.number == libc::SYS_arch_prctl as u64 {
@@ -153,7 +190,7 @@ mod host {
                             options(nostack, preserves_flags),
                         );
                     }
-                    return 0;
+                    return SyscallResult::Ok(0);
                 }
                 ARCH_GET_FS => {
                     let fs: u64;
@@ -170,24 +207,22 @@ mod host {
                             (call.args[1] as *mut u64).write(fs);
                         }
                     }
-                    return 0;
+                    return SyscallResult::Ok(0);
                 }
-                ARCH_SET_GS | ARCH_GET_GS => {
-                    return -(libc::EINVAL as i64);
-                }
+                ARCH_SET_GS | ARCH_GET_GS => return SyscallResult::Error(libc::EINVAL),
                 _ => {}
             }
         }
 
-        host_syscall(call)
-    }
-
-    pub fn syscall_full(call: &SystemCall) -> HostResult {
-        // Linux signals errors as negative return values; there is no
-        // out-of-band flag, so `is_error` is always false here.
-        HostResult {
-            value: syscall(call),
-            is_error: false,
+        // Linux's kernel signals errors as `-errno` in the return value, in
+        // the closed range `[-4095, -1]`. Anything outside that range is a
+        // successful result (including legitimate "negative-looking" values
+        // like the high user-space addresses `mmap` can hand back).
+        let ret = host_syscall(call);
+        if (-4095..0).contains(&ret) {
+            SyscallResult::Error(-ret as i32)
+        } else {
+            SyscallResult::Ok(ret)
         }
     }
 }
@@ -196,28 +231,21 @@ mod host {
 mod host {
     use std::arch::asm;
 
-    use super::{HostResult, SystemCall};
+    use super::{SyscallResult, SystemCall};
 
-    /// Forward `call` to the host kernel and return its raw value. Darwin
-    /// signals errors via the NZCV carry flag, not as a negative return
-    /// value, so a caller that only consumes the integer cannot distinguish
-    /// success from error; use [`syscall_full`] when that matters.
+    /// Forward `call` to the host kernel and return the result. Darwin's
+    /// kernel signals errors via the NZCV carry flag rather than as a
+    /// negative return value, so the carry bit becomes [`SyscallResult::Error`]
+    /// here and the value field carries the positive errno.
     ///
     /// Darwin's `exit` (BSD syscall #1) is intercepted: forwarding it to
     /// the host kernel would terminate Chimera itself, so it no-ops and
     /// returns 0. The run loop captures the requested exit code from the
     /// syscall's first argument and ends the run cleanly after the handler
     /// returns.
-    pub fn syscall(call: &SystemCall) -> i64 {
-        syscall_full(call).value
-    }
-
-    pub fn syscall_full(call: &SystemCall) -> HostResult {
+    pub fn syscall(call: &SystemCall) -> SyscallResult {
         if call.number == 1 {
-            return HostResult {
-                value: 0,
-                is_error: false,
-            };
+            return SyscallResult::Ok(0);
         }
         // `__abort_with_payload` (BSD #521): if dyld asserts during the
         // bring-up we are still bringing online, forwarding the call would
@@ -227,10 +255,7 @@ mod host {
         // assertion should not fire at all; this is a temporary survival
         // valve while we shake the translator out.)
         if call.number == 521 {
-            return HostResult {
-                value: 0,
-                is_error: false,
-            };
+            return SyscallResult::Ok(0);
         }
         // `thread_set_tsd_base` (syscall #0x80000000 on arm64 Darwin):
         // the guest is trying to install its own value into the kernel's
@@ -242,10 +267,7 @@ mod host {
         // memory layout but the kernel-level TPIDRRO_EL0 stays bound to
         // Chimera. A future revision can virtualize this properly.
         if call.number == 0x80000000 {
-            return HostResult {
-                value: 0,
-                is_error: false,
-            };
+            return SyscallResult::Ok(0);
         }
 
         // Darwin's userspace syscall ABI: number in x16, args in x0..x5,
@@ -268,9 +290,10 @@ mod host {
                 options(nostack, preserves_flags),
             );
         }
-        HostResult {
-            value: ret,
-            is_error: cflag != 0,
+        if cflag != 0 {
+            SyscallResult::Error(ret as i32)
+        } else {
+            SyscallResult::Ok(ret)
         }
     }
 }
@@ -280,20 +303,13 @@ mod host {
     all(target_arch = "aarch64", target_os = "macos"),
 )))]
 mod host {
-    use super::{HostResult, SystemCall};
+    use super::{SyscallResult, SystemCall};
 
-    /// Stub used on hosts Chimera has not been ported to. Calling it
-    /// returns `-ENOSYS`.
-    pub fn syscall(_call: &SystemCall) -> i64 {
-        -(libc::ENOSYS as i64)
-    }
-
-    pub fn syscall_full(call: &SystemCall) -> HostResult {
-        HostResult {
-            value: syscall(call),
-            is_error: true,
-        }
+    /// Stub used on hosts Chimera has not been ported to. Always reports
+    /// `ENOSYS`.
+    pub fn syscall(_call: &SystemCall) -> SyscallResult {
+        SyscallResult::Error(libc::ENOSYS)
     }
 }
 
-pub use host::{syscall, syscall_full};
+pub use host::syscall;

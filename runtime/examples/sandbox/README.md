@@ -36,20 +36,19 @@ impl SystemCalls for Allowlist {
     fn handle(&mut self, call: &mut SystemCall) {
         let name = syscall_name(call.number);
         if self.allowed.iter().any(|r| r.is_match(name)) {
-            let ret = syscall(call);
-            call.set_return(ret);
+            call.set_result(syscall(call));
         } else {
-            call.set_return(-(libc::EPERM as i64));
+            call.set_result(SyscallResult::Error(libc::EPERM));
         }
     }
 }
 ```
 
-`syscall(call)` issues the syscall on the host kernel;
-`call.set_return(v)` writes `v` into the guest's `rax` on resume.
-Negative values in `[-4095, -1]` are interpreted by guest libc as
-errno-encoded errors — `-EPERM` here makes the call look exactly like a
-seccomp-enforced denial.
+`syscall(call)` issues the syscall on the host kernel and returns a
+`SyscallResult` — `Ok(value)` on success, `Error(errno)` on failure.
+`call.set_result(r)` writes `r` back to the guest in the host's
+return-ABI, so `Error(EPERM)` here makes the denial look exactly like
+a seccomp-enforced one.
 
 Unknown syscall numbers serialize as `syscall_<n>` so a user-supplied
 regex can never let one through by accident.

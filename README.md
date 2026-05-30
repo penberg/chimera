@@ -55,8 +55,7 @@ struct Tracer;
 impl SystemCalls for Tracer {
     fn handle(&mut self, call: &mut SystemCall) {
         eprintln!("syscall {}", call.number);
-        let ret = syscall(call);
-        call.set_return(ret);
+        call.set_result(syscall(call));
     }
 }
 
