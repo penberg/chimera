@@ -98,6 +98,7 @@ mod host {
     use std::arch::asm;
 
     use super::{HostResult, SystemCall};
+    use crate::sys::linux::syscall::host_syscall;
 
     /// Forward `call` to the host kernel verbatim and return the kernel's
     /// result.
@@ -178,24 +179,7 @@ mod host {
             }
         }
 
-        let ret: i64;
-        unsafe {
-            asm!(
-                "syscall",
-                in("rax") call.number,
-                in("rdi") call.args[0],
-                in("rsi") call.args[1],
-                in("rdx") call.args[2],
-                in("r10") call.args[3],
-                in("r8")  call.args[4],
-                in("r9")  call.args[5],
-                lateout("rax") ret,
-                lateout("rcx") _,
-                lateout("r11") _,
-                options(nostack, preserves_flags),
-            );
-        }
-        ret
+        host_syscall(call)
     }
 
     pub fn syscall_full(call: &SystemCall) -> HostResult {
