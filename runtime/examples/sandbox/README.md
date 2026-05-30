@@ -36,7 +36,7 @@ impl SystemCalls for Allowlist {
     fn handle(&mut self, call: &mut SystemCall) {
         let name = syscall_name(call.number);
         if self.allowed.iter().any(|r| r.is_match(name)) {
-            let ret = host_syscall(call);
+            let ret = syscall(call);
             call.set_return(ret);
         } else {
             call.set_return(-(libc::EPERM as i64));
@@ -45,7 +45,7 @@ impl SystemCalls for Allowlist {
 }
 ```
 
-`host_syscall(call)` issues the syscall on the host kernel;
+`syscall(call)` issues the syscall on the host kernel;
 `call.set_return(v)` writes `v` into the guest's `rax` on resume.
 Negative values in `[-4095, -1]` are interpreted by guest libc as
 errno-encoded errors — `-EPERM` here makes the call look exactly like a

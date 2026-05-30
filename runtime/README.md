@@ -13,13 +13,13 @@ or modify program behavior without source code or recompilation.
 Construct a `Sandbox`, install a `SystemCalls` handler, and run:
 
 ```rust
-use chimera::{Sandbox, SystemCall, SystemCalls, host_syscall};
+use chimera::{Sandbox, SystemCall, SystemCalls, syscall};
 
 struct Passthrough;
 
 impl SystemCalls for Passthrough {
     fn handle(&mut self, call: &mut SystemCall) {
-        let ret = host_syscall(call);
+        let ret = syscall(call);
         call.set_return(ret);
     }
 }
@@ -29,7 +29,7 @@ sandbox.args(["hello"]).system_calls(Passthrough);
 sandbox.run()?;
 ```
 
-`host_syscall(call)` issues the syscall on the host kernel;
+`syscall(call)` issues the syscall on the host kernel;
 `call.set_return(v)` writes `v` into the guest's `rax` on resume. A
 handler is free to do anything in between — log, deny, rewrite
 arguments, fabricate a return value, or skip the kernel entirely.

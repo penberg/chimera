@@ -10,9 +10,7 @@ mod arch;
 mod sys;
 mod syscall;
 
-pub use syscall::{
-    HostResult, Passthrough, SystemCall, SystemCalls, host_syscall, host_syscall_full,
-};
+pub use syscall::{HostResult, Passthrough, SystemCall, SystemCalls, syscall, syscall_full};
 
 /// A sandboxed guest program, configured but not yet running.
 pub struct Sandbox {

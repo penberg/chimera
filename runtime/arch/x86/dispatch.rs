@@ -137,7 +137,7 @@ pub struct ThreadState {
     /// reset to `BLOCK` before each entry.
     pub exit_kind: u64,
     /// Guest's FS base. Loaded into the FS MSR on every entry, restored
-    /// from the FS MSR on every exit. Updated by `host_syscall` when it
+    /// from the FS MSR on every exit. Updated by `syscall` when it
     /// intercepts `arch_prctl(ARCH_SET_FS, ...)`.
     pub guest_fs_base: u64,
     /// Chimera's FS base, captured on the host thread immediately before

@@ -1,5 +1,5 @@
 //! Guest system-call interception: the `SystemCall` value handed to embedder
-//! handlers, the `SystemCalls` trait, the free [`host_syscall`]
+//! handlers, the `SystemCalls` trait, the free [`syscall`]
 //! function, and the default [`Passthrough`] handler.
 
 /// A single guest system call, presented to a [`SystemCalls`] handler.
@@ -7,7 +7,7 @@
 /// `number` is the syscall number from the guest's syscall-number register
 /// (`rax` on x86-64, `x16` on Darwin/arm64). `args` contains the six argument
 /// registers in the guest ABI's syscall order. The handler decides what the
-/// call should do — forward it to the host kernel via [`host_syscall`],
+/// call should do — forward it to the host kernel via [`syscall`],
 /// synthesize an answer with [`SystemCall::set_return`], or both.
 pub struct SystemCall {
     /// The syscall number.
@@ -72,13 +72,13 @@ pub struct Passthrough;
 
 impl SystemCalls for Passthrough {
     fn handle(&mut self, call: &mut SystemCall) {
-        let HostResult { value, is_error } = host_syscall_full(call);
+        let HostResult { value, is_error } = syscall_full(call);
         call.set_return(value);
         call.set_error(is_error);
     }
 }
 
-/// Result of `host_syscall_full`: the kernel's return value plus a flag for
+/// Result of `syscall_full`: the kernel's return value plus a flag for
 /// hosts (Darwin) that signal errors out-of-band rather than as `-errno`.
 pub struct HostResult {
     pub value: i64,
@@ -87,7 +87,7 @@ pub struct HostResult {
 
 // === Host-specific passthrough implementation ===
 //
-// `host_syscall` is the bridge from a `SystemCall` to the host kernel. The
+// `syscall` is the bridge from a `SystemCall` to the host kernel. The
 // shape of that bridge depends on both the host ISA (which registers carry
 // which arguments) and the host kernel (which numbers mean what, which
 // syscalls the runtime must intercept rather than forward). It therefore
@@ -120,7 +120,7 @@ mod host {
     /// sandbox entirely. That is a sandbox escape, not a feature, so the
     /// stop-gap is to deny it and log the attempt. (A real implementation
     /// would re-enter Chimera on the new image; see `ARCHITECTURE.md`.)
-    pub fn host_syscall(call: &SystemCall) -> i64 {
+    pub fn syscall(call: &SystemCall) -> i64 {
         if call.number == libc::SYS_exit_group as u64 || call.number == libc::SYS_exit as u64 {
             return 0;
         }
@@ -198,11 +198,11 @@ mod host {
         ret
     }
 
-    pub fn host_syscall_full(call: &SystemCall) -> HostResult {
+    pub fn syscall_full(call: &SystemCall) -> HostResult {
         // Linux signals errors as negative return values; there is no
         // out-of-band flag, so `is_error` is always false here.
         HostResult {
-            value: host_syscall(call),
+            value: syscall(call),
             is_error: false,
         }
     }
@@ -217,18 +217,18 @@ mod host {
     /// Forward `call` to the host kernel and return its raw value. Darwin
     /// signals errors via the NZCV carry flag, not as a negative return
     /// value, so a caller that only consumes the integer cannot distinguish
-    /// success from error; use [`host_syscall_full`] when that matters.
+    /// success from error; use [`syscall_full`] when that matters.
     ///
     /// Darwin's `exit` (BSD syscall #1) is intercepted: forwarding it to
     /// the host kernel would terminate Chimera itself, so it no-ops and
     /// returns 0. The run loop captures the requested exit code from the
     /// syscall's first argument and ends the run cleanly after the handler
     /// returns.
-    pub fn host_syscall(call: &SystemCall) -> i64 {
-        host_syscall_full(call).value
+    pub fn syscall(call: &SystemCall) -> i64 {
+        syscall_full(call).value
     }
 
-    pub fn host_syscall_full(call: &SystemCall) -> HostResult {
+    pub fn syscall_full(call: &SystemCall) -> HostResult {
         if call.number == 1 {
             return HostResult {
                 value: 0,
@@ -300,16 +300,16 @@ mod host {
 
     /// Stub used on hosts Chimera has not been ported to. Calling it
     /// returns `-ENOSYS`.
-    pub fn host_syscall(_call: &SystemCall) -> i64 {
+    pub fn syscall(_call: &SystemCall) -> i64 {
         -(libc::ENOSYS as i64)
     }
 
-    pub fn host_syscall_full(call: &SystemCall) -> HostResult {
+    pub fn syscall_full(call: &SystemCall) -> HostResult {
         HostResult {
-            value: host_syscall(call),
+            value: syscall(call),
             is_error: true,
         }
     }
 }
 
-pub use host::{host_syscall, host_syscall_full};
+pub use host::{syscall, syscall_full};

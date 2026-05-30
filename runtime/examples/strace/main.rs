@@ -9,7 +9,7 @@
 //!
 //! The handler implements [`SystemCalls`] with a single
 //! `handle(&mut self, &mut SystemCall)` entry point. The `SystemCall` value
-//! carries the number and argument registers; [`host_syscall`]
+//! carries the number and argument registers; [`syscall`]
 //! forwards to the host kernel and [`SystemCall::set_return`] writes the
 //! result back to the guest.
 //!
@@ -43,7 +43,7 @@ mod linux {
 
     use std::{env, fmt::Write, process::ExitCode, ptr};
 
-    use chimera::{Sandbox, SystemCall, SystemCalls, host_syscall};
+    use chimera::{Sandbox, SystemCall, SystemCalls, syscall};
 
     pub fn main() -> ExitCode {
         let mut argv = env::args_os().skip(1);
@@ -86,7 +86,7 @@ mod linux {
                 return;
             }
 
-            let ret = host_syscall(call);
+            let ret = syscall(call);
             eprintln!(
                 "{:<40} = {}",
                 format_call(name, call, ret),
@@ -757,7 +757,7 @@ mod darwin {
 
     use std::{env, process::ExitCode};
 
-    use chimera::{Sandbox, SystemCall, SystemCalls, host_syscall_full};
+    use chimera::{Sandbox, SystemCall, SystemCalls, syscall_full};
 
     pub fn main() -> ExitCode {
         let mut argv = env::args_os().skip(1);
@@ -801,7 +801,7 @@ mod darwin {
                 return;
             }
 
-            let result = host_syscall_full(call);
+            let result = syscall_full(call);
             let ret_str = if result.is_error {
                 format!("-1 (errno {})", result.value)
             } else {
