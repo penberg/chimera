@@ -33,23 +33,26 @@ denial log tell you what the program asks for next.
 struct Allowlist { allowed: Vec<Regex>, /* ... */ }
 
 impl SystemCalls for Allowlist {
-    fn handle(&mut self, call: &mut SystemCall) {
+    fn do_syscall(&mut self, call: &mut SystemCall) {
         let name = syscall_name(call.number);
         if self.allowed.iter().any(|r| r.is_match(name)) {
-            let ret = host_syscall(call);
-            call.set_return(ret);
+            call.set_result(host_syscall(call));
         } else {
-            call.set_return(-(libc::EPERM as i64));
+            call.set_result(SyscallResult::Error(libc::EPERM));
         }
     }
 }
 ```
 
-`host_syscall(call)` issues the syscall on the host kernel;
-`call.set_return(v)` writes `v` into the guest's `rax` on resume.
-Negative values in `[-4095, -1]` are interpreted by guest libc as
-errno-encoded errors — `-EPERM` here makes the call look exactly like a
-seccomp-enforced denial.
+`host_syscall(call)` issues the syscall on the host kernel and returns a
+`SyscallResult` — `Ok(value)` on success, `Error(errno)` on failure.
+`call.set_result(r)` writes `r` back to the guest in the host's
+return-ABI, so `Error(EPERM)` here makes the denial look exactly like
+a seccomp-enforced one.
+
+Only delegated syscalls reach `do_syscall()`: Chimera-owned syscalls
+like `exit_group` and the virtualized `arch_prctl` cases are handled by
+the runtime before `post_syscall()` observers run.
 
 Unknown syscall numbers serialize as `syscall_<n>` so a user-supplied
 regex can never let one through by accident.

@@ -18,9 +18,8 @@ use chimera::{Sandbox, SystemCall, SystemCalls, host_syscall};
 struct Passthrough;
 
 impl SystemCalls for Passthrough {
-    fn handle(&mut self, call: &mut SystemCall) {
-        let ret = host_syscall(call);
-        call.set_return(ret);
+    fn do_syscall(&mut self, call: &mut SystemCall) {
+        call.set_result(host_syscall(call));
     }
 }
 
@@ -29,10 +28,16 @@ sandbox.args(["hello"]).system_calls(Passthrough);
 sandbox.run()?;
 ```
 
-`host_syscall(call)` issues the syscall on the host kernel;
-`call.set_return(v)` writes `v` into the guest's `rax` on resume. A
-handler is free to do anything in between — log, deny, rewrite
-arguments, fabricate a return value, or skip the kernel entirely.
+`pre_syscall()` and `post_syscall()` can observe every guest syscall,
+including the few Chimera services itself for correctness.
+`do_syscall()` is only invoked for delegated syscalls; the default
+implementation forwards to the host kernel via `host_syscall(call)`,
+which returns a `SyscallResult` — `Ok(value)` on success,
+`Error(errno)` on failure. `call.set_result(r)` writes `r` back to the
+guest in the host's return-ABI (Linux: `-errno` in `rax`; Darwin:
+`errno` plus the carry flag). A handler is free to do anything in
+between — log, deny, rewrite arguments, fabricate a return value, or
+skip the kernel entirely.
 
 If no handler is installed, the runtime uses a `Passthrough` default
 equivalent to the snippet above.
@@ -45,7 +50,7 @@ equivalent to the snippet above.
   `-EPERM` to the guest.
 * [strace](examples/strace/README.md) — reimplements `strace(1)` on
   top of `SystemCalls`; logs every guest syscall in `strace(1)` format
-  and forwards it to the host kernel.
+  from `post_syscall()`, including Chimera-owned syscalls.
 
 Run an example with:
 

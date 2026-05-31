@@ -10,9 +10,12 @@ mod arch;
 mod sys;
 mod syscall;
 
-pub use syscall::{
-    HostResult, Passthrough, SystemCall, SystemCalls, host_syscall, host_syscall_full,
-};
+pub use syscall::{Passthrough, SyscallResult, SystemCall, SystemCalls};
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use sys::linux::syscall::host_syscall;
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+pub use syscall::host_syscall;
 
 /// A sandboxed guest program, configured but not yet running.
 pub struct Sandbox {

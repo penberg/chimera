@@ -34,10 +34,19 @@ const XSAVE_AREA_SIZE: usize = 4096;
 
 /// The `Thread` struct represents a guest thread: the register state and the
 /// address space it runs in. The purpose of this struct is similar to the
-/// `task_struct` in the Linux kernel.
+/// `task_struct` in the Linux kernel. `running` and `exit_code` mirror the
+/// kernel's task state: a syscall implementation can mark a thread done by
+/// clearing `running` and recording an `exit_code`, and the run loop
+/// terminates on its next iteration.
 pub struct Thread {
-    state: Box<ThreadState>,
+    pub state: Box<ThreadState>,
     addr_space: AddressSpace,
+    /// Whether the run loop should keep iterating. Set true on entry to
+    /// [`Thread::run`]; cleared by the `exit`/`exit_group` syscall
+    /// implementation in [`crate::syscall::syscall`].
+    pub running: bool,
+    /// The status code the run loop returns once `running` is cleared.
+    pub exit_code: i32,
 }
 
 impl Thread {
@@ -57,6 +66,8 @@ impl Thread {
                 fpstate: [0; XSAVE_AREA_SIZE],
             }),
             addr_space: AddressSpace::new()?,
+            running: false,
+            exit_code: 0,
         };
         thread.reset(rip, rsp);
         Ok(thread)
@@ -66,21 +77,25 @@ impl Thread {
     pub fn reset(&mut self, rip: u64, rsp: u64) {
         self.addr_space.reset();
         self.state.reset(rip, rsp);
+        self.running = false;
+        self.exit_code = 0;
     }
 
     /// Run the guest using the thread's current entry state. Returns the
-    /// guest's exit code when it issues `exit_group` or `exit`; the syscall
-    /// itself is not forwarded to the host kernel (that would terminate
-    /// Chimera). The handler still observes the call before the run ends.
+    /// guest's exit code once the `exit`/`exit_group` syscall implementation
+    /// has cleared `running`; the syscall itself is never forwarded to the
+    /// host kernel (that would terminate Chimera).
     pub fn run(&mut self, mut handler: Box<dyn SystemCalls>) -> Result<i32, Error> {
         self.setup_gs()?;
         self.state.setup_fs();
+        self.running = true;
 
-        let ts_ptr: *mut ThreadState = &mut *self.state;
         let block_exit = exit_block as *const () as usize as u64;
         let syscall_exit = exit_syscall as *const () as usize as u64;
 
-        loop {
+        while self.running {
+            let ts_ptr: *mut ThreadState = &mut *self.state;
+
             let rip = unsafe { (*ts_ptr).rip };
             let host_pc = match self.addr_space.map.get(&rip) {
                 Some(&hpc) => hpc,
@@ -95,12 +110,27 @@ impl Thread {
                 (*ts_ptr).exit_kind = EXIT_KIND_BLOCK;
                 dispatch(ts_ptr, host_pc);
             }
-            if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL
-                && let Some(code) = handle_syscall(ts_ptr, handler.as_mut())
-            {
-                return Ok(code);
+            if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL {
+                self.handle_syscall(handler.as_mut());
             }
         }
+        Ok(self.exit_code)
+    }
+
+    fn handle_syscall(&mut self, handler: &mut dyn SystemCalls) {
+        let mut call = SystemCall::new(
+            self.state.regs[RAX],
+            [
+                self.state.regs[RDI],
+                self.state.regs[RSI],
+                self.state.regs[RDX],
+                self.state.regs[R10],
+                self.state.regs[R8],
+                self.state.regs[R9],
+            ],
+        );
+        crate::syscall::syscall(self, &mut call, handler);
+        self.state.regs[RAX] = call.return_value() as u64;
     }
 
     fn setup_gs(&self) -> Result<(), Error> {
@@ -137,7 +167,7 @@ pub struct ThreadState {
     /// reset to `BLOCK` before each entry.
     pub exit_kind: u64,
     /// Guest's FS base. Loaded into the FS MSR on every entry, restored
-    /// from the FS MSR on every exit. Updated by `host_syscall` when it
+    /// from the FS MSR on every exit. Updated by `syscall` when it
     /// intercepts `arch_prctl(ARCH_SET_FS, ...)`.
     pub guest_fs_base: u64,
     /// Chimera's FS base, captured on the host thread immediately before
@@ -232,23 +262,4 @@ impl AddressSpace {
         self.cache.reset();
         self.map.clear();
     }
-}
-
-fn handle_syscall(ts_ptr: *mut ThreadState, handler: &mut dyn SystemCalls) -> Option<i32> {
-    let regs = unsafe { &(*ts_ptr).regs };
-    let number = regs[RAX];
-    let args = [
-        regs[RDI], regs[RSI], regs[RDX], regs[R10], regs[R8], regs[R9],
-    ];
-    let exit_code = if number == libc::SYS_exit_group as u64 || number == libc::SYS_exit as u64 {
-        Some(args[0] as i32)
-    } else {
-        None
-    };
-    let mut call = SystemCall::new(number, args);
-    handler.handle(&mut call);
-    unsafe {
-        (*ts_ptr).regs[RAX] = call.return_value() as u64;
-    }
-    exit_code
 }
