@@ -223,8 +223,15 @@ pub fn map_elf(parsed: &ParsedElf) -> Result<LoadedElf, Error> {
         if ph.p_flags & PF_W != 0 {
             prot |= libc::PROT_WRITE;
         }
+        // W^X: Chimera never executes guest pages natively — the dispatcher
+        // reads them and runs translated blocks from the code cache — so an
+        // executable segment is mapped read-only rather than `PROT_EXEC`. This
+        // mirrors the `PROT_EXEC` stripping the syscall driver applies to the
+        // libraries the dynamic linker maps later; here it covers the
+        // executable and interpreter images the runtime maps itself, which
+        // never pass through that path. `PROT_READ` keeps them translatable.
         if ph.p_flags & PF_X != 0 {
-            prot |= libc::PROT_EXEC;
+            prot |= libc::PROT_READ;
         }
 
         let map_flags = if ehdr.e_type == ET_EXEC {
