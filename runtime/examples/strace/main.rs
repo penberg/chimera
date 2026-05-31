@@ -7,11 +7,9 @@
 //! stderr, with the syscall-name-and-args column padded so return values
 //! line up the way `strace(1)` does.
 //!
-//! The handler implements [`SystemCalls`] with a single
-//! `handle(&mut self, &mut SystemCall)` entry point. The `SystemCall` value
-//! carries the number and argument registers; [`syscall`]
-//! forwards to the host kernel and [`SystemCall::set_return`] writes the
-//! result back to the guest.
+//! The handler implements [`SystemCalls`] by logging in
+//! `post_syscall(&SystemCall)`. The `SystemCall` value carries the number,
+//! argument registers, and the final result when one exists.
 //!
 //! The Linux argument decoders are the rich ones (signal names, open
 //! flags, struct stat, etc.). The Darwin port (with arm64 syscall numbers
@@ -43,7 +41,7 @@ mod linux {
 
     use std::{env, fmt::Write, process::ExitCode, ptr};
 
-    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls, host_syscall};
+    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls};
 
     pub fn main() -> ExitCode {
         let mut argv = env::args_os().skip(1);
@@ -77,26 +75,24 @@ mod linux {
     struct Strace;
 
     impl SystemCalls for Strace {
-        fn handle(&mut self, call: &mut SystemCall) {
+        fn post_syscall(&mut self, call: &SystemCall) {
             let name = syscall_name(call.number);
-
-            // exit/exit_group end the run; the runtime tears down after we return.
-            if matches!(name, "exit" | "exit_group") {
-                eprintln!("{:<40} = ?", format_call(name, call, 0));
-                return;
+            match call.result() {
+                Some(result) => {
+                    let ret = match result {
+                        SyscallResult::Ok(v) => v,
+                        SyscallResult::Error(e) => -(e as i64),
+                    };
+                    eprintln!(
+                        "{:<40} = {}",
+                        format_call(name, call, ret),
+                        format_ret(name, result),
+                    );
+                }
+                None => {
+                    eprintln!("{:<40} = ?", format_call(name, call, 0));
+                }
             }
-
-            let result = host_syscall(call);
-            let ret = match result {
-                SyscallResult::Ok(v) => v,
-                SyscallResult::Error(e) => -(e as i64),
-            };
-            eprintln!(
-                "{:<40} = {}",
-                format_call(name, call, ret),
-                format_ret(name, result),
-            );
-            call.set_result(result);
         }
     }
 
@@ -762,7 +758,7 @@ mod darwin {
 
     use std::{env, process::ExitCode};
 
-    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls, host_syscall};
+    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls};
 
     pub fn main() -> ExitCode {
         let mut argv = env::args_os().skip(1);
@@ -796,23 +792,21 @@ mod darwin {
     struct Strace;
 
     impl SystemCalls for Strace {
-        fn handle(&mut self, call: &mut SystemCall) {
+        fn post_syscall(&mut self, call: &SystemCall) {
             let name = syscall_name(call.number);
             let line = format_call(name, call);
-
-            // BSD exit (#1) ends the run before the handler can record a return.
-            if call.number == 1 {
-                eprintln!("{:<48} = ?", line);
-                return;
+            match call.result() {
+                Some(result) => {
+                    let ret_str = match result {
+                        SyscallResult::Error(errno) => format!("-1 (errno {})", errno),
+                        SyscallResult::Ok(v) => format!("{:#x}", v),
+                    };
+                    eprintln!("{:<48} = {}", line, ret_str);
+                }
+                None => {
+                    eprintln!("{:<48} = ?", line);
+                }
             }
-
-            let result = host_syscall(call);
-            let ret_str = match result {
-                SyscallResult::Error(errno) => format!("-1 (errno {})", errno),
-                SyscallResult::Ok(v) => format!("{:#x}", v),
-            };
-            eprintln!("{:<48} = {}", line, ret_str);
-            call.set_result(result);
         }
     }
 

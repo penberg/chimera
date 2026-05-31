@@ -94,7 +94,7 @@ impl Allowlist {
 }
 
 impl SystemCalls for Allowlist {
-    fn handle(&mut self, call: &mut SystemCall) {
+    fn do_syscall(&mut self, call: &mut SystemCall) {
         let name = syscall_name(call.number);
         // Unknown numbers serialize as `syscall_<n>` so a user's regex
         // can never let one through by accident.

@@ -33,7 +33,7 @@ denial log tell you what the program asks for next.
 struct Allowlist { allowed: Vec<Regex>, /* ... */ }
 
 impl SystemCalls for Allowlist {
-    fn handle(&mut self, call: &mut SystemCall) {
+    fn do_syscall(&mut self, call: &mut SystemCall) {
         let name = syscall_name(call.number);
         if self.allowed.iter().any(|r| r.is_match(name)) {
             call.set_result(host_syscall(call));
@@ -49,6 +49,10 @@ impl SystemCalls for Allowlist {
 `call.set_result(r)` writes `r` back to the guest in the host's
 return-ABI, so `Error(EPERM)` here makes the denial look exactly like
 a seccomp-enforced one.
+
+Only delegated syscalls reach `do_syscall()`: Chimera-owned syscalls
+like `exit_group` and the virtualized `arch_prctl` cases are handled by
+the runtime before `post_syscall()` observers run.
 
 Unknown syscall numbers serialize as `syscall_<n>` so a user-supplied
 regex can never let one through by accident.

@@ -33,28 +33,24 @@ The example implements the `chimera::SystemCalls` trait:
 
 ```rust
 impl SystemCalls for Strace {
-    fn handle(&mut self, call: &mut SystemCall) {
-        // Format the name and arguments.
+    fn post_syscall(&mut self, call: &SystemCall) {
         let name = syscall_name(call.number);
         let line = format!("{}({})", name, format_args(name, call));
-
-        // Forward to the host kernel.
-        let result = host_syscall(call);
-        eprintln!("{:<40} = {}", line, format_ret(name, result));
-
-        // Hand the kernel's result back to the guest in the host's ABI.
-        call.set_result(result);
+        match call.result() {
+            Some(result) => eprintln!("{:<40} = {}", line, format_ret(result)),
+            None => eprintln!("{:<40} = ?", line),
+        }
     }
 }
 ```
 
-`host_syscall(call)` issues the syscall on the host and returns a
-`SyscallResult` — `Ok(value)` on success, `Error(errno)` on failure.
-`call.set_result(r)` writes `r` back to the guest in the host's
-return-ABI. A handler is free to do anything in between: log, deny,
-rewrite arguments, fabricate a return value, or skip the kernel
-entirely.
+`pre_syscall()` and `post_syscall()` run for every guest syscall, even
+when Chimera services it internally. `do_syscall()` is only used for
+delegated syscalls and defaults to forwarding them with
+`host_syscall(call)`.
 
 The Chimera runtime intercepts `arch_prctl(ARCH_SET_FS, ...)` inside
-`syscall` so the guest's TLS setup doesn't disturb the runtime's
-own FS-base register. Everything else passes through verbatim.
+`syscall` so the guest's TLS setup doesn't disturb the runtime's own
+FS-base register, and it terminates `exit`/`exit_group` itself instead
+of forwarding them to the host kernel. Logging in `post_syscall()`
+keeps those syscalls visible without making them interceptable.

@@ -23,6 +23,7 @@ pub struct SystemCall {
     pub args: [u64; 6],
     return_value: i64,
     is_error: bool,
+    has_result: bool,
 }
 
 impl SystemCall {
@@ -56,6 +57,7 @@ impl SystemCall {
     /// which encodes the host's convention for you.
     pub fn set_return(&mut self, value: i64) {
         self.return_value = value;
+        self.has_result = true;
     }
 
     /// Mark this syscall as an error. On Darwin/arm64, the dispatcher
@@ -64,6 +66,33 @@ impl SystemCall {
     /// a negative return value.
     pub fn set_error(&mut self, is_error: bool) {
         self.is_error = is_error;
+    }
+
+    /// Return the syscall outcome currently stored in this value.
+    ///
+    /// Returns `None` when no result exists yet, which is the case in
+    /// `pre_syscall` and for syscalls like `exit`/`exit_group` that never
+    /// resume in the guest.
+    pub fn result(&self) -> Option<SyscallResult> {
+        if !self.has_result {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if self.is_error {
+                Some(SyscallResult::Error(self.return_value as i32))
+            } else {
+                Some(SyscallResult::Ok(self.return_value))
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if (-4095..0).contains(&self.return_value) {
+                Some(SyscallResult::Error((-self.return_value) as i32))
+            } else {
+                Some(SyscallResult::Ok(self.return_value))
+            }
+        }
     }
 
     pub(crate) fn return_value(&self) -> i64 {
@@ -81,33 +110,38 @@ impl SystemCall {
             args,
             return_value: 0,
             is_error: false,
+            has_result: false,
         }
     }
 }
 
 /// Guest system-call implementation supplied by the embedder.
 ///
-/// Chimera does not implement system-call policy itself: every forwardable
-/// guest syscall is handed to [`SystemCalls::handle`]. Implementors can
-/// forward to the host kernel with [`crate::host_syscall`], return errors,
-/// log, re-route, or emulate the call entirely. The handler does not see the
-/// few syscalls Chimera intercepts for its own correctness (`exit`,
-/// `execve`, `arch_prctl`); those are serviced by [`syscall`] before the
-/// handler is invoked.
+/// Chimera does not implement system-call policy itself: delegated guest
+/// syscalls are handed to [`SystemCalls::do_syscall`], while
+/// [`SystemCalls::pre_syscall`] and [`SystemCalls::post_syscall`] can observe
+/// every guest syscall, including the few Chimera intercepts for its own
+/// correctness (`exit`, `execve`, `arch_prctl`).
 pub trait SystemCalls {
-    /// Invoked for every forwardable guest syscall, before the guest resumes.
-    fn handle(&mut self, call: &mut SystemCall);
-}
+    /// Observe a guest syscall before Chimera or the embedder services it.
+    fn pre_syscall(&mut self, _call: &SystemCall) {}
 
-/// The default system-call handler: forwards every guest syscall to the
-/// host kernel verbatim.
-pub struct Passthrough;
-
-impl SystemCalls for Passthrough {
-    fn handle(&mut self, call: &mut SystemCall) {
+    /// Service a guest syscall that Chimera delegated to the embedder.
+    ///
+    /// The default implementation forwards the call to the host kernel.
+    fn do_syscall(&mut self, call: &mut SystemCall) {
         call.set_result(host_syscall_(call));
     }
+
+    /// Observe a guest syscall after its final result is known, if any.
+    fn post_syscall(&mut self, _call: &SystemCall) {}
 }
+
+/// The default system-call handler: forwards every delegated guest syscall to
+/// the host kernel verbatim.
+pub struct Passthrough;
+
+impl SystemCalls for Passthrough {}
 
 /// The outcome the host kernel reported for a forwarded syscall, or that a
 /// runtime intercept synthesized in lieu of forwarding. `Ok(value)` is the
@@ -129,7 +163,7 @@ pub enum SyscallResult {
 // `syscall` (on Linux) is the runtime entry the arch dispatcher calls once per
 // guest syscall instruction: it intercepts the calls Chimera must service
 // itself (`exit`/`exit_group`, `execve`/`execveat`, `arch_prctl`) and hands
-// the rest to the embedder handler. On Darwin and unsupported hosts the file
+// the rest to the embedder hooks. On Darwin and unsupported hosts the file
 // only exposes `host_syscall` — the unified driver is Linux-only for now.
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -138,8 +172,8 @@ mod host {
     use crate::arch::dispatch::Thread;
 
     /// Drive one guest syscall. Runtime-owned syscalls are serviced inline
-    /// here, the way a kernel's syscall table services its own; forwardable
-    /// syscalls go to the embedder handler.
+    /// here, the way a kernel's syscall table services its own; delegated
+    /// syscalls go to the embedder hook.
     ///
     /// `exit`/`exit_group` mark the thread done (the dispatch loop notices
     /// `running == false` on its next iteration and returns `exit_code`).
@@ -159,11 +193,14 @@ mod host {
     /// `ARCH_SET_FS` records the requested base into `thread.state` and
     /// `ARCH_GET_FS` reads it back, both without touching the kernel.
     /// `ARCH_SET_GS`/`ARCH_GET_GS` return `EINVAL`. Unknown subfunctions fall
-    /// through to the handler.
+    /// through to the embedder.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
+        handler.pre_syscall(call);
+
         if call.number == libc::SYS_exit_group as u64 || call.number == libc::SYS_exit as u64 {
             thread.exit_code = call.args[0] as i32;
             thread.running = false;
+            handler.post_syscall(call);
             return;
         }
 
@@ -175,6 +212,7 @@ mod host {
             };
             eprintln!("chimera: blocked {name} (would escape the sandbox); returning EPERM");
             call.set_result(SyscallResult::Error(libc::EPERM));
+            handler.post_syscall(call);
             return;
         }
 
@@ -187,6 +225,7 @@ mod host {
                 ARCH_SET_FS => {
                     thread.state.guest_fs_base = call.args[1];
                     call.set_result(SyscallResult::Ok(0));
+                    handler.post_syscall(call);
                     return;
                 }
                 ARCH_GET_FS => {
@@ -197,17 +236,20 @@ mod host {
                         }
                     }
                     call.set_result(SyscallResult::Ok(0));
+                    handler.post_syscall(call);
                     return;
                 }
                 ARCH_SET_GS | ARCH_GET_GS => {
                     call.set_result(SyscallResult::Error(libc::EINVAL));
+                    handler.post_syscall(call);
                     return;
                 }
-                _ => {} // unknown subfunction: forward to the handler
+                _ => {} // unknown subfunction: delegate to the embedder
             }
         }
 
-        handler.handle(call);
+        handler.do_syscall(call);
+        handler.post_syscall(call);
     }
 }
 
