@@ -171,111 +171,100 @@ mod host {
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
-        if call.number == libc::SYS_mmap as u64
-            || call.number == libc::SYS_mprotect as u64
-            || call.number == libc::SYS_pkey_mprotect as u64
-        {
-            let prot = call.args[2] as libc::c_int;
-            if prot & libc::PROT_EXEC != 0 {
-                call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
-            }
-        }
-
-        if call.number == libc::SYS_exit_group as u64 || call.number == libc::SYS_exit as u64 {
-            thread.exit_code = call.args[0] as i32;
-            thread.running = false;
-            handler.post_syscall(call);
-            return;
-        }
-
-        if call.number == libc::SYS_execve as u64 || call.number == libc::SYS_execveat as u64 {
-            // Intercepted, never forwarded to the host kernel: forwarding would
-            // have the host replace Chimera's whole process image — runtime,
-            // code cache, and translation map included — with an untranslated
-            // program running natively, outside the sandbox. The dispatch loop
-            // tears down the old image and re-enters the translator on the new
-            // one (see `crate::sys::linux::exec`); report success so observers
-            // see the allowed call.
-            call.set_result(SyscallResult::Ok(0));
-            handler.post_syscall(call);
-            return;
-        }
-
-        if call.number == libc::SYS_arch_prctl as u64 {
-            const ARCH_SET_GS: u64 = 0x1001;
-            const ARCH_SET_FS: u64 = 0x1002;
-            const ARCH_GET_FS: u64 = 0x1003;
-            const ARCH_GET_GS: u64 = 0x1004;
-            match call.args[0] {
-                ARCH_SET_FS => {
-                    thread.state.guest_fs_base = call.args[1];
-                    call.set_result(SyscallResult::Ok(0));
-                    handler.post_syscall(call);
-                    return;
+        let nr = call.number as i64;
+        match nr {
+            libc::SYS_mmap => {
+                let prot = call.args[2] as libc::c_int;
+                if prot & libc::PROT_EXEC != 0 {
+                    call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
                 }
-                ARCH_GET_FS => {
-                    let fs = thread.state.guest_fs_base;
-                    if call.args[1] != 0 {
-                        unsafe {
-                            (call.args[1] as *mut u64).write(fs);
-                        }
+                let result = host_syscall(call);
+                if let SyscallResult::Ok(addr) = result {
+                    thread
+                        .addr_space()
+                        .add_region(addr as usize, call.args[1] as usize);
+                }
+                call.set_result(result);
+            }
+            libc::SYS_mprotect | libc::SYS_pkey_mprotect => {
+                // Not runtime-owned: strip PROT_EXEC from the requested
+                // protection, then hand off to the embedder unchanged.
+                let prot = call.args[2] as libc::c_int;
+                if prot & libc::PROT_EXEC != 0 {
+                    call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
+                }
+                handler.do_syscall(call);
+            }
+            libc::SYS_munmap => {
+                let result = host_syscall(call);
+                if matches!(result, SyscallResult::Ok(_)) {
+                    thread
+                        .addr_space()
+                        .remove_region(call.args[0] as usize, call.args[1] as usize);
+                }
+                call.set_result(result);
+            }
+            libc::SYS_mremap => {
+                let result = host_syscall(call);
+                if let SyscallResult::Ok(new_start) = result {
+                    let flags = call.args[3] as libc::c_int;
+                    let dontunmap = (flags & libc::MREMAP_DONTUNMAP) != 0;
+                    thread.addr_space().remap_region(
+                        call.args[0] as usize,
+                        call.args[1] as usize,
+                        new_start as usize,
+                        call.args[2] as usize,
+                        dontunmap,
+                    );
+                }
+                call.set_result(result);
+            }
+            libc::SYS_exit | libc::SYS_exit_group => {
+                thread.exit_code = call.args[0] as i32;
+                thread.running = false;
+            }
+            libc::SYS_execve | libc::SYS_execveat => {
+                // Intercepted, never forwarded to the host kernel: forwarding would
+                // have the host replace Chimera's whole process image — runtime,
+                // code cache, and translation map included — with an untranslated
+                // program running natively, outside the sandbox. The dispatch loop
+                // tears down the old image and re-enters the translator on the new
+                // one (see `crate::sys::linux::exec`); report success so observers
+                // see the allowed call.
+                call.set_result(SyscallResult::Ok(0));
+            }
+            libc::SYS_arch_prctl => {
+                const ARCH_SET_GS: u64 = 0x1001;
+                const ARCH_SET_FS: u64 = 0x1002;
+                const ARCH_GET_FS: u64 = 0x1003;
+                const ARCH_GET_GS: u64 = 0x1004;
+                match call.args[0] {
+                    ARCH_SET_FS => {
+                        thread.state.guest_fs_base = call.args[1];
+                        call.set_result(SyscallResult::Ok(0));
                     }
-                    call.set_result(SyscallResult::Ok(0));
-                    handler.post_syscall(call);
-                    return;
+                    ARCH_GET_FS => {
+                        let fs = thread.state.guest_fs_base;
+                        if call.args[1] != 0 {
+                            unsafe {
+                                (call.args[1] as *mut u64).write(fs);
+                            }
+                        }
+                        call.set_result(SyscallResult::Ok(0));
+                    }
+                    ARCH_SET_GS | ARCH_GET_GS => {
+                        call.set_result(SyscallResult::Error(libc::EINVAL));
+                    }
+                    // unknown subfunction: delegate to the embedder
+                    _ => {
+                        handler.do_syscall(call);
+                    }
                 }
-                ARCH_SET_GS | ARCH_GET_GS => {
-                    call.set_result(SyscallResult::Error(libc::EINVAL));
-                    handler.post_syscall(call);
-                    return;
-                }
-                _ => {} // unknown subfunction: delegate to the embedder
             }
-        }
-
-        if call.number == libc::SYS_mmap as u64 {
-            let result = host_syscall(call);
-            if let SyscallResult::Ok(addr) = result {
-                thread
-                    .addr_space()
-                    .add_region(addr as usize, call.args[1] as usize);
+            _ => {
+                handler.do_syscall(call);
             }
-            call.set_result(result);
-            handler.post_syscall(call);
-            return;
-        }
-
-        if call.number == libc::SYS_munmap as u64 {
-            let result = host_syscall(call);
-            if matches!(result, SyscallResult::Ok(_)) {
-                thread
-                    .addr_space()
-                    .remove_region(call.args[0] as usize, call.args[1] as usize);
-            }
-            call.set_result(result);
-            handler.post_syscall(call);
-            return;
-        }
-
-        if call.number == libc::SYS_mremap as u64 {
-            let result = host_syscall(call);
-            if let SyscallResult::Ok(new_start) = result {
-                let flags = call.args[3] as libc::c_int;
-                let dontunmap = (flags & libc::MREMAP_DONTUNMAP) != 0;
-                thread.addr_space().remap_region(
-                    call.args[0] as usize,
-                    call.args[1] as usize,
-                    new_start as usize,
-                    call.args[2] as usize,
-                    dontunmap,
-                );
-            }
-            call.set_result(result);
-            handler.post_syscall(call);
-            return;
-        }
-
-        handler.do_syscall(call);
+        };
         handler.post_syscall(call);
     }
 }
