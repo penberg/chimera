@@ -9,7 +9,7 @@ check: conformance-native conformance
 
 # Run the GitHub Actions CI workflow locally with Agent CI (https://agent-ci.dev/).
 ci:
-	npx @redwoodjs/agent-ci run --workflow .github/workflows/ci.yml
+	npx -y @redwoodjs/agent-ci run --workflow .github/workflows/ci.yml
 .PHONY: ci
 
 conformance: build
