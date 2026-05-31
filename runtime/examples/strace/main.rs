@@ -11,10 +11,8 @@
 //! `post_syscall(&SystemCall)`. The `SystemCall` value carries the number,
 //! argument registers, and the final result when one exists.
 //!
-//! The Linux argument decoders are the rich ones (signal names, open
-//! flags, struct stat, etc.). The Darwin port (with arm64 syscall numbers
-//! and Mach traps) is intentionally smaller — it prints names and raw
-//! args, leaving full decoding for later.
+//! The argument decoders are the rich ones: signal names, open flags,
+//! struct stat, and so on.
 
 use mimalloc::MiMalloc;
 
@@ -24,19 +22,8 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn main() -> std::process::ExitCode {
-    eprintln!("strace example only supports Linux and macOS hosts");
-    std::process::ExitCode::from(2)
-}
-
-#[cfg(target_os = "linux")]
 use linux::main;
 
-#[cfg(target_os = "macos")]
-use darwin::main;
-
-#[cfg(target_os = "linux")]
 mod linux {
 
     use std::{env, fmt::Write, process::ExitCode, ptr};
@@ -752,130 +739,3 @@ mod linux {
         }
     }
 } // mod linux
-
-#[cfg(target_os = "macos")]
-mod darwin {
-
-    use std::{env, process::ExitCode};
-
-    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls};
-
-    pub fn main() -> ExitCode {
-        let mut argv = env::args_os().skip(1);
-        let program = match argv.next() {
-            Some(p) => p,
-            None => {
-                eprintln!("usage: strace <program> [args...]");
-                return ExitCode::from(2);
-            }
-        };
-        let prog_args: Vec<_> = argv.collect();
-
-        let mut sandbox = match Sandbox::new(&program) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("strace: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        sandbox.args(prog_args).system_calls(Strace);
-
-        match sandbox.run() {
-            Ok(status) => ExitCode::from(status.code() as u8),
-            Err(e) => {
-                eprintln!("strace: {e}");
-                ExitCode::FAILURE
-            }
-        }
-    }
-
-    struct Strace;
-
-    impl SystemCalls for Strace {
-        fn post_syscall(&mut self, call: &SystemCall) {
-            let name = syscall_name(call.number);
-            let line = format_call(name, call);
-            match call.result() {
-                Some(result) => {
-                    let ret_str = match result {
-                        SyscallResult::Error(errno) => format!("-1 (errno {})", errno),
-                        SyscallResult::Ok(v) => format!("{:#x}", v),
-                    };
-                    eprintln!("{:<48} = {}", line, ret_str);
-                }
-                None => {
-                    eprintln!("{:<48} = ?", line);
-                }
-            }
-        }
-    }
-
-    fn format_call(name: &str, c: &SystemCall) -> String {
-        // For most syscalls we print three positional args — enough to scan
-        // logs by eye without re-implementing every Mach/BSD struct decoder.
-        format!(
-            "{}({:#x}, {:#x}, {:#x})",
-            name, c.args[0], c.args[1], c.args[2]
-        )
-    }
-
-    fn syscall_name(n: u64) -> &'static str {
-        // Darwin's userspace ABI: positive numbers are BSD syscalls, negative
-        // (interpreted as a signed 32-bit value) are Mach traps. We use the
-        // raw u64 here, so values with bit 31 set look like very large
-        // positive numbers — match them as such.
-        match n {
-            // BSD syscalls — common subset of /usr/include/sys/syscall.h.
-            1 => "exit",
-            2 => "fork",
-            3 => "read",
-            4 => "write",
-            5 => "open",
-            6 => "close",
-            7 => "wait4",
-            20 => "getpid",
-            24 => "getuid",
-            33 => "access",
-            37 => "kill",
-            38 => "readlink",
-            39 => "getppid",
-            42 => "pipe",
-            46 => "sigaction",
-            48 => "sigprocmask",
-            53 => "sigaltstack",
-            54 => "ioctl",
-            73 => "munmap",
-            74 => "mprotect",
-            75 => "madvise",
-            92 => "fcntl",
-            170 => "csops",
-            174 => "csops_audittoken",
-            197 => "mmap",
-            202 => "sysctl",
-            220 => "mlock",
-            294 => "psynch_cvclrprepost",
-            333 => "pthread_canceled",
-            336 => "proc_info",
-            339 => "fstat64",
-            372 => "csops_audittoken",
-            381 => "csops",
-            483 => "bsdthread_register",
-            500 => "thread_selfid",
-            521 => "abort_with_payload",
-            // Special: Apple's threading TSD setup.
-            0x80000000 => "thread_set_tsd_base",
-            // Mach traps (the kernel reads x16 as a signed 32-bit value; in
-            // u64 they appear as 0xFFFFFFFF_FFFFFFXX).
-            0xFFFFFFFFFFFFFFE4 => "task_self_trap",
-            0xFFFFFFFFFFFFFFE3 => "host_self_trap",
-            0xFFFFFFFFFFFFFFE6 => "mach_reply_port",
-            0xFFFFFFFFFFFFFFE1 => "mach_msg_trap",
-            0xFFFFFFFFFFFFFFF1 => "_kernelrpc_mach_vm_protect_trap",
-            0xFFFFFFFFFFFFFFF2 => "_kernelrpc_mach_vm_deallocate_trap",
-            0xFFFFFFFFFFFFFFF4 => "_kernelrpc_mach_vm_allocate_trap",
-            0xFFFFFFFFFFFFFFF6 => "_kernelrpc_mach_vm_map_trap",
-            0xFFFFFFFFFFFFFFED => "_kernelrpc_mach_port_deallocate_trap",
-            _ => "syscall",
-        }
-    }
-} // mod darwin

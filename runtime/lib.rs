@@ -12,10 +12,7 @@ mod syscall;
 
 pub use syscall::{Passthrough, SyscallResult, SystemCall, SystemCalls};
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use sys::linux::syscall::host_syscall;
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-pub use syscall::host_syscall;
 
 /// A sandboxed guest program, configured but not yet running.
 pub struct Sandbox {
@@ -130,13 +127,6 @@ pub enum Error {
     /// bind/rebase opcode, …).
     #[error("unsupported guest feature: {0}")]
     Unsupported(String),
-
-    /// Chimera is itself running on a host platform it doesn't support.
-    #[error("unsupported host platform {os}-{arch}: Chimera runtime supports Linux and macOS")]
-    UnsupportedHost {
-        os: &'static str,
-        arch: &'static str,
-    },
 }
 
 impl Error {
