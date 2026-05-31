@@ -77,6 +77,11 @@ impl SystemCall {
 /// [`SystemCalls::pre_syscall`] and [`SystemCalls::post_syscall`] can observe
 /// every guest syscall, including the few Chimera intercepts for its own
 /// correctness (`exit`, `execve`, `arch_prctl`, `mmap`, `munmap`, `mremap`).
+///
+/// Chimera also rewrites the `prot` argument of `mmap`, `mprotect`, and
+/// `pkey_mprotect` before servicing them, clearing `PROT_EXEC` (see
+/// [`crate::syscall::syscall`]). `pre_syscall` sees the guest's original
+/// request; every later stage, including `do_syscall`, sees the rewritten one.
 pub trait SystemCalls {
     /// Observe a guest syscall before Chimera or the embedder services it.
     fn pre_syscall(&mut self, _call: &SystemCall) {}
@@ -150,8 +155,31 @@ mod host {
     /// to the host kernel itself so its guest-mapping bookkeeping stays
     /// authoritative. Embedders can observe them in `pre_syscall()` and
     /// `post_syscall()`, but they do not reach `do_syscall()`.
+    ///
+    /// Finally, Chimera enforces a W^X invariant on the guest: the guest never
+    /// executes its own pages natively — the dispatcher reads them and runs
+    /// translated blocks from the code cache — so freshly mapped or re-protected
+    /// guest code must never be executable in the host page tables. Before any
+    /// dispatch, the `prot` argument of `mmap`, `mprotect`, and `pkey_mprotect`
+    /// (always `args[2]`) has `PROT_EXEC` replaced with `PROT_READ`, so a stray
+    /// native jump into guest code faults instead of running untranslated while
+    /// the translator can still read the bytes it will translate (an
+    /// execute-only mapping would otherwise become `PROT_NONE`). Unlike the
+    /// `mmap` family, `mprotect`/`pkey_mprotect` are not otherwise
+    /// runtime-owned: they still reach `do_syscall()`, only with `PROT_EXEC`
+    /// already cleared from their argument.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
+
+        if call.number == libc::SYS_mmap as u64
+            || call.number == libc::SYS_mprotect as u64
+            || call.number == libc::SYS_pkey_mprotect as u64
+        {
+            let prot = call.args[2] as libc::c_int;
+            if prot & libc::PROT_EXEC != 0 {
+                call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
+            }
+        }
 
         if call.number == libc::SYS_exit_group as u64 || call.number == libc::SYS_exit as u64 {
             thread.exit_code = call.args[0] as i32;
