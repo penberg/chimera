@@ -14,7 +14,7 @@ use crate::{
     sys::mmap::AddressSpace,
 };
 
-use super::elf::{LoadedElf, PAGE_SIZE, load_elf, map_elf, parse_elf};
+use super::elf::{LoadedElf, PAGE_SIZE, ParsedElf, load_elf, map_elf, parse_elf};
 
 const STACK_SIZE: usize = 8 * 1024 * 1024;
 
@@ -70,13 +70,22 @@ pub fn execv(
         match thread.run(handler.as_mut())? {
             ExitReason::Exited(code) => return Ok(code),
             ExitReason::Execve { number, args } => {
-                // Read the request out of the still-live old image, then parse
-                // the new one.
-                let req = read_request(number, &args);
-                let parsed = parse_elf(&req.path)?;
-                let parsed_interp = match &parsed.interp {
-                    Some(interp_path) => Some(parse_elf(interp_path)?),
-                    None => None,
+                // Parse the replacement image while the old one is still live.
+                // Failures here must report `-errno` to the guest and resume
+                // the original image, just like Linux `execve`.
+                let PreparedExec {
+                    req,
+                    parsed,
+                    parsed_interp,
+                } = match prepare_exec(number, &args) {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        if let Some(errno) = exec_errno(&err) {
+                            thread.state.regs[dispatch::RAX] = (-(errno as i64)) as u64;
+                            continue;
+                        }
+                        return Err(err);
+                    }
                 };
 
                 // Tear down the old image (unmapping its regions, so a fixed
@@ -107,6 +116,34 @@ pub fn execv(
                 thread.enter(rip, rsp);
             }
         }
+    }
+}
+
+struct PreparedExec {
+    req: ExecRequest,
+    parsed: ParsedElf,
+    parsed_interp: Option<ParsedElf>,
+}
+
+fn prepare_exec(number: u64, args: &[u64; 6]) -> Result<PreparedExec, Error> {
+    let req = read_request(number, args);
+    let parsed = parse_elf(&req.path)?;
+    let parsed_interp = match &parsed.interp {
+        Some(interp_path) => Some(parse_elf(interp_path)?),
+        None => None,
+    };
+    Ok(PreparedExec {
+        req,
+        parsed,
+        parsed_interp,
+    })
+}
+
+fn exec_errno(err: &Error) -> Option<i32> {
+    match err {
+        Error::Io { source, .. } => Some(source.raw_os_error().unwrap_or(libc::EIO)),
+        Error::BadBinary(_) | Error::Link(_) | Error::Unsupported(_) => Some(libc::ENOEXEC),
+        Error::CodeCacheExhausted | Error::Translate(_) | Error::UnsupportedHost { .. } => None,
     }
 }
 
