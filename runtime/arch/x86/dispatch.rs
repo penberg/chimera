@@ -63,6 +63,7 @@ pub struct Thread {
 impl Thread {
     /// Create a new guest thread.
     pub fn new(rip: u64, rsp: u64) -> Result<Self, Error> {
+        let guest_fs_base = current_fs_base();
         let mut thread = Self {
             state: Box::new(ThreadState {
                 regs: [0; 16],
@@ -80,14 +81,14 @@ impl Thread {
             running: false,
             exit_code: 0,
         };
-        thread.reset(rip, rsp);
+        thread.reset(rip, rsp, guest_fs_base);
         Ok(thread)
     }
 
     /// Reset the thread to a new entry point and a stack.
-    pub fn reset(&mut self, rip: u64, rsp: u64) {
+    pub fn reset(&mut self, rip: u64, rsp: u64, guest_fs_base: u64) {
         self.addr_space.reset();
-        self.state.reset(rip, rsp);
+        self.state.reset(rip, rsp, guest_fs_base);
         self.running = false;
         self.exit_code = 0;
     }
@@ -100,7 +101,7 @@ impl Thread {
     /// touching its address space. Used to re-enter after an `execve` once the
     /// caller has torn down the old image and mapped the new one.
     pub fn enter(&mut self, rip: u64, rsp: u64) {
-        self.state.reset(rip, rsp);
+        self.state.reset(rip, rsp, current_fs_base());
     }
 
     /// Run the guest using the thread's current entry state. Returns when the
@@ -111,7 +112,7 @@ impl Thread {
         // GS is host-thread-local, so bind it on the OS thread that is
         // actually about to execute the translated guest.
         self.setup_gs()?;
-        self.state.setup_fs();
+        self.state.capture_chimera_fs();
         self.running = true;
 
         let block_exit = exit_block as *const () as usize as u64;
@@ -224,14 +225,14 @@ const _: () = assert!(
 );
 
 impl ThreadState {
-    fn reset(&mut self, rip: u64, rsp: u64) {
+    fn reset(&mut self, rip: u64, rsp: u64, guest_fs_base: u64) {
         self.regs = [0; 16];
         self.rip = 0;
         self.rflags = 0;
         self.chimera_rsp = 0;
         self.host_pc_target = 0;
         self.exit_kind = 0;
-        self.guest_fs_base = 0;
+        self.guest_fs_base = guest_fs_base;
         self.chimera_fs_base = 0;
         self._align_fpstate = [0; 1];
         self.fpstate.fill(0);
@@ -249,21 +250,21 @@ impl ThreadState {
         self.rip = rip;
     }
 
-    fn setup_fs(&mut self) {
-        // Capture the executing host thread's FS base immediately before the
-        // guest starts. A fresh guest inherits that value until it issues its
-        // own `arch_prctl(ARCH_SET_FS, ...)`.
-        let chimera_fs: u64;
-        unsafe {
-            asm!(
-                "rdfsbase {0}",
-                out(reg) chimera_fs,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
-        self.chimera_fs_base = chimera_fs;
-        self.guest_fs_base = chimera_fs;
+    fn capture_chimera_fs(&mut self) {
+        self.chimera_fs_base = current_fs_base();
     }
+}
+
+fn current_fs_base() -> u64 {
+    let fs_base: u64;
+    unsafe {
+        asm!(
+            "rdfsbase {0}",
+            out(reg) fs_base,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    fs_base
 }
 
 pub const RAX: usize = 0;
