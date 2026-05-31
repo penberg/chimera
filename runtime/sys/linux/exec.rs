@@ -114,6 +114,9 @@ pub fn execv(
                     stack_len,
                 );
                 thread.enter(rip, rsp);
+                // POSIX `execve` resets caught signals to their default
+                // disposition (ignored stay ignored) and drops the alt stack.
+                thread.signals_mut().on_execve();
             }
         }
     }

@@ -4,15 +4,18 @@
 //! point at it via `arch_prctl`, so translated code can reach any field with a
 //! plain `gs:[disp]` access — no reserved GPR required.
 //!
-//! [`Thread::run`] is the loop: translate the next block if it isn't already
-//! cached, enter the cache through [`dispatch`], handle whatever caused the
-//! cache to exit (a block boundary or a syscall), and repeat until the guest
-//! issues `exit_group` or `exit`. The boundary-crossing assembly lives in
-//! [`super::trampoline`].
+//! [`Thread::run`] is the loop: deliver any pending guest signal, translate the
+//! next block if it isn't already cached, enter the cache through [`dispatch`],
+//! handle whatever caused the cache to exit (a block boundary or a syscall), and
+//! repeat until the guest issues `exit_group` or `exit`. The boundary-crossing
+//! assembly lives in [`super::trampoline`].
 
 use std::arch::asm;
 
-use crate::{Error, SystemCall, SystemCalls, sys::mmap::AddressSpace};
+use crate::{
+    Error, SystemCall, SystemCalls,
+    sys::{linux::signal::Signals, mmap::AddressSpace},
+};
 
 use super::{
     trampoline::{dispatch, exit_block, exit_syscall},
@@ -52,6 +55,8 @@ const XSAVE_AREA_SIZE: usize = 4096;
 pub struct Thread {
     pub state: Box<ThreadState>,
     addr_space: AddressSpace,
+    /// Per-process guest signal state: handler table, blocked mask, alt stack.
+    signals: Signals,
     /// Whether the run loop should keep iterating. Set true on entry to
     /// [`Thread::run`]; cleared by the `exit`/`exit_group` syscall
     /// implementation in [`crate::syscall::syscall`].
@@ -78,6 +83,7 @@ impl Thread {
                 fpstate: [0; XSAVE_AREA_SIZE],
             }),
             addr_space: AddressSpace::new()?,
+            signals: Signals::new(),
             running: false,
             exit_code: 0,
         };
@@ -95,6 +101,26 @@ impl Thread {
 
     pub fn addr_space(&mut self) -> &mut AddressSpace {
         &mut self.addr_space
+    }
+
+    pub fn signals_mut(&mut self) -> &mut Signals {
+        &mut self.signals
+    }
+
+    /// Restore the pre-signal guest context on a guest `rt_sigreturn`.
+    pub fn sigreturn(&mut self) {
+        let state = &mut *self.state;
+        self.signals.restore(state);
+    }
+
+    /// Deliver one pending, unblocked guest signal at a safe point (a block
+    /// boundary), building its frame and redirecting the guest to the handler.
+    /// Entry into the handler then happens through the normal `dispatch` path.
+    fn deliver_pending_signals(&mut self) {
+        if let Some(signo) = crate::sys::linux::signal::pending_take_one(self.signals.blocked) {
+            let state = &mut *self.state;
+            self.signals.deliver(state, signo);
+        }
     }
 
     /// Set the thread's entry registers for a freshly mapped image, without
@@ -119,6 +145,8 @@ impl Thread {
         let syscall_exit = exit_syscall as *const () as usize as u64;
 
         while self.running {
+            self.deliver_pending_signals();
+
             let ts_ptr: *mut ThreadState = &mut *self.state;
 
             let rip = unsafe { (*ts_ptr).rip };

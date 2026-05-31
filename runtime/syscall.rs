@@ -261,6 +261,33 @@ mod host {
                     }
                 }
             }
+            libc::SYS_rt_sigaction => {
+                let r = thread
+                    .signals_mut()
+                    .sigaction(call.args[0], call.args[1], call.args[2]);
+                call.set_result(r);
+            }
+            libc::SYS_rt_sigprocmask => {
+                let r = thread.signals_mut().sigprocmask(
+                    call.args[0] as i32,
+                    call.args[1],
+                    call.args[2],
+                );
+                call.set_result(r);
+            }
+            libc::SYS_sigaltstack => {
+                let r = thread.signals_mut().sigaltstack(call.args[0], call.args[1]);
+                call.set_result(r);
+            }
+            libc::SYS_rt_sigreturn => {
+                // Restore the pre-signal context from the frame on the guest
+                // stack. `sigreturn` writes the guest's saved rax back into the
+                // register file; mirror it into the call so `handle_syscall`'s
+                // unconditional rax writeback (see `crate::arch::dispatch`) is a
+                // no-op rather than clobbering it.
+                thread.sigreturn();
+                call.set_return(thread.state.regs[0] as i64);
+            }
             _ => {
                 handler.do_syscall(call);
             }
