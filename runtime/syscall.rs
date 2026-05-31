@@ -185,7 +185,6 @@ mod host {
                         .add_region(addr as usize, call.args[1] as usize);
                 }
                 call.set_result(result);
-                handler.post_syscall(call);
             }
             libc::SYS_mprotect | libc::SYS_pkey_mprotect => {
                 // Not runtime-owned: strip PROT_EXEC from the requested
@@ -195,7 +194,6 @@ mod host {
                     call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
                 }
                 handler.do_syscall(call);
-                handler.post_syscall(call);
             }
             libc::SYS_munmap => {
                 let result = host_syscall(call);
@@ -205,7 +203,6 @@ mod host {
                         .remove_region(call.args[0] as usize, call.args[1] as usize);
                 }
                 call.set_result(result);
-                handler.post_syscall(call);
             }
             libc::SYS_mremap => {
                 let result = host_syscall(call);
@@ -221,12 +218,10 @@ mod host {
                     );
                 }
                 call.set_result(result);
-                handler.post_syscall(call);
             }
             libc::SYS_exit | libc::SYS_exit_group => {
                 thread.exit_code = call.args[0] as i32;
                 thread.running = false;
-                handler.post_syscall(call);
             }
             libc::SYS_execve | libc::SYS_execveat => {
                 // Intercepted, never forwarded to the host kernel: forwarding would
@@ -237,7 +232,6 @@ mod host {
                 // one (see `crate::sys::linux::exec`); report success so observers
                 // see the allowed call.
                 call.set_result(SyscallResult::Ok(0));
-                handler.post_syscall(call);
             }
             libc::SYS_arch_prctl => {
                 const ARCH_SET_GS: u64 = 0x1001;
@@ -248,7 +242,6 @@ mod host {
                     ARCH_SET_FS => {
                         thread.state.guest_fs_base = call.args[1];
                         call.set_result(SyscallResult::Ok(0));
-                        handler.post_syscall(call);
                     }
                     ARCH_GET_FS => {
                         let fs = thread.state.guest_fs_base;
@@ -258,24 +251,21 @@ mod host {
                             }
                         }
                         call.set_result(SyscallResult::Ok(0));
-                        handler.post_syscall(call);
                     }
                     ARCH_SET_GS | ARCH_GET_GS => {
                         call.set_result(SyscallResult::Error(libc::EINVAL));
-                        handler.post_syscall(call);
                     }
                     // unknown subfunction: delegate to the embedder
                     _ => {
                         handler.do_syscall(call);
-                        handler.post_syscall(call);
                     }
                 }
             }
             _ => {
                 handler.do_syscall(call);
-                handler.post_syscall(call);
             }
-        }
+        };
+        handler.post_syscall(call);
     }
 }
 
