@@ -23,7 +23,7 @@ use argh::FromArgs;
 use mimalloc::MiMalloc;
 use regex::Regex;
 
-use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls, syscall};
+use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls, host_syscall};
 
 /// Route this embedder's allocations through mimalloc's `mmap`-backed
 /// segments, keeping Chimera's heap off the guest libc's shared `brk`.
@@ -105,7 +105,7 @@ impl SystemCalls for Allowlist {
         };
 
         if self.allowed.iter().any(|r| r.is_match(&display)) {
-            call.set_result(syscall(call));
+            call.set_result(host_syscall(call));
         } else {
             if self.denied_seen.insert(call.number) {
                 eprintln!("sandbox: denied {}", display);

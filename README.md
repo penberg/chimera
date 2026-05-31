@@ -48,14 +48,14 @@ Implement the `SystemCalls` trait to decide how each guest syscall is
 handled:
 
 ```rust
-use chimera::{Sandbox, SystemCall, SystemCalls, syscall};
+use chimera::{Sandbox, SystemCall, SystemCalls, host_syscall};
 
 struct Tracer;
 
 impl SystemCalls for Tracer {
     fn handle(&mut self, call: &mut SystemCall) {
         eprintln!("syscall {}", call.number);
-        call.set_result(syscall(call));
+        call.set_result(host_syscall(call));
     }
 }
 

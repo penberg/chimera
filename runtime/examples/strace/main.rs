@@ -43,7 +43,7 @@ mod linux {
 
     use std::{env, fmt::Write, process::ExitCode, ptr};
 
-    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls, syscall};
+    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls, host_syscall};
 
     pub fn main() -> ExitCode {
         let mut argv = env::args_os().skip(1);
@@ -86,7 +86,7 @@ mod linux {
                 return;
             }
 
-            let result = syscall(call);
+            let result = host_syscall(call);
             let ret = match result {
                 SyscallResult::Ok(v) => v,
                 SyscallResult::Error(e) => -(e as i64),
@@ -762,7 +762,7 @@ mod darwin {
 
     use std::{env, process::ExitCode};
 
-    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls, syscall};
+    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls, host_syscall};
 
     pub fn main() -> ExitCode {
         let mut argv = env::args_os().skip(1);
@@ -806,7 +806,7 @@ mod darwin {
                 return;
             }
 
-            let result = syscall(call);
+            let result = host_syscall(call);
             let ret_str = match result {
                 SyscallResult::Error(errno) => format!("-1 (errno {})", errno),
                 SyscallResult::Ok(v) => format!("{:#x}", v),

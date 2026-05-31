@@ -1,18 +1,16 @@
 //! The Linux x86-64 raw-syscall bridge. This is the one place Chimera
-//! actually reaches the host kernel; the intercept logic around it (the
-//! syscalls Chimera handles itself instead of forwarding) lives in
+//! actually reaches the host kernel; the dispatch logic around it lives in
 //! [`crate::syscall`].
 
 use std::arch::asm;
 
-use crate::SystemCall;
+use crate::{SyscallResult, SystemCall};
 
 /// Issue the host kernel's `syscall` instruction with `call`'s number in `rax`
-/// and the six argument registers in Linux x86-64 syscall ABI order, and
-/// return whatever the kernel leaves in `rax`. Linux signals errors as a
-/// negative return value (`-errno`), not out-of-band, so the caller can use
-/// the result directly.
-pub fn host_syscall(call: &SystemCall) -> i64 {
+/// and the six argument registers in Linux x86-64 syscall ABI order. Decodes
+/// the kernel's negative-errno convention into a [`SyscallResult`] so callers
+/// don't have to inspect the sign themselves.
+pub fn host_syscall(call: &SystemCall) -> SyscallResult {
     let ret: i64;
     unsafe {
         asm!(
@@ -30,5 +28,12 @@ pub fn host_syscall(call: &SystemCall) -> i64 {
             options(nostack, preserves_flags),
         );
     }
-    ret
+    // Linux signals errors in the closed range `[-4095, -1]`; anything else
+    // is a successful result (including "negative-looking" high addresses
+    // `mmap` can hand back).
+    if (-4095..0).contains(&ret) {
+        SyscallResult::Error(-ret as i32)
+    } else {
+        SyscallResult::Ok(ret)
+    }
 }

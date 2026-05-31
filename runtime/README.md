@@ -13,13 +13,13 @@ or modify program behavior without source code or recompilation.
 Construct a `Sandbox`, install a `SystemCalls` handler, and run:
 
 ```rust
-use chimera::{Sandbox, SystemCall, SystemCalls, syscall};
+use chimera::{Sandbox, SystemCall, SystemCalls, host_syscall};
 
 struct Passthrough;
 
 impl SystemCalls for Passthrough {
     fn handle(&mut self, call: &mut SystemCall) {
-        call.set_result(syscall(call));
+        call.set_result(host_syscall(call));
     }
 }
 
@@ -28,7 +28,7 @@ sandbox.args(["hello"]).system_calls(Passthrough);
 sandbox.run()?;
 ```
 
-`syscall(call)` issues the syscall on the host kernel and returns a
+`host_syscall(call)` issues the syscall on the host kernel and returns a
 `SyscallResult` — `Ok(value)` on success, `Error(errno)` on failure.
 `call.set_result(r)` writes `r` back to the guest in the host's
 return-ABI (Linux: `-errno` in `rax`; Darwin: `errno` plus the carry

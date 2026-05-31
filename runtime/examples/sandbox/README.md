@@ -36,7 +36,7 @@ impl SystemCalls for Allowlist {
     fn handle(&mut self, call: &mut SystemCall) {
         let name = syscall_name(call.number);
         if self.allowed.iter().any(|r| r.is_match(name)) {
-            call.set_result(syscall(call));
+            call.set_result(host_syscall(call));
         } else {
             call.set_result(SyscallResult::Error(libc::EPERM));
         }
@@ -44,7 +44,7 @@ impl SystemCalls for Allowlist {
 }
 ```
 
-`syscall(call)` issues the syscall on the host kernel and returns a
+`host_syscall(call)` issues the syscall on the host kernel and returns a
 `SyscallResult` — `Ok(value)` on success, `Error(errno)` on failure.
 `call.set_result(r)` writes `r` back to the guest in the host's
 return-ABI, so `Error(EPERM)` here makes the denial look exactly like

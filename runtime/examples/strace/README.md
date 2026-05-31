@@ -39,7 +39,7 @@ impl SystemCalls for Strace {
         let line = format!("{}({})", name, format_args(name, call));
 
         // Forward to the host kernel.
-        let result = syscall(call);
+        let result = host_syscall(call);
         eprintln!("{:<40} = {}", line, format_ret(name, result));
 
         // Hand the kernel's result back to the guest in the host's ABI.
@@ -48,7 +48,7 @@ impl SystemCalls for Strace {
 }
 ```
 
-`syscall(call)` issues the syscall on the host and returns a
+`host_syscall(call)` issues the syscall on the host and returns a
 `SyscallResult` — `Ok(value)` on success, `Error(errno)` on failure.
 `call.set_result(r)` writes `r` back to the guest in the host's
 return-ABI. A handler is free to do anything in between: log, deny,
