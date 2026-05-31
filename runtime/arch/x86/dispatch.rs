@@ -81,6 +81,10 @@ impl Thread {
         self.exit_code = 0;
     }
 
+    pub fn addr_space(&mut self) -> &mut AddressSpace {
+        &mut self.addr_space
+    }
+
     /// Run the guest using the thread's current entry state. Returns the
     /// guest's exit code once the `exit`/`exit_group` syscall implementation
     /// has cleared `running`; the syscall itself is never forwarded to the

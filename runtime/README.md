@@ -29,7 +29,8 @@ sandbox.run()?;
 ```
 
 `pre_syscall()` and `post_syscall()` can observe every guest syscall,
-including the few Chimera services itself for correctness.
+including the few Chimera services itself for correctness, such as
+`exit`, `execve`, `arch_prctl`, and the `mmap` family.
 `do_syscall()` is only invoked for delegated syscalls; the default
 implementation forwards to the host kernel via `host_syscall(call)`,
 which returns a `SyscallResult` — `Ok(value)` on success,

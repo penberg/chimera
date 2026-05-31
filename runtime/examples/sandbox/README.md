@@ -21,7 +21,7 @@ A workable starter policy for a dynamically linked binary looks
 something like:
 
     cargo run --example sandbox -- \
-        --allow '^(read|write|close|fstat|lseek|mmap|mprotect|munmap|brk|arch_prctl|set_tid_address|set_robust_list|rseq|prlimit64|getrandom|exit_group|openat|newfstatat|pread64)$' \
+        --allow '^(read|write|close|fstat|lseek|mprotect|brk|set_tid_address|set_robust_list|rseq|prlimit64|getrandom|openat|newfstatat|pread64)$' \
         /bin/echo hi
 
 Less is more revealing — start with `--allow '^write$'` and let the
@@ -51,8 +51,9 @@ return-ABI, so `Error(EPERM)` here makes the denial look exactly like
 a seccomp-enforced one.
 
 Only delegated syscalls reach `do_syscall()`: Chimera-owned syscalls
-like `exit_group` and the virtualized `arch_prctl` cases are handled by
-the runtime before `post_syscall()` observers run.
+like `exit`/`exit_group`, `execve`, the virtualized `arch_prctl` cases,
+and the `mmap` family are handled by the runtime before
+`post_syscall()` observers run.
 
 Unknown syscall numbers serialize as `syscall_<n>` so a user-supplied
 regex can never let one through by accident.
