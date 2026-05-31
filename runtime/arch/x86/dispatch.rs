@@ -25,6 +25,17 @@ const ARCH_SET_GS: libc::c_int = 0x1001;
 const EXIT_KIND_BLOCK: u64 = 0;
 pub const EXIT_KIND_SYSCALL: u64 = 1;
 
+/// Why [`Thread::run`] returned: the guest terminated, or it `execve`d and the
+/// caller must load the new image and re-enter the thread on it.
+pub enum ExitReason {
+    /// The guest issued `exit`/`exit_group`. Carries the exit code.
+    Exited(i32),
+    /// The guest issued an `execve`/`execveat` the handler allowed. `number`
+    /// distinguishes the two; `args` are the raw guest syscall arguments
+    /// (pathname, argv, and envp pointers among them).
+    Execve { number: u64, args: [u64; 6] },
+}
+
 /// Size of the XSAVE area in [`ThreadState::fpstate`]. The standard (non-
 /// compacted) XSAVE layout for x87+SSE+AVX+AVX-512 ends at architecturally
 /// fixed offsets totaling ~2688 bytes; 4096 leaves comfortable margin. The
@@ -52,6 +63,7 @@ pub struct Thread {
 impl Thread {
     /// Create a new guest thread.
     pub fn new(rip: u64, rsp: u64) -> Result<Self, Error> {
+        let guest_fs_base = current_fs_base();
         let mut thread = Self {
             state: Box::new(ThreadState {
                 regs: [0; 16],
@@ -69,14 +81,14 @@ impl Thread {
             running: false,
             exit_code: 0,
         };
-        thread.reset(rip, rsp);
+        thread.reset(rip, rsp, guest_fs_base);
         Ok(thread)
     }
 
     /// Reset the thread to a new entry point and a stack.
-    pub fn reset(&mut self, rip: u64, rsp: u64) {
+    pub fn reset(&mut self, rip: u64, rsp: u64, guest_fs_base: u64) {
         self.addr_space.reset();
-        self.state.reset(rip, rsp);
+        self.state.reset(rip, rsp, guest_fs_base);
         self.running = false;
         self.exit_code = 0;
     }
@@ -85,13 +97,22 @@ impl Thread {
         &mut self.addr_space
     }
 
-    /// Run the guest using the thread's current entry state. Returns the
-    /// guest's exit code once the `exit`/`exit_group` syscall implementation
-    /// has cleared `running`; the syscall itself is never forwarded to the
-    /// host kernel (that would terminate Chimera).
-    pub fn run(&mut self, mut handler: Box<dyn SystemCalls>) -> Result<i32, Error> {
+    /// Set the thread's entry registers for a freshly mapped image, without
+    /// touching its address space. Used to re-enter after an `execve` once the
+    /// caller has torn down the old image and mapped the new one.
+    pub fn enter(&mut self, rip: u64, rsp: u64) {
+        self.state.reset(rip, rsp, current_fs_base());
+    }
+
+    /// Run the guest using the thread's current entry state. Returns when the
+    /// guest issues `exit`/`exit_group` (with the code) or an allowed
+    /// `execve`/`execveat` (for the caller to act on); neither syscall is
+    /// forwarded to the host kernel. The handler observes the call first.
+    pub fn run(&mut self, handler: &mut dyn SystemCalls) -> Result<ExitReason, Error> {
+        // GS is host-thread-local, so bind it on the OS thread that is
+        // actually about to execute the translated guest.
         self.setup_gs()?;
-        self.state.setup_fs();
+        self.state.capture_chimera_fs();
         self.running = true;
 
         let block_exit = exit_block as *const () as usize as u64;
@@ -114,27 +135,36 @@ impl Thread {
                 (*ts_ptr).exit_kind = EXIT_KIND_BLOCK;
                 dispatch(ts_ptr, host_pc);
             }
-            if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL {
-                self.handle_syscall(handler.as_mut());
+            if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL
+                && let Some(reason) = self.handle_syscall(handler)
+            {
+                return Ok(reason);
             }
         }
-        Ok(self.exit_code)
+        Ok(ExitReason::Exited(self.exit_code))
     }
 
-    fn handle_syscall(&mut self, handler: &mut dyn SystemCalls) {
-        let mut call = SystemCall::new(
-            self.state.regs[RAX],
-            [
-                self.state.regs[RDI],
-                self.state.regs[RSI],
-                self.state.regs[RDX],
-                self.state.regs[R10],
-                self.state.regs[R8],
-                self.state.regs[R9],
-            ],
-        );
+    /// Service the syscall that just exited the cache. Returns `Some` only when
+    /// the guest issued an allowed `execve`/`execveat`, in which case the run
+    /// loop hands the request back to its caller to re-enter on the new image.
+    fn handle_syscall(&mut self, handler: &mut dyn SystemCalls) -> Option<ExitReason> {
+        let number = self.state.regs[RAX];
+        let args = [
+            self.state.regs[RDI],
+            self.state.regs[RSI],
+            self.state.regs[RDX],
+            self.state.regs[R10],
+            self.state.regs[R8],
+            self.state.regs[R9],
+        ];
+        let mut call = SystemCall::new(number, args);
         crate::syscall::syscall(self, &mut call, handler);
         self.state.regs[RAX] = call.return_value() as u64;
+
+        if number == libc::SYS_execve as u64 || number == libc::SYS_execveat as u64 {
+            return Some(ExitReason::Execve { number, args });
+        }
+        None
     }
 
     fn setup_gs(&self) -> Result<(), Error> {
@@ -195,14 +225,14 @@ const _: () = assert!(
 );
 
 impl ThreadState {
-    fn reset(&mut self, rip: u64, rsp: u64) {
+    fn reset(&mut self, rip: u64, rsp: u64, guest_fs_base: u64) {
         self.regs = [0; 16];
         self.rip = 0;
         self.rflags = 0;
         self.chimera_rsp = 0;
         self.host_pc_target = 0;
         self.exit_kind = 0;
-        self.guest_fs_base = 0;
+        self.guest_fs_base = guest_fs_base;
         self.chimera_fs_base = 0;
         self._align_fpstate = [0; 1];
         self.fpstate.fill(0);
@@ -220,21 +250,21 @@ impl ThreadState {
         self.rip = rip;
     }
 
-    fn setup_fs(&mut self) {
-        // Capture the executing host thread's FS base immediately before the
-        // guest starts. A fresh guest inherits that value until it issues its
-        // own `arch_prctl(ARCH_SET_FS, ...)`.
-        let chimera_fs: u64;
-        unsafe {
-            asm!(
-                "rdfsbase {0}",
-                out(reg) chimera_fs,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
-        self.chimera_fs_base = chimera_fs;
-        self.guest_fs_base = chimera_fs;
+    fn capture_chimera_fs(&mut self) {
+        self.chimera_fs_base = current_fs_base();
     }
+}
+
+fn current_fs_base() -> u64 {
+    let fs_base: u64;
+    unsafe {
+        asm!(
+            "rdfsbase {0}",
+            out(reg) fs_base,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    fs_base
 }
 
 pub const RAX: usize = 0;

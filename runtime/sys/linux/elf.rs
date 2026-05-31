@@ -61,10 +61,35 @@ pub struct LoadedElf {
     pub entry: u64,
     pub phdr_addr: u64,
     pub interp: Option<PathBuf>,
+    /// Host mappings owned by the loader for this image.
+    ///
+    /// `ET_EXEC` images record the individual `PT_LOAD` mappings created for
+    /// each segment. `ET_DYN` images reserve one contiguous PROT_NONE span up
+    /// front and then map their segments into it, so that single reservation
+    /// remains the owned region to unmap later.
     pub regions: Vec<(u64, u64)>,
 }
 
+/// Read, validate, and map an ELF image: [`parse_elf`] followed by [`map_elf`].
 pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
+    map_elf(&parse_elf(path)?)
+}
+
+/// An ELF image read and validated, but not yet mapped. Producing one touches
+/// no memory, so a malformed image is reported as a recoverable error rather
+/// than after the loader has started committing mappings.
+pub struct ParsedElf {
+    bytes: Vec<u8>,
+    ehdr: Ehdr,
+    phdrs: Vec<Phdr>,
+    pub interp: Option<PathBuf>,
+    lo: u64,
+    hi: u64,
+}
+
+/// Read an ELF image and validate that Chimera can run it, without mapping
+/// anything.
+pub fn parse_elf(path: &Path) -> Result<ParsedElf, Error> {
     let bytes = fs::read(path).map_err(|e| Error::io(format!("reading {}", path.display()), e))?;
     if bytes.len() < std::mem::size_of::<Ehdr>() {
         return Err(Error::BadBinary(format!(
@@ -131,8 +156,31 @@ pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
         }
     }
 
+    let (lo, hi) = load_range(&phdrs);
+    Ok(ParsedElf {
+        bytes,
+        ehdr,
+        phdrs,
+        interp,
+        lo,
+        hi,
+    })
+}
+
+/// Map a parsed ELF image into memory. The commit phase: the reservation and
+/// `PT_LOAD` mappings it makes cannot be rolled back.
+pub fn map_elf(parsed: &ParsedElf) -> Result<LoadedElf, Error> {
+    let ParsedElf {
+        bytes,
+        ehdr,
+        phdrs,
+        interp,
+        lo,
+        hi,
+    } = parsed;
+    let (lo, hi) = (*lo, *hi);
+
     let base = if ehdr.e_type == ET_DYN {
-        let (lo, hi) = load_range(&phdrs);
         let total = (hi - lo) as usize;
         let reservation = unsafe {
             libc::mmap(
@@ -145,11 +193,7 @@ pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
             )
         };
         if reservation == libc::MAP_FAILED {
-            return Err(Error::last_os_error(format!(
-                "reserving {} bytes for {}",
-                total,
-                path.display(),
-            )));
+            return Err(Error::last_os_error(format!("reserving {total} bytes")));
         }
         (reservation as u64).wrapping_sub(lo)
     } else {
@@ -158,12 +202,11 @@ pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
 
     let mut phdr_addr = 0u64;
     let mut regions = if ehdr.e_type == ET_DYN {
-        let (lo, hi) = load_range(&phdrs);
         vec![(base.wrapping_add(lo), hi - lo)]
     } else {
         Vec::new()
     };
-    for ph in &phdrs {
+    for ph in phdrs {
         if ph.p_type != PT_LOAD {
             continue;
         }
@@ -238,11 +281,11 @@ pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
     }
 
     Ok(LoadedElf {
-        ehdr,
+        ehdr: *ehdr,
         base,
         entry: ehdr.e_entry.wrapping_add(base),
         phdr_addr,
-        interp,
+        interp: interp.clone(),
         regions,
     })
 }

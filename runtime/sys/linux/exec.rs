@@ -1,40 +1,258 @@
-//! Guest runtime entry: build the initial stack and hand control to the dispatcher.
+//! Guest runtime entry: build the initial stack, hand control to the
+//! dispatcher, and service `execve` by loading the new image and re-entering.
 
-use std::{ffi::OsString, os::unix::ffi::OsStrExt, path::Path, ptr};
+use std::{
+    ffi::{OsStr, OsString},
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    ptr,
+};
 
-use crate::{Error, SystemCalls, arch::dispatch};
+use crate::{
+    Error, SystemCalls,
+    arch::dispatch::{self, ExitReason},
+    sys::mmap::AddressSpace,
+};
 
-use super::elf::{LoadedElf, PAGE_SIZE, load_elf};
+use super::elf::{LoadedElf, PAGE_SIZE, ParsedElf, load_elf, map_elf, parse_elf};
+
+const STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// `execveat` special dirfd and flag values (from `<fcntl.h>`).
+const AT_FDCWD: i32 = -100;
+const AT_EMPTY_PATH: i32 = 0x1000;
 
 pub fn execv(
     program: &Path,
     args: &[OsString],
     envs: Option<&[(OsString, OsString)]>,
-    handler: Box<dyn SystemCalls>,
+    mut handler: Box<dyn SystemCalls>,
 ) -> Result<i32, Error> {
-    let main = load_elf(program)?;
-
-    let (rip, interp_base, interp_regions) = if let Some(interp_path) = &main.interp {
-        let interp = load_elf(interp_path)?;
-        (interp.entry, interp.base, Some(interp.regions))
-    } else {
-        (main.entry, 0, None)
+    // The first image's argv and envp come from the embedder: argv[0] is the
+    // program path, then the supplied args; the environment is the explicit set
+    // if one was given, otherwise the host's.
+    let mut argv: Vec<Vec<u8>> = Vec::with_capacity(args.len() + 1);
+    argv.push(program.as_os_str().as_bytes().to_vec());
+    for a in args {
+        argv.push(a.as_bytes().to_vec());
+    }
+    let envp: Vec<Vec<u8>> = match envs {
+        Some(over) => over.iter().map(|(k, v)| env_pair(k, v)).collect(),
+        None => std::env::vars_os().map(|(k, v)| env_pair(&k, &v)).collect(),
     };
 
-    let (rsp, stack_start, stack_len) = build_stack(program, args, envs, &main, interp_base)?;
+    let main = load_elf(program)?;
+    let (rip, interp_base, interp) = match &main.interp {
+        Some(interp_path) => {
+            let interp = load_elf(interp_path)?;
+            (interp.entry, interp.base, Some(interp))
+        }
+        None => (main.entry, 0, None),
+    };
+    let (rsp, stack_start, stack_len) = build_stack(
+        &argv,
+        &envp,
+        program.as_os_str().as_bytes(),
+        &main,
+        interp_base,
+    )?;
 
     let mut thread = dispatch::Thread::new(rip, rsp)?;
-    let addr_space = thread.addr_space();
+    record_regions(
+        thread.addr_space(),
+        &main,
+        interp.as_ref(),
+        stack_start,
+        stack_len,
+    );
+
+    loop {
+        match thread.run(handler.as_mut())? {
+            ExitReason::Exited(code) => return Ok(code),
+            ExitReason::Execve { number, args } => {
+                // Parse the replacement image while the old one is still live.
+                // Failures here must report `-errno` to the guest and resume
+                // the original image, just like Linux `execve`.
+                let PreparedExec {
+                    req,
+                    parsed,
+                    parsed_interp,
+                } = match prepare_exec(number, &args) {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        if let Some(errno) = exec_errno(&err) {
+                            thread.state.regs[dispatch::RAX] = (-(errno as i64)) as u64;
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                };
+
+                // Tear down the old image (unmapping its regions, so a fixed
+                // ET_EXEC can reuse its addresses), then map the new one.
+                thread.addr_space().reset();
+                let main = map_elf(&parsed)?;
+                let (rip, interp_base, interp) = match &parsed_interp {
+                    Some(parsed_interp) => {
+                        let interp = map_elf(parsed_interp)?;
+                        (interp.entry, interp.base, Some(interp))
+                    }
+                    None => (main.entry, 0, None),
+                };
+                let (rsp, stack_start, stack_len) = build_stack(
+                    &req.argv,
+                    &req.envp,
+                    req.path.as_os_str().as_bytes(),
+                    &main,
+                    interp_base,
+                )?;
+                record_regions(
+                    thread.addr_space(),
+                    &main,
+                    interp.as_ref(),
+                    stack_start,
+                    stack_len,
+                );
+                thread.enter(rip, rsp);
+            }
+        }
+    }
+}
+
+struct PreparedExec {
+    req: ExecRequest,
+    parsed: ParsedElf,
+    parsed_interp: Option<ParsedElf>,
+}
+
+fn prepare_exec(number: u64, args: &[u64; 6]) -> Result<PreparedExec, Error> {
+    let req = read_request(number, args);
+    let parsed = parse_elf(&req.path)?;
+    let parsed_interp = match &parsed.interp {
+        Some(interp_path) => Some(parse_elf(interp_path)?),
+        None => None,
+    };
+    Ok(PreparedExec {
+        req,
+        parsed,
+        parsed_interp,
+    })
+}
+
+fn exec_errno(err: &Error) -> Option<i32> {
+    match err {
+        Error::Io { source, .. } => Some(source.raw_os_error().unwrap_or(libc::EIO)),
+        Error::BadBinary(_) | Error::Link(_) | Error::Unsupported(_) => Some(libc::ENOEXEC),
+        Error::CodeCacheExhausted | Error::Translate(_) | Error::UnsupportedHost { .. } => None,
+    }
+}
+
+/// Format a `KEY=VALUE` environment entry (no trailing NUL; `build_stack` adds
+/// it).
+fn env_pair(key: &OsStr, value: &OsStr) -> Vec<u8> {
+    let mut s = key.as_bytes().to_vec();
+    s.push(b'=');
+    s.extend_from_slice(value.as_bytes());
+    s
+}
+
+/// Record an image's mappings and its stack as regions of the address space,
+/// so they are unmapped when the address space is torn down.
+fn record_regions(
+    addr_space: &mut AddressSpace,
+    main: &LoadedElf,
+    interp: Option<&LoadedElf>,
+    stack_start: usize,
+    stack_len: usize,
+) {
     for &(start, len) in &main.regions {
         addr_space.add_region(start as usize, len as usize);
     }
-    if let Some(regions) = interp_regions {
-        for (start, len) in regions {
+    if let Some(interp) = interp {
+        for &(start, len) in &interp.regions {
             addr_space.add_region(start as usize, len as usize);
         }
     }
     addr_space.add_region(stack_start, stack_len);
-    thread.run(handler)
+}
+
+/// A decoded `execve`/`execveat` request, copied out of guest memory.
+struct ExecRequest {
+    path: PathBuf,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+}
+
+/// Read an `execve`/`execveat` request out of guest memory. Chimera and the
+/// guest share an address space, so the pathname, argv, and envp pointers are
+/// plain dereferences.
+fn read_request(number: u64, args: &[u64; 6]) -> ExecRequest {
+    let (path, argv_ptr, envp_ptr) = if number == libc::SYS_execveat as u64 {
+        let dirfd = args[0] as i32;
+        let raw = unsafe { read_cstr(args[1]) };
+        let flags = args[4] as i32;
+        (resolve_at(dirfd, &raw, flags), args[2], args[3])
+    } else {
+        let raw = unsafe { read_cstr(args[0]) };
+        (PathBuf::from(OsStr::from_bytes(&raw)), args[1], args[2])
+    };
+    ExecRequest {
+        path,
+        argv: unsafe { read_ptr_array(argv_ptr) },
+        envp: unsafe { read_ptr_array(envp_ptr) },
+    }
+}
+
+/// Resolve an `execveat` pathname against its `dirfd` and flags. An absolute
+/// path or `AT_FDCWD` is used directly; `AT_EMPTY_PATH` with an empty pathname
+/// names the open fd itself (`fexecve`); otherwise the path is relative to the
+/// directory the fd refers to. The fd cases route through `/proc/self/fd`.
+fn resolve_at(dirfd: i32, raw: &[u8], flags: i32) -> PathBuf {
+    if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        return PathBuf::from(format!("/proc/self/fd/{dirfd}"));
+    }
+    let path = Path::new(OsStr::from_bytes(raw));
+    if path.is_absolute() || dirfd == AT_FDCWD {
+        return path.to_path_buf();
+    }
+    PathBuf::from(format!("/proc/self/fd/{dirfd}")).join(path)
+}
+
+/// Read a NUL-terminated C string from guest memory, without the terminator.
+unsafe fn read_cstr(ptr: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    if ptr == 0 {
+        return out;
+    }
+    let mut i = 0usize;
+    loop {
+        let b = unsafe { ptr::read((ptr as *const u8).add(i)) };
+        if b == 0 {
+            break;
+        }
+        out.push(b);
+        i += 1;
+    }
+    out
+}
+
+/// Read a NULL-terminated array of C-string pointers (an argv or envp) from
+/// guest memory, returning each string's bytes (no terminator).
+unsafe fn read_ptr_array(ptr: u64) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    if ptr == 0 {
+        return out;
+    }
+    let mut i = 0usize;
+    loop {
+        let entry = unsafe { ptr::read((ptr as *const u64).add(i)) };
+        if entry == 0 {
+            break;
+        }
+        out.push(unsafe { read_cstr(entry) });
+        i += 1;
+    }
+    out
 }
 
 unsafe fn push_bytes(p: &mut u64, b: &[u8]) -> u64 {
@@ -45,14 +263,25 @@ unsafe fn push_bytes(p: &mut u64, b: &[u8]) -> u64 {
     *p
 }
 
+/// Push a string and its NUL terminator onto the descending stack, returning
+/// the address of the first byte.
+unsafe fn push_str(p: &mut u64, s: &[u8]) -> u64 {
+    unsafe {
+        push_bytes(p, &[0]);
+        push_bytes(p, s)
+    }
+}
+
+/// Build the initial stack from already-formed `argv` and `envp` (each entry
+/// carrying no trailing NUL) and the `execfn` path for `AT_EXECFN`. Returns the
+/// guest `rsp` and the `(start, len)` of the stack mapping.
 fn build_stack(
-    program: &Path,
-    args: &[OsString],
-    envs_override: Option<&[(OsString, OsString)]>,
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+    execfn: &[u8],
     main: &LoadedElf,
     interp_base: u64,
 ) -> Result<(u64, usize, usize), Error> {
-    const STACK_SIZE: usize = 8 * 1024 * 1024;
     let stack = unsafe {
         libc::mmap(
             ptr::null_mut(),
@@ -68,56 +297,24 @@ fn build_stack(
     }
     let mut p = (stack as u64) + STACK_SIZE as u64;
 
-    let mut argv_strs: Vec<Vec<u8>> = Vec::with_capacity(args.len() + 1);
-    let mut argv0 = program.as_os_str().as_bytes().to_vec();
-    argv0.push(0);
-    argv_strs.push(argv0);
-    for a in args {
-        let mut b = a.as_bytes().to_vec();
-        b.push(0);
-        argv_strs.push(b);
-    }
-
-    let mut envp_strs: Vec<Vec<u8>> = Vec::new();
-    if let Some(over) = envs_override {
-        for (k, v) in over {
-            let mut s = k.as_bytes().to_vec();
-            s.push(b'=');
-            s.extend_from_slice(v.as_bytes());
-            s.push(0);
-            envp_strs.push(s);
-        }
-    } else {
-        for (k, v) in std::env::vars_os() {
-            let mut s = k.as_bytes().to_vec();
-            s.push(b'=');
-            s.extend_from_slice(v.as_bytes());
-            s.push(0);
-            envp_strs.push(s);
-        }
-    }
-
-    let mut execfn = program.as_os_str().as_bytes().to_vec();
-    execfn.push(0);
-
     let random = [0xa5u8; 16];
 
-    let mut argv_addrs: Vec<u64> = argv_strs
+    let mut argv_addrs: Vec<u64> = argv
         .iter()
         .rev()
-        .map(|s| unsafe { push_bytes(&mut p, s) })
+        .map(|s| unsafe { push_str(&mut p, s) })
         .collect();
     argv_addrs.reverse();
 
-    let mut envp_addrs: Vec<u64> = envp_strs
+    let mut envp_addrs: Vec<u64> = envp
         .iter()
         .rev()
-        .map(|s| unsafe { push_bytes(&mut p, s) })
+        .map(|s| unsafe { push_str(&mut p, s) })
         .collect();
     envp_addrs.reverse();
 
     let at_platform = unsafe { push_bytes(&mut p, b"x86_64\0") };
-    let at_execfn = unsafe { push_bytes(&mut p, &execfn) };
+    let at_execfn = unsafe { push_str(&mut p, execfn) };
     let at_random = unsafe { push_bytes(&mut p, &random) };
 
     let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) };
@@ -150,11 +347,9 @@ fn build_stack(
     }
     auxv.push((libc::AT_NULL, 0));
 
-    let argc = argv_strs.len() as u64;
-    let fixed_size = 8u64
-        + (argv_strs.len() as u64 + 1) * 8
-        + (envp_strs.len() as u64 + 1) * 8
-        + (auxv.len() as u64) * 16;
+    let argc = argv.len() as u64;
+    let fixed_size =
+        8u64 + (argv.len() as u64 + 1) * 8 + (envp.len() as u64 + 1) * 8 + (auxv.len() as u64) * 16;
 
     let target_rsp = (p - fixed_size) & !15;
     p = target_rsp;
