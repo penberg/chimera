@@ -1,0 +1,237 @@
+//! The guest address space: the translated-block cache, the guest-PC to host-PC
+//! map, and the guest mappings Chimera owns on the host.
+
+use std::{collections::HashMap, sync::OnceLock};
+
+use crate::{Error, arch::x86::translate::CodeCache};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Region {
+    start: usize,
+    len: usize,
+}
+
+/// A guest address space: the cache of translated blocks, the map from guest
+/// PC to the host PC where each block begins, and the host mappings created
+/// for the guest. Mirrors the Linux kernel's `mm_struct`.
+pub struct AddressSpace {
+    pub cache: CodeCache,
+    pub map: HashMap<u64, u64>,
+    regions: Vec<Region>,
+}
+
+impl AddressSpace {
+    pub fn new() -> Result<Self, Error> {
+        Ok(Self {
+            cache: CodeCache::new()?,
+            map: HashMap::new(),
+            regions: Vec::new(),
+        })
+    }
+
+    pub fn add_region(&mut self, start: usize, len: usize) {
+        let len = round_mapping_len(len);
+        if len == 0 {
+            return;
+        }
+        self.remove_region(start, len);
+        self.regions.push(Region { start, len });
+        self.coalesce_regions();
+    }
+
+    pub fn remove_region(&mut self, start: usize, len: usize) {
+        let len = round_mapping_len(len);
+        if len == 0 {
+            return;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return;
+        };
+        let mut kept = Vec::with_capacity(self.regions.len() + 1);
+        for region in self.regions.drain(..) {
+            let region_end = region.start.saturating_add(region.len);
+            if end <= region.start || start >= region_end {
+                kept.push(region);
+                continue;
+            }
+            if region.start < start {
+                kept.push(Region {
+                    start: region.start,
+                    len: start - region.start,
+                });
+            }
+            if end < region_end {
+                kept.push(Region {
+                    start: end,
+                    len: region_end - end,
+                });
+            }
+        }
+        self.regions = kept;
+    }
+
+    pub fn remap_region(
+        &mut self,
+        old_start: usize,
+        old_len: usize,
+        new_start: usize,
+        new_len: usize,
+        dontunmap: bool,
+    ) {
+        let old_len = round_mapping_len(old_len);
+        let new_len = round_mapping_len(new_len);
+
+        if dontunmap {
+            self.add_region(new_start, new_len);
+            return;
+        }
+        if old_len != 0 {
+            self.remove_region(old_start, old_len);
+        }
+        self.add_region(new_start, new_len);
+    }
+
+    pub fn reset(&mut self) {
+        self.clear_regions();
+        self.cache.reset();
+        self.map.clear();
+    }
+
+    fn clear_regions(&mut self) {
+        for region in self.regions.drain(..) {
+            let ret = unsafe { libc::munmap(region.start as *mut libc::c_void, region.len) };
+            debug_assert_eq!(ret, 0, "guest region munmap failed");
+        }
+    }
+
+    fn coalesce_regions(&mut self) {
+        self.regions.sort_unstable_by_key(|region| region.start);
+        let mut merged: Vec<Region> = Vec::with_capacity(self.regions.len());
+        for region in self.regions.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                let last_end = last.start.saturating_add(last.len);
+                let region_end = region.start.saturating_add(region.len);
+                if region.start <= last_end {
+                    last.len = region_end.max(last_end) - last.start;
+                    continue;
+                }
+            }
+            merged.push(region);
+        }
+        self.regions = merged;
+    }
+}
+
+impl Drop for AddressSpace {
+    fn drop(&mut self) {
+        self.clear_regions();
+    }
+}
+
+fn round_mapping_len(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    let page_size = host_page_size();
+    match len.checked_add(page_size - 1) {
+        Some(rounded) => rounded / page_size * page_size,
+        None => usize::MAX / page_size * page_size,
+    }
+}
+
+fn host_page_size() -> usize {
+    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
+
+    *PAGE_SIZE.get_or_init(|| {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page_size > 0, "host page size unavailable");
+        page_size as usize
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ptr;
+
+    const PAGE_SIZE: usize = 4096;
+
+    fn mmap_anon(len: usize) -> usize {
+        let addr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        addr as usize
+    }
+
+    #[test]
+    fn add_region_coalesces_adjacent_ranges() {
+        let mut addr_space = AddressSpace::new().unwrap();
+        let base = mmap_anon(PAGE_SIZE * 2);
+
+        addr_space.add_region(base, PAGE_SIZE);
+        addr_space.add_region(base + PAGE_SIZE, PAGE_SIZE);
+
+        assert_eq!(
+            addr_space.regions,
+            vec![Region {
+                start: base,
+                len: PAGE_SIZE * 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn remove_region_splits_partial_unmap() {
+        let mut addr_space = AddressSpace::new().unwrap();
+        let base = mmap_anon(PAGE_SIZE * 3);
+        addr_space.add_region(base, PAGE_SIZE * 3);
+
+        addr_space.remove_region(base + PAGE_SIZE, PAGE_SIZE);
+        assert_eq!(
+            addr_space.regions,
+            vec![
+                Region {
+                    start: base,
+                    len: PAGE_SIZE,
+                },
+                Region {
+                    start: base + (PAGE_SIZE * 2),
+                    len: PAGE_SIZE,
+                },
+            ]
+        );
+
+        let ret = unsafe { libc::munmap((base + PAGE_SIZE) as *mut libc::c_void, PAGE_SIZE) };
+        assert_eq!(ret, 0);
+    }
+
+    #[test]
+    fn remap_region_moves_mapping() {
+        let mut addr_space = AddressSpace::new().unwrap();
+        let old = mmap_anon(PAGE_SIZE);
+        let new = mmap_anon(PAGE_SIZE);
+
+        addr_space.add_region(old, PAGE_SIZE);
+        addr_space.remap_region(old, PAGE_SIZE, new, PAGE_SIZE, false);
+
+        assert_eq!(
+            addr_space.regions,
+            vec![Region {
+                start: new,
+                len: PAGE_SIZE,
+            }]
+        );
+
+        let ret = unsafe { libc::munmap(old as *mut libc::c_void, PAGE_SIZE) };
+        assert_eq!(ret, 0);
+    }
+}

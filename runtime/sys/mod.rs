@@ -4,6 +4,9 @@
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(target_arch = "x86_64")]
+pub mod mmap;
+
 #[cfg(target_os = "linux")]
 pub use linux::exec;
 

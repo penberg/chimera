@@ -61,6 +61,7 @@ pub struct LoadedElf {
     pub entry: u64,
     pub phdr_addr: u64,
     pub interp: Option<PathBuf>,
+    pub regions: Vec<(u64, u64)>,
 }
 
 pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
@@ -156,6 +157,12 @@ pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
     };
 
     let mut phdr_addr = 0u64;
+    let mut regions = if ehdr.e_type == ET_DYN {
+        let (lo, hi) = load_range(&phdrs);
+        vec![(base.wrapping_add(lo), hi - lo)]
+    } else {
+        Vec::new()
+    };
     for ph in &phdrs {
         if ph.p_type != PT_LOAD {
             continue;
@@ -205,6 +212,9 @@ pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
                 p, vstart
             )));
         }
+        if ehdr.e_type == ET_EXEC {
+            regions.push((vstart, len as u64));
+        }
 
         if ph.p_filesz > 0 {
             unsafe {
@@ -233,6 +243,7 @@ pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
         entry: ehdr.e_entry.wrapping_add(base),
         phdr_addr,
         interp,
+        regions,
     })
 }
 

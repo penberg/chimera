@@ -51,6 +51,8 @@ delegated syscalls and defaults to forwarding them with
 
 The Chimera runtime intercepts `arch_prctl(ARCH_SET_FS, ...)` inside
 `syscall` so the guest's TLS setup doesn't disturb the runtime's own
-FS-base register, and it terminates `exit`/`exit_group` itself instead
-of forwarding them to the host kernel. Logging in `post_syscall()`
-keeps those syscalls visible without making them interceptable.
+FS-base register, handles the `mmap` family itself so guest mapping
+bookkeeping stays authoritative, and terminates `exit`/`exit_group`
+itself instead of forwarding them to the host kernel. Logging in
+`post_syscall()` keeps those syscalls visible without making them
+interceptable.

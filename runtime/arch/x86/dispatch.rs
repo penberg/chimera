@@ -10,13 +10,13 @@
 //! issues `exit_group` or `exit`. The boundary-crossing assembly lives in
 //! [`super::trampoline`].
 
-use std::{arch::asm, collections::HashMap};
+use std::arch::asm;
 
-use crate::{Error, SystemCall, SystemCalls};
+use crate::{Error, SystemCall, SystemCalls, sys::mmap::AddressSpace};
 
 use super::{
     trampoline::{dispatch, exit_block, exit_syscall},
-    translate::{CodeCache, translate},
+    translate::translate,
 };
 
 /// Linux x86-64 `arch_prctl` subfunction code: set the GS base.
@@ -79,6 +79,10 @@ impl Thread {
         self.state.reset(rip, rsp);
         self.running = false;
         self.exit_code = 0;
+    }
+
+    pub fn addr_space(&mut self) -> &mut AddressSpace {
+        &mut self.addr_space
     }
 
     /// Run the guest using the thread's current entry state. Returns the
@@ -241,25 +245,3 @@ pub const RSP: usize = 7;
 pub const R8: usize = 8;
 pub const R9: usize = 9;
 pub const R10: usize = 10;
-
-/// A guest address space: the cache of translated blocks and the map from
-/// guest PC to the host PC where each block begins. Mirrors the Linux kernel's
-/// `mm_struct`.
-pub struct AddressSpace {
-    cache: CodeCache,
-    map: HashMap<u64, u64>,
-}
-
-impl AddressSpace {
-    pub fn new() -> Result<Self, Error> {
-        Ok(Self {
-            cache: CodeCache::new()?,
-            map: HashMap::new(),
-        })
-    }
-
-    fn reset(&mut self) {
-        self.cache.reset();
-        self.map.clear();
-    }
-}

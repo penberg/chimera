@@ -14,16 +14,26 @@ pub fn execv(
 ) -> Result<i32, Error> {
     let main = load_elf(program)?;
 
-    let (rip, interp_base) = if let Some(interp_path) = &main.interp {
+    let (rip, interp_base, interp_regions) = if let Some(interp_path) = &main.interp {
         let interp = load_elf(interp_path)?;
-        (interp.entry, interp.base)
+        (interp.entry, interp.base, Some(interp.regions))
     } else {
-        (main.entry, 0)
+        (main.entry, 0, None)
     };
 
-    let rsp = build_stack(program, args, envs, &main, interp_base)?;
+    let (rsp, stack_start, stack_len) = build_stack(program, args, envs, &main, interp_base)?;
 
     let mut thread = dispatch::Thread::new(rip, rsp)?;
+    let addr_space = thread.addr_space();
+    for &(start, len) in &main.regions {
+        addr_space.add_region(start as usize, len as usize);
+    }
+    if let Some(regions) = interp_regions {
+        for (start, len) in regions {
+            addr_space.add_region(start as usize, len as usize);
+        }
+    }
+    addr_space.add_region(stack_start, stack_len);
     thread.run(handler)
 }
 
@@ -41,7 +51,7 @@ fn build_stack(
     envs_override: Option<&[(OsString, OsString)]>,
     main: &LoadedElf,
     interp_base: u64,
-) -> Result<u64, Error> {
+) -> Result<(u64, usize, usize), Error> {
     const STACK_SIZE: usize = 8 * 1024 * 1024;
     let stack = unsafe {
         libc::mmap(
@@ -171,5 +181,5 @@ fn build_stack(
         }
     }
 
-    Ok(target_rsp)
+    Ok((target_rsp, stack as usize, STACK_SIZE))
 }

@@ -121,7 +121,7 @@ impl SystemCall {
 /// syscalls are handed to [`SystemCalls::do_syscall`], while
 /// [`SystemCalls::pre_syscall`] and [`SystemCalls::post_syscall`] can observe
 /// every guest syscall, including the few Chimera intercepts for its own
-/// correctness (`exit`, `execve`, `arch_prctl`).
+/// correctness (`exit`, `execve`, `arch_prctl`, `mmap`, `munmap`, `mremap`).
 pub trait SystemCalls {
     /// Observe a guest syscall before Chimera or the embedder services it.
     fn pre_syscall(&mut self, _call: &SystemCall) {}
@@ -162,13 +162,14 @@ pub enum SyscallResult {
 //
 // `syscall` (on Linux) is the runtime entry the arch dispatcher calls once per
 // guest syscall instruction: it intercepts the calls Chimera must service
-// itself (`exit`/`exit_group`, `execve`/`execveat`, `arch_prctl`) and hands
-// the rest to the embedder hooks. On Darwin and unsupported hosts the file
-// only exposes `host_syscall` — the unified driver is Linux-only for now.
+// itself (`exit`/`exit_group`, `execve`/`execveat`, `arch_prctl`, the
+// `mmap` family) and hands the rest to the embedder hooks. On Darwin and
+// unsupported hosts the file only exposes `host_syscall` — the unified
+// driver is Linux-only for now.
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod host {
-    use super::{SyscallResult, SystemCall, SystemCalls};
+    use super::{SyscallResult, SystemCall, SystemCalls, host_syscall_};
     use crate::arch::dispatch::Thread;
 
     /// Drive one guest syscall. Runtime-owned syscalls are serviced inline
@@ -194,6 +195,11 @@ mod host {
     /// `ARCH_GET_FS` reads it back, both without touching the kernel.
     /// `ARCH_SET_GS`/`ARCH_GET_GS` return `EINVAL`. Unknown subfunctions fall
     /// through to the embedder.
+    ///
+    /// `mmap`/`munmap`/`mremap` are also runtime-owned: Chimera forwards them
+    /// to the host kernel itself so its guest-mapping bookkeeping stays
+    /// authoritative. Embedders can observe them in `pre_syscall()` and
+    /// `post_syscall()`, but they do not reach `do_syscall()`.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -246,6 +252,48 @@ mod host {
                 }
                 _ => {} // unknown subfunction: delegate to the embedder
             }
+        }
+
+        if call.number == libc::SYS_mmap as u64 {
+            let result = host_syscall_(call);
+            if let SyscallResult::Ok(addr) = result {
+                thread
+                    .addr_space()
+                    .add_region(addr as usize, call.args[1] as usize);
+            }
+            call.set_result(result);
+            handler.post_syscall(call);
+            return;
+        }
+
+        if call.number == libc::SYS_munmap as u64 {
+            let result = host_syscall_(call);
+            if matches!(result, SyscallResult::Ok(_)) {
+                thread
+                    .addr_space()
+                    .remove_region(call.args[0] as usize, call.args[1] as usize);
+            }
+            call.set_result(result);
+            handler.post_syscall(call);
+            return;
+        }
+
+        if call.number == libc::SYS_mremap as u64 {
+            let result = host_syscall_(call);
+            if let SyscallResult::Ok(new_start) = result {
+                let flags = call.args[3] as libc::c_int;
+                let dontunmap = (flags & libc::MREMAP_DONTUNMAP) != 0;
+                thread.addr_space().remap_region(
+                    call.args[0] as usize,
+                    call.args[1] as usize,
+                    new_start as usize,
+                    call.args[2] as usize,
+                    dontunmap,
+                );
+            }
+            call.set_result(result);
+            handler.post_syscall(call);
+            return;
         }
 
         handler.do_syscall(call);
