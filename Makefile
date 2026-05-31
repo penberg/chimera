@@ -7,6 +7,11 @@ build:
 check: conformance-native conformance
 .PHONY: check
 
+# Run the GitHub Actions CI workflow locally with Agent CI (https://agent-ci.dev/).
+ci:
+	npx @redwoodjs/agent-ci run --workflow .github/workflows/ci.yml
+.PHONY: ci
+
 conformance: build
 	python3 testing/lit.py --runner "$(RUNNER)"
 .PHONY: conformance
