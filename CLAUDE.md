@@ -47,3 +47,5 @@ CLI options live in `opts.rs` and are derived with [`argh`](https://github.com/g
 ## Tests
 
 `make conformance` builds Chimera and runs each test under it; `make conformance-native` runs the same tests directly without Chimera. The runner is `testing/lit.py`, modeled after LLVM's LIT: each test source carries one or more `// RUN:` directives that the runner expands and executes. Tests live under `testing/conformance/` and are organized by topic.
+
+`make ci` runs the GitHub Actions workflow (`.github/workflows/ci.yml` — rustfmt, clippy, build, test, conformance) locally with [Agent CI](https://agent-ci.dev/), reproducing what GitHub runs on push. It uses a custom runner image, `.github/agent-ci.Dockerfile`, that adds the build toolchain and rustup the default minimal runner lacks; keep its pinned toolchain in sync with `rust-toolchain.toml`.
