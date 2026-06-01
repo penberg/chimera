@@ -168,6 +168,12 @@ mod host {
     /// `mmap` family, `mprotect`/`pkey_mprotect` are not otherwise
     /// runtime-owned: they still reach `do_syscall()`, only with `PROT_EXEC`
     /// already cleared from their argument.
+    ///
+    /// `clone` is refused with `EPERM` when it requests `CLONE_VM`, a new thread
+    /// sharing the address space: Chimera is single-threaded, and the new host
+    /// thread would execute guest code with no translator context, natively.
+    /// Without `CLONE_VM` the call is an ordinary `fork`, whose copy-on-write
+    /// child carries Chimera and resumes in translated code, so it is forwarded.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -232,6 +238,17 @@ mod host {
                 // one (see `crate::sys::linux::exec`); report success so observers
                 // see the allowed call.
                 call.set_result(SyscallResult::Ok(0));
+            }
+            // A `clone` that creates a new thread sharing this address space
+            // (`CLONE_VM`) would have the host kernel run guest code on the new
+            // thread with no Chimera context — natively, never through the
+            // translator — a sandbox escape (and, today, a crash). Refuse it with
+            // `EPERM`. A `clone` without `CLONE_VM` is an ordinary `fork`: a
+            // copy-on-write duplicate of the whole process, Chimera included,
+            // that resumes in translated code, so it falls through to the default
+            // arm and is forwarded.
+            libc::SYS_clone if call.args[0] & libc::CLONE_VM as u64 != 0 => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
             }
             libc::SYS_arch_prctl => {
                 const ARCH_SET_GS: u64 = 0x1001;
