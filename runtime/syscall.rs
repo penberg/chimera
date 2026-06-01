@@ -177,6 +177,11 @@ mod host {
     /// is forwarded. (`clone3` carries its flags in a `clone_args` struct rather
     /// than a register; the rest is identical.) `vfork` always shares the
     /// address space and has no `fork`-shaped variant, so it is refused outright.
+    ///
+    /// The io_uring interface (`io_uring_setup`/`io_uring_enter`/
+    /// `io_uring_register`) is refused with `EPERM`: it would let the guest
+    /// queue system calls the kernel runs asynchronously, never passing them
+    /// back through this driver, bypassing every interception here.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -266,6 +271,15 @@ mod host {
             // on the same stack — there is no `fork`-shaped variant to allow, so
             // refuse it outright.
             libc::SYS_vfork => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // io_uring lets the guest queue system calls that the kernel then
+            // executes asynchronously, on its own, without ever passing them
+            // back through Chimera's syscall path — a direct way around every
+            // interception above. Refuse the whole interface: denying
+            // `io_uring_setup` stops a ring from ever existing, and denying
+            // `enter`/`register` covers any fd that slipped through.
+            libc::SYS_io_uring_setup | libc::SYS_io_uring_enter | libc::SYS_io_uring_register => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
             libc::SYS_arch_prctl => {
