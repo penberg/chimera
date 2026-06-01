@@ -288,11 +288,44 @@ mod host {
                 thread.sigreturn();
                 call.set_return(thread.state.regs[0] as i64);
             }
+            libc::SYS_uname => {
+                // `uname` is the conventional channel a guest uses to learn what
+                // it is running under, the same field WSL marks. The embedder
+                // still services the call (the default forwards it to the host);
+                // afterward Chimera unconditionally tags the kernel `release`
+                // string so a cooperating guest or a shell `uname -r` can tell it
+                // is under Chimera. The tag is a suffix, leaving the numeric
+                // version prefix glibc parses intact, and `sysname` stays "Linux"
+                // because Chimera presents the Linux syscall ABI.
+                handler.do_syscall(call);
+                if let Some(SyscallResult::Ok(_)) = call.result() {
+                    let uts = call.args[0] as *mut libc::utsname;
+                    if !uts.is_null() {
+                        unsafe { append_chimera_tag(&mut (*uts).release) };
+                    }
+                }
+            }
             _ => {
                 handler.do_syscall(call);
             }
         };
         handler.post_syscall(call);
+    }
+
+    /// Append `-chimera` to a NUL-terminated `uname` field in place, preserving
+    /// the existing contents and the NUL terminator. Does nothing if the field
+    /// has no room for the suffix, so an unexpectedly full buffer is left as the
+    /// host wrote it rather than truncated.
+    fn append_chimera_tag(field: &mut [libc::c_char]) {
+        const TAG: &[u8] = b"-chimera";
+        let len = field.iter().position(|&c| c == 0).unwrap_or(field.len());
+        if len + TAG.len() + 1 > field.len() {
+            return;
+        }
+        for (i, &b) in TAG.iter().enumerate() {
+            field[len + i] = b as libc::c_char;
+        }
+        field[len + TAG.len()] = 0;
     }
 }
 
