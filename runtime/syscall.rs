@@ -169,11 +169,13 @@ mod host {
     /// runtime-owned: they still reach `do_syscall()`, only with `PROT_EXEC`
     /// already cleared from their argument.
     ///
-    /// `clone` is refused with `EPERM` when it requests `CLONE_VM`, a new thread
-    /// sharing the address space: Chimera is single-threaded, and the new host
-    /// thread would execute guest code with no translator context, natively.
-    /// Without `CLONE_VM` the call is an ordinary `fork`, whose copy-on-write
-    /// child carries Chimera and resumes in translated code, so it is forwarded.
+    /// `clone`/`clone3` are refused with `EPERM` when they request `CLONE_VM`, a
+    /// new thread sharing the address space: Chimera is single-threaded, and the
+    /// new host thread would execute guest code with no translator context,
+    /// natively. Without `CLONE_VM` the call is an ordinary `fork`, whose
+    /// copy-on-write child carries Chimera and resumes in translated code, so it
+    /// is forwarded. (`clone3` carries its flags in a `clone_args` struct rather
+    /// than a register; the rest is identical.)
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -250,6 +252,14 @@ mod host {
             libc::SYS_clone if call.args[0] & libc::CLONE_VM as u64 != 0 => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
+            // `clone3` is the same escape as `clone` above, but carries its
+            // flags in the `clone_args` struct `args[0]` points at rather than
+            // in a register. Refuse it when those flags request `CLONE_VM`; a
+            // `clone3` without it (the `fork`-shaped case) falls through to the
+            // default arm and is forwarded.
+            libc::SYS_clone3 if clone3_requests_vm(call.args[0]) => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
             libc::SYS_arch_prctl => {
                 const ARCH_SET_GS: u64 = 0x1001;
                 const ARCH_SET_FS: u64 = 0x1002;
@@ -310,6 +320,18 @@ mod host {
             }
         };
         handler.post_syscall(call);
+    }
+
+    /// Whether a `clone3` whose `clone_args` struct lives at `args_ptr` requests
+    /// `CLONE_VM`. The flags are the first `u64` of the struct; Chimera shares
+    /// the guest's address space, so this is a plain read. A null pointer
+    /// carries no flags — the kernel rejects it with `EFAULT` once forwarded.
+    fn clone3_requests_vm(args_ptr: u64) -> bool {
+        if args_ptr == 0 {
+            return false;
+        }
+        let flags = unsafe { core::ptr::read(args_ptr as *const u64) };
+        flags & libc::CLONE_VM as u64 != 0
     }
 }
 
