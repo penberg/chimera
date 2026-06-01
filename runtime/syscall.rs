@@ -184,7 +184,9 @@ mod host {
     /// back through this driver, bypassing every interception here. `shmat`/
     /// `shmdt` are refused for a related reason: `shmat` maps shared memory
     /// outside the runtime's `mmap` bookkeeping (and `SHM_EXEC` would dodge
-    /// W^X), so the segment is never tracked.
+    /// W^X), so the segment is never tracked. `remap_file_pages` is refused
+    /// because it rebinds the pages under an existing mapping, which can change
+    /// the bytes at an already-translated guest PC behind the translator's back.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -291,6 +293,15 @@ mod host {
             // and `shmdt` tears such a mapping back down. Refuse both with
             // `EPERM`; `shmget` alone only allocates an id and maps nothing.
             libc::SYS_shmat | libc::SYS_shmdt => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `remap_file_pages` rebinds the file pages backing an existing
+            // mapping without changing its address, so the bytes at a guest PC
+            // the translator has already cached can change underneath it (a
+            // stale-translation hole), and the resulting nonlinear mapping
+            // escapes the runtime's region bookkeeping. It is deprecated and
+            // emulated by the kernel anyway; refuse it with `EPERM`.
+            libc::SYS_remap_file_pages => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
             libc::SYS_arch_prctl => {
