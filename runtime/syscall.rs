@@ -175,7 +175,8 @@ mod host {
     /// natively. Without `CLONE_VM` the call is an ordinary `fork`, whose
     /// copy-on-write child carries Chimera and resumes in translated code, so it
     /// is forwarded. (`clone3` carries its flags in a `clone_args` struct rather
-    /// than a register; the rest is identical.)
+    /// than a register; the rest is identical.) `vfork` always shares the
+    /// address space and has no `fork`-shaped variant, so it is refused outright.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -258,6 +259,13 @@ mod host {
             // `clone3` without it (the `fork`-shaped case) falls through to the
             // default arm and is forwarded.
             libc::SYS_clone3 if clone3_requests_vm(call.args[0]) => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `vfork` always shares the address space (`CLONE_VM`) and, worse,
+            // suspends the parent until the child execs or exits while both run
+            // on the same stack — there is no `fork`-shaped variant to allow, so
+            // refuse it outright.
+            libc::SYS_vfork => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
             libc::SYS_arch_prctl => {
