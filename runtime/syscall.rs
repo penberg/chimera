@@ -187,6 +187,8 @@ mod host {
     /// W^X), so the segment is never tracked. `remap_file_pages` is refused
     /// because it rebinds the pages under an existing mapping, which can change
     /// the bytes at an already-translated guest PC behind the translator's back.
+    /// `ptrace` is refused because it reads and writes a process's memory and
+    /// registers out of band, ignoring page protection and the translator both.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -302,6 +304,15 @@ mod host {
             // escapes the runtime's region bookkeeping. It is deprecated and
             // emulated by the kernel anyway; refuse it with `EPERM`.
             libc::SYS_remap_file_pages => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `ptrace` is an out-of-band channel into another process: it reads
+            // and writes registers and memory regardless of page protection
+            // (`PTRACE_POKETEXT`/`POKEDATA`) and redirects control flow, none of
+            // which passes through the translator. A traced peer — or, with a
+            // future multi-process model, Chimera itself — could be driven
+            // straight out of the sandbox. Refuse it with `EPERM`.
+            libc::SYS_ptrace => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
             libc::SYS_arch_prctl => {
