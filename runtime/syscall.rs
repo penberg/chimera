@@ -181,7 +181,10 @@ mod host {
     /// The io_uring interface (`io_uring_setup`/`io_uring_enter`/
     /// `io_uring_register`) is refused with `EPERM`: it would let the guest
     /// queue system calls the kernel runs asynchronously, never passing them
-    /// back through this driver, bypassing every interception here.
+    /// back through this driver, bypassing every interception here. `shmat`/
+    /// `shmdt` are refused for a related reason: `shmat` maps shared memory
+    /// outside the runtime's `mmap` bookkeeping (and `SHM_EXEC` would dodge
+    /// W^X), so the segment is never tracked.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -280,6 +283,14 @@ mod host {
             // `io_uring_setup` stops a ring from ever existing, and denying
             // `enter`/`register` covers any fd that slipped through.
             libc::SYS_io_uring_setup | libc::SYS_io_uring_enter | libc::SYS_io_uring_register => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `shmat` maps a System V shared-memory segment into the address
+            // space behind the `mmap` family's back — so the runtime never
+            // records it, and `SHM_EXEC` would make it executable, dodging W^X —
+            // and `shmdt` tears such a mapping back down. Refuse both with
+            // `EPERM`; `shmget` alone only allocates an id and maps nothing.
+            libc::SYS_shmat | libc::SYS_shmdt => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
             libc::SYS_arch_prctl => {
