@@ -3,7 +3,7 @@
 //! fixed up by `BlockEncoder`), and rewrites the terminator into a
 //! "compute next guest PC, then exit to the dispatcher" sequence.
 
-use std::ptr;
+use std::{mem::offset_of, ptr};
 
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, FlowControl, Instruction,
@@ -12,19 +12,53 @@ use iced_x86::{
 
 use crate::Error;
 
+use super::dispatch::ThreadState;
+
 const CACHE_SIZE: usize = 16 * 1024 * 1024;
 const MAX_BLOCK_GUEST_BYTES: usize = 4096;
+
+/// Inline indirect-branch lookup table: a direct-mapped, guest-readable mirror
+/// of the guest-PC -> host-PC map, probed from the code cache so that `ret`,
+/// indirect `call`, and indirect `jmp` can stay in the cache on a hit instead
+/// of round-tripping through the dispatcher. Each slot is `{guest_pc, host_pc}`
+/// (two `u64`s). It is a prediction cache, not authoritative: a miss or a
+/// collision simply falls back to the dispatcher, which re-inserts the entry.
+const IB_SLOTS: usize = 1 << 17;
+const IB_SLOT_BYTES: usize = 16;
+const IB_TABLE_BYTES: usize = IB_SLOTS * IB_SLOT_BYTES;
+const IB_BITS: u32 = IB_SLOTS.trailing_zeros();
+
+/// Multiplier for the Fibonacci hash that maps a guest PC to a table slot. The
+/// slot index is the top [`IB_BITS`] bits of `guest_pc * IB_HASH_MULT`. A plain
+/// `(guest_pc >> k) & mask` would be cheaper, but any fixed right-shift folds
+/// every PC within one 2^k-byte window onto the same slot — and indirect
+/// targets routinely land that close (a polymorphic `ret` returns just past
+/// each of several adjacent call sites). Those neighbours would then evict each
+/// other on every branch, so the table would never hit. The multiply mixes the
+/// low bits into the index, so PCs a few bytes apart take different slots.
+const IB_HASH_MULT: u64 = 0x9e37_79b9_7f4a_7c15;
+/// Empty-slot marker for the `guest_pc` field: a non-canonical address that no
+/// real guest PC ever equals, so an unoccupied slot always fails the compare.
+const IB_EMPTY: u8 = 0xff;
 
 /// `gs:[]` displacement of the guest's rbx slot (`regs[1]`). Terminators that
 /// need a scratch memory slot borrow it: `exit_block` re-saves the live rbx
 /// over the slot on the way out, so the guest's rbx register is preserved.
 const RBX_SLOT: i64 = 8;
 
-/// A bump-allocated RWX region into which `translate()` emits blocks.
+/// A bump-allocated RWX region into which `translate()` emits blocks, paired
+/// with the inline indirect-branch lookup table and the shared lookup routine.
 pub struct CodeCache {
     base: *mut u8,
     size: usize,
     used: usize,
+    /// Direct-mapped indirect-branch table (see [`IB_SLOTS`]). A separate RW
+    /// mapping at a fixed address, baked into the lookup routine as an
+    /// immediate.
+    ib_table: *mut u8,
+    /// Host address of the shared lookup routine, emitted lazily into the code
+    /// region on first use and re-emitted after [`CodeCache::reset`].
+    ib_lookup: Option<u64>,
 }
 
 impl CodeCache {
@@ -42,11 +76,30 @@ impl CodeCache {
         if p == libc::MAP_FAILED {
             return Err(Error::last_os_error("code cache mmap"));
         }
-        Ok(Self {
+        let t = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                IB_TABLE_BYTES,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if t == libc::MAP_FAILED {
+            let err = Error::last_os_error("ib table mmap");
+            unsafe { libc::munmap(p, CACHE_SIZE) };
+            return Err(err);
+        }
+        let cache = Self {
             base: p as *mut u8,
             size: CACHE_SIZE,
             used: 0,
-        })
+            ib_table: t as *mut u8,
+            ib_lookup: None,
+        };
+        cache.clear_ib_table();
+        Ok(cache)
     }
 
     fn next_pc(&self) -> u64 {
@@ -64,8 +117,109 @@ impl CodeCache {
         Ok(())
     }
 
+    /// Record a guest-PC -> host-PC mapping in the inline lookup table. Direct
+    /// mapped, so this overwrites any prior occupant of the slot; the evicted
+    /// entry just falls back to the dispatcher (and is re-inserted) next time.
+    pub fn ib_insert(&mut self, guest_pc: u64, host_pc: u64) {
+        let slot = ib_slot(guest_pc) * IB_SLOT_BYTES;
+        unsafe {
+            let p = self.ib_table.add(slot) as *mut u64;
+            p.write(guest_pc);
+            p.add(1).write(host_pc);
+        }
+    }
+
+    fn clear_ib_table(&self) {
+        unsafe { ptr::write_bytes(self.ib_table, IB_EMPTY, IB_TABLE_BYTES) };
+    }
+
+    /// Emit the shared inline indirect-branch lookup routine (once), returning
+    /// its host address. Translated indirect branches reach it via
+    /// `jmp gs:[ib_lookup]` with the guest target in `rax` and the guest's rax
+    /// already saved at `gs:[0]`; the guest's flags and all other registers are
+    /// still live.
+    ///
+    /// The routine preserves the guest's flags around its own arithmetic
+    /// (`lahf`/`seto` on entry, `add al,0x7f`/`sahf` on exit, via the `ib_flags`
+    /// slot) and borrows rcx/rdx through the `ib_rcx`/`ib_rdx` slots. It hashes
+    /// the target, reads the one direct-mapped table slot, and on a guest-PC
+    /// match restores every register and jumps straight to the cached host PC.
+    /// On a mismatch it restores state, writes the target into the `rip` slot,
+    /// and falls through to the normal block-exit trampoline, exactly as the
+    /// pre-lookup terminator did — so a miss is transparent and re-inserts the
+    /// entry on the way back through the dispatcher.
+    pub fn ensure_ib_lookup(&mut self, exit_tramp: u64) -> Result<u64, Error> {
+        if let Some(addr) = self.ib_lookup {
+            return Ok(addr);
+        }
+        let d_rax = 0i32;
+        let d_rip = offset_of!(ThreadState, rip) as i32;
+        let d_flags = offset_of!(ThreadState, ib_flags) as i32;
+        let d_target = offset_of!(ThreadState, ib_target) as i32;
+        let d_rcx = offset_of!(ThreadState, ib_rcx) as i32;
+        let d_rdx = offset_of!(ThreadState, ib_rdx) as i32;
+        let d_host = offset_of!(ThreadState, ib_host) as i32;
+        let table = self.ib_table as u64;
+
+        let mut out = Vec::new();
+        // Stash the target and save the guest's status flags before any
+        // flag-clobbering arithmetic. lahf/seto write into rax (AH/AL), so the
+        // target is moved out to its slot first.
+        gs_store(&mut out, MODRM_RAX, d_target); // mov gs:[target], rax
+        out.push(0x9f); // lahf
+        out.extend_from_slice(&[0x0f, 0x90, 0xc0]); // seto al
+        gs_store(&mut out, MODRM_RAX, d_flags); // mov gs:[flags], rax
+        // Borrow rcx (target) and rdx (slot index) as scratch.
+        gs_store(&mut out, MODRM_RCX, d_rcx); // mov gs:[rcx], rcx
+        gs_store(&mut out, MODRM_RDX, d_rdx); // mov gs:[rdx], rdx
+        gs_load(&mut out, MODRM_RCX, d_target); // mov rcx, gs:[target]
+        // Fibonacci hash: slot = (target * IB_HASH_MULT) >> (64 - IB_BITS),
+        // matching `ib_slot`. The multiply mixes the low PC bits in, so nearby
+        // indirect targets do not alias onto the same slot (see IB_HASH_MULT).
+        out.extend_from_slice(&[0x48, 0x89, 0xca]); // mov rdx, rcx
+        movabs_rax(&mut out, IB_HASH_MULT); // movabs rax, IB_HASH_MULT
+        out.extend_from_slice(&[0x48, 0x0f, 0xaf, 0xd0]); // imul rdx, rax
+        out.extend_from_slice(&[0x48, 0xc1, 0xea, (64 - IB_BITS) as u8]); // shr rdx, 64-IB_BITS
+        out.extend_from_slice(&[0x48, 0xc1, 0xe2, 0x04]); // shl rdx, 4  (*16)
+        movabs_rax(&mut out, table); // movabs rax, table_base
+        out.extend_from_slice(&[0x48, 0x01, 0xd0]); // add rax, rdx -> &slot
+        out.extend_from_slice(&[0x48, 0x3b, 0x08]); // cmp rcx, [rax]
+        out.extend_from_slice(&[0x0f, 0x85]); // jne miss
+        let jne_rel = take_rel32(&mut out);
+
+        // Hit: load the host PC, restore flags and the borrowed registers, and
+        // jump into the successor block with the full guest register file live.
+        out.extend_from_slice(&[0x48, 0x8b, 0x50, 0x08]); // mov rdx, [rax+8]
+        gs_store(&mut out, MODRM_RDX, d_host); // mov gs:[host], rdx
+        emit_restore_flags(&mut out, d_flags);
+        gs_load(&mut out, MODRM_RCX, d_rcx); // mov rcx, gs:[rcx]
+        gs_load(&mut out, MODRM_RDX, d_rdx); // mov rdx, gs:[rdx]
+        gs_load(&mut out, MODRM_RAX, d_rax); // mov rax, gs:[0]  (guest rax)
+        out.extend_from_slice(&[0x65, 0xff, 0x24, 0x25]); // jmp gs:[host]
+        emit_u32(&mut out, d_host as u32);
+
+        // Miss: restore flags and registers, publish the target as the next
+        // guest PC, and exit to the dispatcher exactly as before.
+        let miss = out.len();
+        write_rel32(&mut out, jne_rel, miss);
+        emit_restore_flags(&mut out, d_flags);
+        gs_load(&mut out, MODRM_RCX, d_rcx); // mov rcx, gs:[rcx]
+        gs_load(&mut out, MODRM_RDX, d_rdx); // mov rdx, gs:[rdx]
+        gs_load(&mut out, MODRM_RAX, d_target); // mov rax, gs:[target]
+        gs_store(&mut out, MODRM_RAX, d_rip); // mov gs:[rip], rax
+        movabs_rax(&mut out, exit_tramp); // movabs rax, exit_block
+        out.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+
+        let addr = self.next_pc();
+        self.emit(&out)?;
+        self.ib_lookup = Some(addr);
+        Ok(addr)
+    }
+
     pub fn reset(&mut self) {
         self.used = 0;
+        self.ib_lookup = None;
+        self.clear_ib_table();
     }
 }
 
@@ -73,7 +227,16 @@ impl Drop for CodeCache {
     fn drop(&mut self) {
         let ret = unsafe { libc::munmap(self.base.cast(), self.size) };
         debug_assert_eq!(ret, 0, "code cache munmap failed");
+        let ret = unsafe { libc::munmap(self.ib_table.cast(), IB_TABLE_BYTES) };
+        debug_assert_eq!(ret, 0, "ib table munmap failed");
     }
+}
+
+/// Map a guest PC to its direct-mapped slot index in the indirect-branch table.
+/// Must stay in lockstep with the hash the inline lookup routine computes in
+/// [`CodeCache::ensure_ib_lookup`].
+fn ib_slot(guest_pc: u64) -> usize {
+    (guest_pc.wrapping_mul(IB_HASH_MULT) >> (64 - IB_BITS)) as usize
 }
 
 /// `gs:[disp]` with a 32-bit displacement, qword-sized.
@@ -154,7 +317,7 @@ pub fn translate(
             .collect();
         Ok((host_pc, edges))
     } else {
-        emit_terminator(&mut instrs, &term, exit_tramp, syscall_tramp)?;
+        emit_terminator(&mut instrs, &term, syscall_tramp)?;
         emit_body(cache, &instrs, host_pc, guest_pc)?;
         Ok((host_pc, Vec::new()))
     }
@@ -265,15 +428,20 @@ fn build_linked_terminator(link: &LinkTerm, exit_tramp: u64) -> (Vec<u8>, Vec<(u
             edges.push((jmp_rel, fallthrough));
         }
         LinkTerm::DirectCall { target, ret } => {
-            // Push the 64-bit return address without a scratch register or
-            // touching flags: `push imm32` writes the (sign-extended) low half
-            // and decrements rsp by 8, then the high half overwrites [rsp+4].
-            // This reproduces `call`'s stack effect exactly, leaving every
-            // guest register — including rax — live for the linked successor.
-            out.push(0x68);
-            emit_u32(&mut out, ret as u32);
-            out.extend_from_slice(&[0xC7, 0x44, 0x24, 0x04]);
-            emit_u32(&mut out, (ret >> 32) as u32);
+            // Push the 64-bit return address with a single 8-byte store so the
+            // callee's `ret` (an 8-byte `pop`) can store-to-load forward from
+            // it. The obvious `push imm32` + `mov [rsp+4], imm32` split would
+            // write the slot as two stores of different sizes; the pop then
+            // straddles both and the load stalls (a store-to-load-forward
+            // failure) on every call/ret pair. There is no `push imm64`, so
+            // route the address through rax: borrow the rax slot, materialize
+            // the full address, `push rax`, and restore rax — leaving every
+            // guest register live for the linked successor. No flags are
+            // touched (mov/movabs/push only).
+            mov_gs_rax(&mut out, RAX_SLOT); // mov gs:[rax_slot], rax
+            movabs_rax(&mut out, ret); // movabs rax, ret
+            out.push(0x50); // push rax
+            gs_load(&mut out, MODRM_RAX, RAX_SLOT); // mov rax, gs:[rax_slot]
             out.push(0xE9);
             let rel = take_rel32(&mut out);
             let stub = out.len();
@@ -311,6 +479,35 @@ fn movabs_rax(out: &mut Vec<u8>, imm: u64) {
 
 fn emit_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// ModRM bytes for `mov gs:[disp32], <reg>` / `mov <reg>, gs:[disp32]`: the
+/// reg field selects the register and rm=100 pulls in a SIB byte (`0x25`) that
+/// encodes a bare disp32. rax=`0x04`, rcx=`0x0c`, rdx=`0x14`.
+const MODRM_RAX: u8 = 0x04;
+const MODRM_RCX: u8 = 0x0c;
+const MODRM_RDX: u8 = 0x14;
+
+/// `mov gs:[disp32], <reg>` — `65 48 89 <modrm> 25 <disp32>`.
+fn gs_store(out: &mut Vec<u8>, modrm: u8, disp: i32) {
+    out.extend_from_slice(&[0x65, 0x48, 0x89, modrm, 0x25]);
+    emit_u32(out, disp as u32);
+}
+
+/// `mov <reg>, gs:[disp32]` — `65 48 8b <modrm> 25 <disp32>`.
+fn gs_load(out: &mut Vec<u8>, modrm: u8, disp: i32) {
+    out.extend_from_slice(&[0x65, 0x48, 0x8b, modrm, 0x25]);
+    emit_u32(out, disp as u32);
+}
+
+/// Restore the guest status flags previously saved by `lahf`/`seto` in the
+/// `ib_flags` slot: reload them into rax, rebuild OF from AL with `add al,0x7f`,
+/// then load SF/ZF/AF/PF/CF with `sahf`. Clobbers rax (callers reload guest rax
+/// afterward), and is itself flag-setting only through the restore it performs.
+fn emit_restore_flags(out: &mut Vec<u8>, d_flags: i32) {
+    gs_load(out, MODRM_RAX, d_flags); // mov rax, gs:[flags]
+    out.extend_from_slice(&[0x04, 0x7f]); // add al, 0x7f
+    out.push(0x9e); // sahf
 }
 
 /// Reserve four bytes for a `rel32` displacement and return their offset.
@@ -352,16 +549,17 @@ fn jcc_opcode(code: Code) -> Option<u8> {
     })
 }
 
-/// Emit the appropriate exit sequence for a terminator instruction.
+/// Emit the exit sequence for a terminator the linker does not lower: a
+/// syscall, an indirect branch/call, or a return.
 ///
-/// Every sequence ends with the next guest PC in `rax`, followed by the
-/// common tail (`mov gs:[128], rax; movabs rax, exit_tramp; jmp rax`). The
-/// guest's original `rax` value is preserved at `gs:[0]` before being
-/// clobbered.
+/// In every case the guest's original `rax` is first saved at `gs:[0]` and the
+/// next guest PC is computed into `rax`. A syscall then takes the common exit
+/// tail (`mov gs:[128], rax; movabs rax, syscall_tramp; jmp rax`); the indirect
+/// branch, indirect call, and return hand off to the shared inline lookup
+/// routine via [`emit_jmp_ib_lookup`], which resolves the target in `rax`.
 fn emit_terminator(
     instrs: &mut Vec<Instruction>,
     t: &Instruction,
-    exit_tramp: u64,
     syscall_tramp: u64,
 ) -> Result<(), Error> {
     let next_ip = t.next_ip();
@@ -492,7 +690,20 @@ fn emit_terminator(
             )));
         }
     }
-    emit_exit_tail(instrs, exit_tramp)
+    // The reachable arms here — indirect branch, indirect call, return — have
+    // left the runtime-computed guest target in rax. Hand off to the shared
+    // inline lookup routine, which jumps straight to the cached translation on
+    // a hit and otherwise falls back to the dispatcher.
+    emit_jmp_ib_lookup(instrs)
+}
+
+/// Emit `jmp gs:[ib_lookup]`, transferring to the shared inline
+/// indirect-branch lookup routine with the resolved guest target in rax and
+/// the guest's rax already saved at `gs:[0]`.
+fn emit_jmp_ib_lookup(instrs: &mut Vec<Instruction>) -> Result<(), Error> {
+    let disp = offset_of!(ThreadState, ib_lookup) as i64;
+    instrs.push(mkinstr(Instruction::with1(Code::Jmp_rm64, gs_qword(disp)))?);
+    Ok(())
 }
 
 fn emit_save_rax(instrs: &mut Vec<Instruction>) -> Result<(), Error> {

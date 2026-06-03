@@ -52,10 +52,17 @@ impl BlockCache {
         syscall_exit: u64,
     ) -> Result<u64, Error> {
         if let Some(&host_pc) = self.map.get(&guest_pc) {
+            // Refresh the in-cache lookup entry: reaching here means an indirect
+            // branch missed it (a direct-mapped collision evicted it), so
+            // reinstate it to return the hot target to the fast path.
+            self.cache.ib_insert(guest_pc, host_pc);
             return Ok(host_pc);
         }
         let (host_pc, edges) = translate(&mut self.cache, guest_pc, block_exit, syscall_exit)?;
         self.map.insert(guest_pc, host_pc);
+        // Mirror the mapping into the in-cache lookup table so indirect
+        // branches to this block resolve without leaving the cache.
+        self.cache.ib_insert(guest_pc, host_pc);
         if let Some(sites) = self.pending.remove(&guest_pc) {
             for site in sites {
                 patch_site(site, host_pc);
@@ -68,6 +75,12 @@ impl BlockCache {
             }
         }
         Ok(host_pc)
+    }
+
+    /// Emit (once per cache) the shared inline indirect-branch lookup routine
+    /// and return its host address so translated indirect branches can reach it.
+    pub fn ensure_ib_lookup(&mut self, block_exit: u64) -> Result<u64, Error> {
+        self.cache.ensure_ib_lookup(block_exit)
     }
 
     /// Flush every translated block and its link bookkeeping. The backing code

@@ -76,7 +76,13 @@ impl Thread {
                 exit_kind: 0,
                 guest_fs_base: 0,
                 chimera_fs_base: 0,
-                _align_fpstate: [0; 1],
+                ib_lookup: 0,
+                ib_flags: 0,
+                ib_target: 0,
+                ib_rcx: 0,
+                ib_rdx: 0,
+                ib_host: 0,
+                _align_fpstate: [0; 3],
                 fpstate: [0; XSAVE_AREA_SIZE],
             }),
             addr_space: AddressSpace::new()?,
@@ -141,6 +147,10 @@ impl Thread {
         let block_exit = exit_block as *const () as usize as u64;
         let syscall_exit = exit_syscall as *const () as usize as u64;
 
+        // Emit (once per cache) the shared inline indirect-branch lookup routine
+        // and record its address so translated indirect branches can reach it.
+        self.state.ib_lookup = self.addr_space.code.ensure_ib_lookup(block_exit)?;
+
         while self.running {
             self.deliver_pending_signals();
 
@@ -202,7 +212,7 @@ impl Thread {
 /// load-bearing: the offsets are consumed by `trampoline.S` (via `offset_of!`
 /// in [`super::trampoline`]) and by the per-block exit stubs emitted by the
 /// translator. The struct is 64-byte aligned, and the fields are arranged so
-/// `fpstate` falls on a 64-byte boundary (offset 192) — XSAVE/XRSTOR `#GP`
+/// `fpstate` falls on a 64-byte boundary (offset 256) — XSAVE/XRSTOR `#GP`
 /// on a misaligned save area.
 #[repr(C, align(64))]
 #[derive(Debug)]
@@ -229,11 +239,24 @@ pub struct ThreadState {
     /// guest execution starts. Restored on every exit so the runtime's own
     /// TLS works after the guest has changed FS.
     pub chimera_fs_base: u64,
-    /// Padding so `fpstate` lands at offset 192 (a 64-byte boundary).
-    _align_fpstate: [u64; 1],
+    /// Host address of the shared inline indirect-branch lookup routine in the
+    /// code cache (`CodeCache::ensure_ib_lookup`). Each translated indirect
+    /// branch ends in `jmp gs:[ib_lookup]`; set once per run before the loop.
+    pub ib_lookup: u64,
+    /// Scratch slots used only by the inline indirect-branch lookup routine,
+    /// which has no free registers of its own: the guest's flags (via
+    /// `lahf`/`seto`), the branch target, the borrowed rcx/rdx, and the
+    /// resolved host PC. Live only for the duration of one lookup.
+    pub ib_flags: u64,
+    pub ib_target: u64,
+    pub ib_rcx: u64,
+    pub ib_rdx: u64,
+    pub ib_host: u64,
+    /// Padding so `fpstate` lands at offset 256 (a 64-byte boundary).
+    _align_fpstate: [u64; 3],
     /// XSAVE area for the guest's extended FP/SIMD state (x87, SSE, AVX,
     /// AVX-512). Saved on every exit, restored on every entry. Must be
-    /// 64-byte aligned; the field layout above guarantees offset 192.
+    /// 64-byte aligned; the field layout above guarantees offset 256.
     pub fpstate: [u8; XSAVE_AREA_SIZE],
 }
 
@@ -255,7 +278,13 @@ impl ThreadState {
         self.exit_kind = 0;
         self.guest_fs_base = guest_fs_base;
         self.chimera_fs_base = 0;
-        self._align_fpstate = [0; 1];
+        self.ib_lookup = 0;
+        self.ib_flags = 0;
+        self.ib_target = 0;
+        self.ib_rcx = 0;
+        self.ib_rdx = 0;
+        self.ib_host = 0;
+        self._align_fpstate = [0; 3];
         self.fpstate.fill(0);
 
         // XRSTOR loads MXCSR from the legacy region (bytes 24..28) of the save
