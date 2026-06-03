@@ -17,10 +17,7 @@ use crate::{
     sys::{linux::signal::Signals, mmap::AddressSpace},
 };
 
-use super::{
-    trampoline::{dispatch, exit_block, exit_syscall},
-    translate::translate,
-};
+use super::trampoline::{dispatch, exit_block, exit_syscall};
 
 /// Linux x86-64 `arch_prctl` subfunction code: set the GS base.
 const ARCH_SET_GS: libc::c_int = 0x1001;
@@ -150,15 +147,11 @@ impl Thread {
             let ts_ptr: *mut ThreadState = &mut *self.state;
 
             let rip = unsafe { (*ts_ptr).rip };
-            let host_pc = match self.addr_space.map.get(&rip) {
-                Some(&hpc) => hpc,
-                None => {
-                    let hpc = translate(&mut self.addr_space.cache, rip, block_exit, syscall_exit)
-                        .unwrap_or_else(|e| panic!("translate failed at {:#x}: {}", rip, e));
-                    self.addr_space.map.insert(rip, hpc);
-                    hpc
-                }
-            };
+            let host_pc = self
+                .addr_space
+                .code
+                .resolve(rip, block_exit, syscall_exit)
+                .unwrap_or_else(|e| panic!("translate failed at {:#x}: {}", rip, e));
             unsafe {
                 (*ts_ptr).exit_kind = EXIT_KIND_BLOCK;
                 dispatch(ts_ptr, host_pc);
