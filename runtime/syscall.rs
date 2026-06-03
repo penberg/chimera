@@ -189,6 +189,13 @@ mod host {
     /// the bytes at an already-translated guest PC behind the translator's back.
     /// `ptrace` is refused because it reads and writes a process's memory and
     /// registers out of band, ignoring page protection and the translator both.
+    /// `process_vm_writev` is refused for the same reason: it writes directly
+    /// into a process's address space through a second mapping the kernel makes
+    /// of the target pages, so a write can land at an already-translated guest
+    /// PC behind the translator's back (a stale-translation hole), and in a
+    /// future multi-process model one guest could drive another straight out of
+    /// the sandbox. Its read-only sibling `process_vm_readv` modifies nothing
+    /// and is forwarded.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -313,6 +320,15 @@ mod host {
             // future multi-process model, Chimera itself — could be driven
             // straight out of the sandbox. Refuse it with `EPERM`.
             libc::SYS_ptrace => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `process_vm_writev` writes into a process's address space out of
+            // band: the kernel maps the target pages a second time and copies
+            // into them, so the write never passes through the translator and
+            // can change the bytes at an already-translated guest PC (a
+            // stale-translation hole). Refuse it with `EPERM`. The read-only
+            // counterpart `process_vm_readv` mutates nothing and is forwarded.
+            libc::SYS_process_vm_writev => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
             libc::SYS_arch_prctl => {
