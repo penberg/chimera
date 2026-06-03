@@ -200,6 +200,16 @@ mod host {
     /// its first fault (via `UFFDIO_COPY`/`UFFDIO_CONTINUE`), so the guest could
     /// supply different code at an already-translated PC, and the resolving
     /// thread runs outside the translator entirely.
+    ///
+    /// `personality` is the exception that is filtered rather than refused
+    /// wholesale, like `clone`'s `CLONE_VM` check. Its `READ_IMPLIES_EXEC`
+    /// persona makes the kernel add `PROT_EXEC` to every readable mapping,
+    /// silently undoing the `PROT_EXEC` stripping above and leaving guest pages
+    /// executable in the host page tables — a W^X defeat — so a call that sets
+    /// that bit is refused with `EPERM`. The query form
+    /// (`personality(0xffffffff)`, which returns the current persona without
+    /// changing it) and benign personas such as `ADDR_NO_RANDOMIZE` carry no
+    /// such risk and are forwarded.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -343,6 +353,20 @@ mod host {
             // set at the faulting PC afterwards (a stale-translation hole), and
             // the monitor runs outside the translator. Refuse it with `EPERM`.
             libc::SYS_userfaultfd => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // The `READ_IMPLIES_EXEC` persona makes the kernel add `PROT_EXEC`
+            // to every readable mapping, which would undo the `PROT_EXEC`
+            // stripping in the `mmap`/`mprotect` arms above and leave guest
+            // pages executable in the host page tables (a W^X defeat). Refuse a
+            // `personality` call that sets it with `EPERM`. The query form
+            // (`0xffffffff`, returns the current persona unchanged) and benign
+            // personas fall through to the default arm and are forwarded.
+            libc::SYS_personality
+                if call.args[0] as libc::c_uint != 0xffff_ffff
+                    && call.args[0] as libc::c_uint & libc::READ_IMPLIES_EXEC as libc::c_uint
+                        != 0 =>
+            {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
             libc::SYS_arch_prctl => {
