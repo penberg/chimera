@@ -168,6 +168,48 @@ mod host {
     /// `mmap` family, `mprotect`/`pkey_mprotect` are not otherwise
     /// runtime-owned: they still reach `do_syscall()`, only with `PROT_EXEC`
     /// already cleared from their argument.
+    ///
+    /// `clone`/`clone3` are refused with `EPERM` when they request `CLONE_VM`, a
+    /// new thread sharing the address space: Chimera is single-threaded, and the
+    /// new host thread would execute guest code with no translator context,
+    /// natively. Without `CLONE_VM` the call is an ordinary `fork`, whose
+    /// copy-on-write child carries Chimera and resumes in translated code, so it
+    /// is forwarded. (`clone3` carries its flags in a `clone_args` struct rather
+    /// than a register; the rest is identical.) `vfork` always shares the
+    /// address space and has no `fork`-shaped variant, so it is refused outright.
+    ///
+    /// The io_uring interface (`io_uring_setup`/`io_uring_enter`/
+    /// `io_uring_register`) is refused with `EPERM`: it would let the guest
+    /// queue system calls the kernel runs asynchronously, never passing them
+    /// back through this driver, bypassing every interception here. `shmat`/
+    /// `shmdt` are refused for a related reason: `shmat` maps shared memory
+    /// outside the runtime's `mmap` bookkeeping (and `SHM_EXEC` would dodge
+    /// W^X), so the segment is never tracked. `remap_file_pages` is refused
+    /// because it rebinds the pages under an existing mapping, which can change
+    /// the bytes at an already-translated guest PC behind the translator's back.
+    /// `ptrace` is refused because it reads and writes a process's memory and
+    /// registers out of band, ignoring page protection and the translator both.
+    /// `process_vm_writev` is refused for the same reason: it writes directly
+    /// into a process's address space through a second mapping the kernel makes
+    /// of the target pages, so a write can land at an already-translated guest
+    /// PC behind the translator's back (a stale-translation hole), and in a
+    /// future multi-process model one guest could drive another straight out of
+    /// the sandbox. Its read-only sibling `process_vm_readv` modifies nothing
+    /// and is forwarded. `userfaultfd` is refused for the stale-translation
+    /// reason again: it hands a userspace monitor the bytes that back a page on
+    /// its first fault (via `UFFDIO_COPY`/`UFFDIO_CONTINUE`), so the guest could
+    /// supply different code at an already-translated PC, and the resolving
+    /// thread runs outside the translator entirely.
+    ///
+    /// `personality` is the exception that is filtered rather than refused
+    /// wholesale, like `clone`'s `CLONE_VM` check. Its `READ_IMPLIES_EXEC`
+    /// persona makes the kernel add `PROT_EXEC` to every readable mapping,
+    /// silently undoing the `PROT_EXEC` stripping above and leaving guest pages
+    /// executable in the host page tables — a W^X defeat — so a call that sets
+    /// that bit is refused with `EPERM`. The query form
+    /// (`personality(0xffffffff)`, which returns the current persona without
+    /// changing it) and benign personas such as `ADDR_NO_RANDOMIZE` carry no
+    /// such risk and are forwarded.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -233,6 +275,100 @@ mod host {
                 // see the allowed call.
                 call.set_result(SyscallResult::Ok(0));
             }
+            // A `clone` that creates a new thread sharing this address space
+            // (`CLONE_VM`) would have the host kernel run guest code on the new
+            // thread with no Chimera context — natively, never through the
+            // translator — a sandbox escape (and, today, a crash). Refuse it with
+            // `EPERM`. A `clone` without `CLONE_VM` is an ordinary `fork`: a
+            // copy-on-write duplicate of the whole process, Chimera included,
+            // that resumes in translated code, so it falls through to the default
+            // arm and is forwarded.
+            libc::SYS_clone if call.args[0] & libc::CLONE_VM as u64 != 0 => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `clone3` is the same escape as `clone` above, but carries its
+            // flags in the `clone_args` struct `args[0]` points at rather than
+            // in a register. Refuse it when those flags request `CLONE_VM`; a
+            // `clone3` without it (the `fork`-shaped case) falls through to the
+            // default arm and is forwarded.
+            libc::SYS_clone3 if clone3_requests_vm(call.args[0]) => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `vfork` always shares the address space (`CLONE_VM`) and, worse,
+            // suspends the parent until the child execs or exits while both run
+            // on the same stack — there is no `fork`-shaped variant to allow, so
+            // refuse it outright.
+            libc::SYS_vfork => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // io_uring lets the guest queue system calls that the kernel then
+            // executes asynchronously, on its own, without ever passing them
+            // back through Chimera's syscall path — a direct way around every
+            // interception above. Refuse the whole interface: denying
+            // `io_uring_setup` stops a ring from ever existing, and denying
+            // `enter`/`register` covers any fd that slipped through.
+            libc::SYS_io_uring_setup | libc::SYS_io_uring_enter | libc::SYS_io_uring_register => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `shmat` maps a System V shared-memory segment into the address
+            // space behind the `mmap` family's back — so the runtime never
+            // records it, and `SHM_EXEC` would make it executable, dodging W^X —
+            // and `shmdt` tears such a mapping back down. Refuse both with
+            // `EPERM`; `shmget` alone only allocates an id and maps nothing.
+            libc::SYS_shmat | libc::SYS_shmdt => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `remap_file_pages` rebinds the file pages backing an existing
+            // mapping without changing its address, so the bytes at a guest PC
+            // the translator has already cached can change underneath it (a
+            // stale-translation hole), and the resulting nonlinear mapping
+            // escapes the runtime's region bookkeeping. It is deprecated and
+            // emulated by the kernel anyway; refuse it with `EPERM`.
+            libc::SYS_remap_file_pages => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `ptrace` is an out-of-band channel into another process: it reads
+            // and writes registers and memory regardless of page protection
+            // (`PTRACE_POKETEXT`/`POKEDATA`) and redirects control flow, none of
+            // which passes through the translator. A traced peer — or, with a
+            // future multi-process model, Chimera itself — could be driven
+            // straight out of the sandbox. Refuse it with `EPERM`.
+            libc::SYS_ptrace => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `process_vm_writev` writes into a process's address space out of
+            // band: the kernel maps the target pages a second time and copies
+            // into them, so the write never passes through the translator and
+            // can change the bytes at an already-translated guest PC (a
+            // stale-translation hole). Refuse it with `EPERM`. The read-only
+            // counterpart `process_vm_readv` mutates nothing and is forwarded.
+            libc::SYS_process_vm_writev => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `userfaultfd` registers a userspace page-fault handler: when the
+            // guest first touches a registered page, a monitor thread chooses
+            // the bytes to fill it with (`UFFDIO_COPY`) or which existing page
+            // to map (`UFFDIO_CONTINUE`). That lets the guest hand the
+            // translator one set of bytes at translation time and a different
+            // set at the faulting PC afterwards (a stale-translation hole), and
+            // the monitor runs outside the translator. Refuse it with `EPERM`.
+            libc::SYS_userfaultfd => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // The `READ_IMPLIES_EXEC` persona makes the kernel add `PROT_EXEC`
+            // to every readable mapping, which would undo the `PROT_EXEC`
+            // stripping in the `mmap`/`mprotect` arms above and leave guest
+            // pages executable in the host page tables (a W^X defeat). Refuse a
+            // `personality` call that sets it with `EPERM`. The query form
+            // (`0xffffffff`, returns the current persona unchanged) and benign
+            // personas fall through to the default arm and are forwarded.
+            libc::SYS_personality
+                if call.args[0] as libc::c_uint != 0xffff_ffff
+                    && call.args[0] as libc::c_uint & libc::READ_IMPLIES_EXEC as libc::c_uint
+                        != 0 =>
+            {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
             libc::SYS_arch_prctl => {
                 const ARCH_SET_GS: u64 = 0x1001;
                 const ARCH_SET_FS: u64 = 0x1002;
@@ -293,6 +429,18 @@ mod host {
             }
         };
         handler.post_syscall(call);
+    }
+
+    /// Whether a `clone3` whose `clone_args` struct lives at `args_ptr` requests
+    /// `CLONE_VM`. The flags are the first `u64` of the struct; Chimera shares
+    /// the guest's address space, so this is a plain read. A null pointer
+    /// carries no flags — the kernel rejects it with `EFAULT` once forwarded.
+    fn clone3_requests_vm(args_ptr: u64) -> bool {
+        if args_ptr == 0 {
+            return false;
+        }
+        let flags = unsafe { core::ptr::read(args_ptr as *const u64) };
+        flags & libc::CLONE_VM as u64 != 0
     }
 }
 
