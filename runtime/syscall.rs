@@ -195,7 +195,11 @@ mod host {
     /// PC behind the translator's back (a stale-translation hole), and in a
     /// future multi-process model one guest could drive another straight out of
     /// the sandbox. Its read-only sibling `process_vm_readv` modifies nothing
-    /// and is forwarded.
+    /// and is forwarded. `userfaultfd` is refused for the stale-translation
+    /// reason again: it hands a userspace monitor the bytes that back a page on
+    /// its first fault (via `UFFDIO_COPY`/`UFFDIO_CONTINUE`), so the guest could
+    /// supply different code at an already-translated PC, and the resolving
+    /// thread runs outside the translator entirely.
     pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
         handler.pre_syscall(call);
 
@@ -329,6 +333,16 @@ mod host {
             // stale-translation hole). Refuse it with `EPERM`. The read-only
             // counterpart `process_vm_readv` mutates nothing and is forwarded.
             libc::SYS_process_vm_writev => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
+            // `userfaultfd` registers a userspace page-fault handler: when the
+            // guest first touches a registered page, a monitor thread chooses
+            // the bytes to fill it with (`UFFDIO_COPY`) or which existing page
+            // to map (`UFFDIO_CONTINUE`). That lets the guest hand the
+            // translator one set of bytes at translation time and a different
+            // set at the faulting PC afterwards (a stale-translation hole), and
+            // the monitor runs outside the translator. Refuse it with `EPERM`.
+            libc::SYS_userfaultfd => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
             libc::SYS_arch_prctl => {
