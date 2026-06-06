@@ -27,6 +27,30 @@ use super::vfs::{
     WriteResult,
 };
 
+/// Long-lived backing descriptors live at or above this number, keeping the
+/// low fd space free for the guest-visible numbers the Personality reserves.
+pub const BACKING_FLOOR: libc::c_int = 512;
+
+/// Move a long-lived backing descriptor above [`BACKING_FLOOR`], freeing its
+/// low number. The kernel hands `open` the lowest free number, but that low,
+/// dense space belongs to the guest: the Personality reserves the guest's
+/// numbers there, and idioms like `close(0); open(...)` must observe the
+/// freed number again — a hidden backing fd squatting on it would displace
+/// them. Best-effort: on failure (fd exhaustion) the low descriptor keeps
+/// working, at worst costing numbering fidelity.
+///
+/// The duplicate is deliberately not `FD_CLOEXEC`: Chimera's emulated execve
+/// sweeps host close-on-exec fds by hand, and the backing must survive it —
+/// the guest-visible reservation is what exec semantics apply to. (`F_DUPFD`
+/// also strips any `O_CLOEXEC` the guest's open flags put on the original.)
+fn relocate_high(fd: OwnedFd) -> OwnedFd {
+    let high = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD, BACKING_FLOOR) };
+    if high < 0 {
+        return fd;
+    }
+    unsafe { OwnedFd::from_raw_fd(high) }
+}
+
 /// A filesystem backed by a host directory. Mount-relative paths are joined onto
 /// `root`; the host kernel does the rest.
 /// Linux x86-64 `struct statfs`, including the fields Rust's `libc` binding
@@ -82,7 +106,7 @@ impl Vfs for HostFs {
             return Err(last_errno());
         }
         Ok(Box::new(HostFile {
-            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            fd: relocate_high(unsafe { OwnedFd::from_raw_fd(fd) }),
         }))
     }
 
@@ -172,6 +196,10 @@ impl Vfs for HostFs {
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno> {
         let cpath = cpath(&self.host_path(path))?;
         Ok(statfs_to_statfs(&raw_statfs(cpath.as_c_str())?))
+    }
+
+    fn host_path(&self, path: &Path) -> Option<PathBuf> {
+        Some(HostFs::host_path(self, path))
     }
 }
 
@@ -276,6 +304,10 @@ impl File for HostFile {
 
     fn fsync(&self) -> Result<(), Errno> {
         check(unsafe { libc::fsync(self.fd.as_raw_fd()) })
+    }
+
+    fn host_fd(&self) -> Option<libc::c_int> {
+        Some(self.fd.as_raw_fd())
     }
 
     fn getdents(&self) -> Result<Vec<DirEntry>, Errno> {

@@ -40,6 +40,9 @@ use std::{
 /// Paths are **mount-relative**: the resolver has already turned the guest's
 /// `dirfd`/`AT_FDCWD`-anchored, possibly-symlinked path into a path rooted at
 /// this mount, and crossed any nested mountpoints before reaching here.
+///
+/// `Send + Sync` because a filesystem instance is shared as `Arc<dyn Vfs>` and,
+/// once Chimera runs guest threads, will be reached from more than one.
 pub trait Vfs: Send + Sync {
     /// Open (or create) a file or directory, yielding a positional handle.
     fn open(&self, path: &Path, flags: OpenFlags, mode: Mode) -> Result<Box<dyn File>, Errno>;
@@ -76,11 +79,20 @@ pub trait Vfs: Send + Sync {
 
     /// Report filesystem-wide statistics for `statfs` by path.
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno>;
+
+    /// The host path backing a mount-relative path, if this filesystem is host
+    /// passthrough. The runtime uses it to load an `execve` target through its
+    /// ELF loader without reaching back through this trait byte by byte; a
+    /// synthetic filesystem returns `None` and is not (yet) executable-from.
+    fn host_path(&self, _path: &Path) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// One open file or directory. Positional: there is no internal cursor, so the
 /// fd table owns the offset and a `dup`'d fd shares this handle. Held as
-/// `Arc<dyn File>`, hence `&self` throughout.
+/// `Arc<dyn File>`, hence `&self` throughout — and `Send + Sync` for the same
+/// sharing reason as [`Vfs`].
 pub trait File: Send + Sync {
     /// Read at an absolute offset (`pread`/`read` after the fd table supplies
     /// the cursor; the `readv` scatter is the Personality's job).
@@ -115,6 +127,16 @@ pub trait File: Send + Sync {
     fn getdents(&self) -> Result<Vec<DirEntry>, Errno> {
         Err(Errno::ENOTDIR)
     }
+
+    /// The host descriptor backing this handle, if any. A passthrough handle
+    /// (like [`HostFile`]) returns its real fd so a file-backed `mmap` can map
+    /// it directly; a synthetic file returns `None`, leaving the Personality to
+    /// emulate the mapping. Used only for `mmap`, never for ordinary I/O.
+    ///
+    /// [`HostFile`]: super::hostfs::HostFile
+    fn host_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
 }
 
 /// The outcome of one write-like operation that advances a file position.
@@ -145,6 +167,8 @@ impl Errno {
     pub const ENOTEMPTY: Errno = Errno(libc::ENOTEMPTY);
     pub const ELOOP: Errno = Errno(libc::ELOOP);
     pub const ENOSYS: Errno = Errno(libc::ENOSYS);
+    pub const ENOTTY: Errno = Errno(libc::ENOTTY);
+    pub const ERANGE: Errno = Errno(libc::ERANGE);
 
     /// The raw positive errno value.
     pub fn raw(self) -> i32 {

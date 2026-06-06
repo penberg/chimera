@@ -123,6 +123,11 @@ pub fn drive(thread: &mut dispatch::Thread, mut reason: ExitReason) -> Result<i3
                 if let Some(interp) = &parsed_interp {
                     keep.push(interp.as_raw_fd());
                 }
+                // The handler first: a descriptor table's close-on-exec flags
+                // live in the table, invisible to the host-fd sweep below.
+                // Its closed fds simply fail the sweep's F_GETFD and are
+                // skipped.
+                thread.process().handler.on_execve(&req.path);
                 close_cloexec_fds(&keep)?;
 
                 // Tear down the old image (unmapping its regions, so a fixed
@@ -207,8 +212,12 @@ pub struct PreparedExec {
 /// calling thread, the way the kernel sequences an exec: an error here means
 /// the caller takes `-errno` (see [`exec_errno`]) and resumes, with no other
 /// thread disturbed.
-pub fn prepare_exec(number: u64, args: &[u64; 6]) -> Result<PreparedExec, Error> {
-    let req = read_request(number, args)?;
+pub fn prepare_exec(
+    number: u64,
+    args: &[u64; 6],
+    handler: &dyn SystemCalls,
+) -> Result<PreparedExec, Error> {
+    let req = read_request(number, args, handler)?;
     let parsed = parse_elf(&req.path)?;
     let parsed_interp = match &parsed.interp {
         Some(interp_path) => Some(parse_elf(interp_path)?),
@@ -273,16 +282,30 @@ struct ExecRequest {
 /// trusted: every read is a fault-safe kernel copy, bounded the way the
 /// kernel bounds it, so a bad pathname, argv, or envp pointer reports
 /// `EFAULT` to the caller — and an oversized string `ENAMETOOLONG`/`E2BIG` —
-/// instead of crashing the runtime.
-fn read_request(number: u64, args: &[u64; 6]) -> Result<ExecRequest, Error> {
-    let (path, argv_ptr, envp_ptr) = if number == libc::SYS_execveat as u64 {
-        let dirfd = args[0] as i32;
-        let raw = read_guest_cstr(args[1], libc::PATH_MAX as usize, libc::ENAMETOOLONG)?;
-        let flags = args[4] as i32;
-        (resolve_at(dirfd, &raw, flags), args[2], args[3])
+/// instead of crashing the runtime. The target pathname is resolved through
+/// the handler's namespace (`resolve_exec`) when it has one, so a confined
+/// guest's exec stays inside its root; otherwise the runtime's own
+/// `/proc/self/fd` handling stands in for [`Passthrough`].
+fn read_request(
+    number: u64,
+    args: &[u64; 6],
+    handler: &dyn SystemCalls,
+) -> Result<ExecRequest, Error> {
+    let (dirfd, rawptr, flags, argv_ptr, envp_ptr) = if number == libc::SYS_execveat as u64 {
+        (args[0] as i32, args[1], args[4] as i32, args[2], args[3])
     } else {
-        let raw = read_guest_cstr(args[0], libc::PATH_MAX as usize, libc::ENAMETOOLONG)?;
-        (PathBuf::from(OsStr::from_bytes(&raw)), args[1], args[2])
+        (AT_FDCWD, args[0], 0, args[1], args[2])
+    };
+    let raw = read_guest_cstr(rawptr, libc::PATH_MAX as usize, libc::ENAMETOOLONG)?;
+    let path = match handler.resolve_exec(dirfd, &raw, flags) {
+        Some(Ok(path)) => path,
+        Some(Err(errno)) => {
+            return Err(Error::io(
+                "execve",
+                std::io::Error::from_raw_os_error(errno),
+            ));
+        }
+        None => resolve_at(dirfd, &raw, flags, handler),
     };
     Ok(ExecRequest {
         path,
@@ -362,19 +385,22 @@ fn read_guest_ptr_array(ptr: u64) -> Result<Vec<Vec<u8>>, Error> {
     }
 }
 
-/// Resolve an `execveat` pathname against its `dirfd` and flags. An absolute
-/// path or `AT_FDCWD` is used directly; `AT_EMPTY_PATH` with an empty pathname
-/// names the open fd itself (`fexecve`); otherwise the path is relative to the
-/// directory the fd refers to. The fd cases route through `/proc/self/fd`.
-fn resolve_at(dirfd: i32, raw: &[u8], flags: i32) -> PathBuf {
+/// Default resolution of an exec pathname against its `dirfd` and flags, used
+/// when the handler does not resolve it itself. An absolute path or `AT_FDCWD`
+/// is used directly; `AT_EMPTY_PATH` with an empty pathname names the open fd
+/// itself (`fexecve`); otherwise the path is relative to the directory the fd
+/// refers to. The fd cases route through `/proc/self/fd`, so a `dirfd` the
+/// handler virtualizes is first mapped back to its host fd.
+fn resolve_at(dirfd: i32, raw: &[u8], flags: i32, handler: &dyn SystemCalls) -> PathBuf {
+    let host_fd = handler.resolve_fd(dirfd).unwrap_or(dirfd);
     if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
-        return PathBuf::from(format!("/proc/self/fd/{dirfd}"));
+        return PathBuf::from(format!("/proc/self/fd/{host_fd}"));
     }
     let path = Path::new(OsStr::from_bytes(raw));
     if path.is_absolute() || dirfd == AT_FDCWD {
         return path.to_path_buf();
     }
-    PathBuf::from(format!("/proc/self/fd/{dirfd}")).join(path)
+    PathBuf::from(format!("/proc/self/fd/{host_fd}")).join(path)
 }
 
 unsafe fn push_bytes(p: &mut u64, b: &[u8]) -> u64 {
