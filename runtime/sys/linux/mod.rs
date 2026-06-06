@@ -7,3 +7,9 @@ pub mod exec;
 pub mod fault;
 pub mod signal;
 pub mod syscall;
+mod vfs;
+
+pub use vfs::{
+    DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec, Vfs,
+    WriteResult,
+};
