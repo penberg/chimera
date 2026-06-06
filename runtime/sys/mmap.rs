@@ -1,9 +1,9 @@
-//! The guest address space: the translated-block cache, the guest-PC to host-PC
-//! map, and the guest mappings Chimera owns on the host.
+//! The guest address space: the translated-block cache ([`BlockCache`]) and the
+//! guest mappings Chimera owns on the host.
 
-use std::{collections::HashMap, sync::OnceLock};
+use std::sync::OnceLock;
 
-use crate::{Error, arch::x86::translate::CodeCache};
+use crate::{Error, arch::x86::cache::BlockCache};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Region {
@@ -11,20 +11,17 @@ struct Region {
     len: usize,
 }
 
-/// A guest address space: the cache of translated blocks, the map from guest
-/// PC to the host PC where each block begins, and the host mappings created
-/// for the guest. Mirrors the Linux kernel's `mm_struct`.
+/// A guest address space: the translated-block cache and the host mappings
+/// created for the guest. Mirrors the Linux kernel's `mm_struct`.
 pub struct AddressSpace {
-    pub cache: CodeCache,
-    pub map: HashMap<u64, u64>,
+    pub code: BlockCache,
     regions: Vec<Region>,
 }
 
 impl AddressSpace {
     pub fn new() -> Result<Self, Error> {
         Ok(Self {
-            cache: CodeCache::new()?,
-            map: HashMap::new(),
+            code: BlockCache::new()?,
             regions: Vec::new(),
         })
     }
@@ -93,8 +90,7 @@ impl AddressSpace {
 
     pub fn reset(&mut self) {
         self.clear_regions();
-        self.cache.reset();
-        self.map.clear();
+        self.code.reset();
     }
 
     fn clear_regions(&mut self) {

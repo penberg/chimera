@@ -89,14 +89,28 @@ fn gs_qword(disp: i64) -> MemoryOperand {
     )
 }
 
+/// A patchable outgoing edge of a translated block: the guest PC of a
+/// statically known successor, and the address of the `rel32` displacement
+/// field of the direct branch that currently targets the block's cold exit
+/// stub. Once the successor is translated, the dispatcher rewrites the
+/// displacement so the branch jumps straight into the successor's host code,
+/// keeping the guest register file live across the edge instead of
+/// round-tripping through the dispatcher. See [`super::super::sys::mmap`].
+pub struct OutEdge {
+    pub target_guest: u64,
+    pub site: usize,
+}
+
 /// Translate one basic block starting at `guest_pc`. Returns the host PC at
-/// which the translated block begins.
+/// which the translated block begins, together with the block's statically
+/// known outgoing edges (empty for blocks ending in an indirect branch,
+/// return, or syscall) for the dispatcher to link.
 pub fn translate(
     cache: &mut CodeCache,
     guest_pc: u64,
     exit_tramp: u64,
     syscall_tramp: u64,
-) -> Result<u64, Error> {
+) -> Result<(u64, Vec<OutEdge>), Error> {
     let host_pc = cache.next_pc();
     let guest_bytes =
         unsafe { std::slice::from_raw_parts(guest_pc as *const u8, MAX_BLOCK_GUEST_BYTES) };
@@ -104,7 +118,7 @@ pub fn translate(
     let mut instrs = Vec::new();
     let mut instr = Instruction::default();
 
-    loop {
+    let term = loop {
         if !decoder.can_decode() {
             return Err(Error::Translate(format!(
                 "decoder ran out of bytes at {:#x}",
@@ -116,15 +130,226 @@ pub fn translate(
             instrs.push(instr);
             continue;
         }
-        emit_terminator(&mut instrs, &instr, exit_tramp, syscall_tramp)?;
-        break;
-    }
+        break instr;
+    };
 
-    let block = InstructionBlock::new(&instrs, host_pc);
+    // A terminator with statically known target(s) — a direct jmp, a direct
+    // call, or a supported conditional branch — gets the linkable layout: the
+    // straight-line body, then a fast-path direct branch (initially aimed at a
+    // cold exit stub) that the dispatcher later back-patches to the successor.
+    // Everything else (indirect branches/calls, returns, syscalls, and the few
+    // unsupported conditional forms) keeps the original "compute next guest PC,
+    // exit to dispatcher" terminator and contributes no links.
+    if let Some(link) = classify_terminator(&term) {
+        emit_body(cache, &instrs, host_pc, guest_pc)?;
+        let term_pc = cache.next_pc() as usize;
+        let (bytes, rel_edges) = build_linked_terminator(&link, exit_tramp);
+        cache.emit(&bytes)?;
+        let edges = rel_edges
+            .into_iter()
+            .map(|(off, target_guest)| OutEdge {
+                target_guest,
+                site: term_pc + off,
+            })
+            .collect();
+        Ok((host_pc, edges))
+    } else {
+        emit_terminator(&mut instrs, &term, exit_tramp, syscall_tramp)?;
+        emit_body(cache, &instrs, host_pc, guest_pc)?;
+        Ok((host_pc, Vec::new()))
+    }
+}
+
+/// Encode the straight-line instruction list at `host_pc` (with RIP-relative
+/// operands fixed up by `BlockEncoder`) and append it to the cache. A block
+/// whose first instruction is the terminator has an empty body and emits
+/// nothing here.
+fn emit_body(
+    cache: &mut CodeCache,
+    instrs: &[Instruction],
+    host_pc: u64,
+    guest_pc: u64,
+) -> Result<(), Error> {
+    if instrs.is_empty() {
+        return Ok(());
+    }
+    let block = InstructionBlock::new(instrs, host_pc);
     let result = BlockEncoder::encode(64, block, BlockEncoderOptions::NONE)
         .map_err(|e| Error::Translate(format!("encode block at {:#x}: {}", guest_pc, e)))?;
-    cache.emit(&result.code_buffer)?;
-    Ok(host_pc)
+    cache.emit(&result.code_buffer)
+}
+
+/// `gs:[]` displacement of the guest's rax slot (`regs[0]`); cold exit stubs
+/// save the live rax here for the dispatcher, matching `emit_save_rax`.
+const RAX_SLOT: i32 = 0;
+/// `gs:[]` displacement of the `rip` slot the exit trampoline resumes from.
+const RIP_SLOT: i32 = 128;
+
+/// A terminator whose successor PCs are known at translation time, and can
+/// therefore be linked directly to its successor blocks once they exist.
+enum LinkTerm {
+    /// `jmp rel`: one direct successor.
+    Uncond { target: u64 },
+    /// `jcc rel`: the taken target and the fall-through, selected by the
+    /// guest's live flags. `opcode` is the second byte of the `0F 8x` form.
+    Cond {
+        opcode: u8,
+        taken: u64,
+        fallthrough: u64,
+    },
+    /// `call rel`: pushes the return address (`ret`), then jumps to `target`.
+    DirectCall { target: u64, ret: u64 },
+}
+
+/// Classify a terminator as linkable, or `None` if it ends the block with a
+/// runtime-determined target (indirect branch/call, return), is a syscall, or
+/// is a conditional form this translator does not lower (`loop`, `jrcxz`).
+fn classify_terminator(t: &Instruction) -> Option<LinkTerm> {
+    if t.code() == Code::Syscall {
+        return None;
+    }
+    match t.flow_control() {
+        FlowControl::UnconditionalBranch => Some(LinkTerm::Uncond {
+            target: t.near_branch_target(),
+        }),
+        FlowControl::ConditionalBranch => Some(LinkTerm::Cond {
+            opcode: jcc_opcode(t.code())?,
+            taken: t.near_branch_target(),
+            fallthrough: t.next_ip(),
+        }),
+        FlowControl::Call => Some(LinkTerm::DirectCall {
+            target: t.near_branch_target(),
+            ret: t.next_ip(),
+        }),
+        _ => None,
+    }
+}
+
+/// Build the raw machine code for a linkable terminator: a fast-path direct
+/// branch followed by one cold exit stub per successor. Returns the encoded
+/// bytes and, for each edge, the byte offset of its fast-path `rel32`
+/// displacement paired with the successor's guest PC. The displacements are
+/// initialized to target the stubs; the dispatcher rewrites them to the
+/// successor blocks as those are translated.
+fn build_linked_terminator(link: &LinkTerm, exit_tramp: u64) -> (Vec<u8>, Vec<(usize, u64)>) {
+    let mut out = Vec::new();
+    let mut edges = Vec::new();
+    match *link {
+        LinkTerm::Uncond { target } => {
+            // jmp rel32 -> stub (later: -> target's host code)
+            out.push(0xE9);
+            let rel = take_rel32(&mut out);
+            let stub = out.len();
+            emit_stub(&mut out, target, exit_tramp);
+            write_rel32(&mut out, rel, stub);
+            edges.push((rel, target));
+        }
+        LinkTerm::Cond {
+            opcode,
+            taken,
+            fallthrough,
+        } => {
+            // jcc rel32 -> taken stub ; jmp rel32 -> fall-through stub.
+            // The native jcc reads the block's live guest flags directly.
+            out.extend_from_slice(&[0x0F, opcode]);
+            let jcc_rel = take_rel32(&mut out);
+            out.push(0xE9);
+            let jmp_rel = take_rel32(&mut out);
+            let taken_stub = out.len();
+            emit_stub(&mut out, taken, exit_tramp);
+            let fall_stub = out.len();
+            emit_stub(&mut out, fallthrough, exit_tramp);
+            write_rel32(&mut out, jcc_rel, taken_stub);
+            write_rel32(&mut out, jmp_rel, fall_stub);
+            edges.push((jcc_rel, taken));
+            edges.push((jmp_rel, fallthrough));
+        }
+        LinkTerm::DirectCall { target, ret } => {
+            // Push the 64-bit return address without a scratch register or
+            // touching flags: `push imm32` writes the (sign-extended) low half
+            // and decrements rsp by 8, then the high half overwrites [rsp+4].
+            // This reproduces `call`'s stack effect exactly, leaving every
+            // guest register — including rax — live for the linked successor.
+            out.push(0x68);
+            emit_u32(&mut out, ret as u32);
+            out.extend_from_slice(&[0xC7, 0x44, 0x24, 0x04]);
+            emit_u32(&mut out, (ret >> 32) as u32);
+            out.push(0xE9);
+            let rel = take_rel32(&mut out);
+            let stub = out.len();
+            emit_stub(&mut out, target, exit_tramp);
+            write_rel32(&mut out, rel, stub);
+            edges.push((rel, target));
+        }
+    }
+    (out, edges)
+}
+
+/// Emit a cold exit stub: stash the live rax, materialize the successor's
+/// guest PC into the `rip` slot, and jump to the exit trampoline. Identical in
+/// effect to the original `emit_terminator` exit tail, established as raw
+/// bytes so the fast-path branch above can be patched independently.
+fn emit_stub(out: &mut Vec<u8>, target_guest: u64, exit_tramp: u64) {
+    mov_gs_rax(out, RAX_SLOT); // mov gs:[rax_slot], rax
+    movabs_rax(out, target_guest); // movabs rax, target_guest
+    mov_gs_rax(out, RIP_SLOT); // mov gs:[rip_slot], rax
+    movabs_rax(out, exit_tramp); // movabs rax, exit_tramp
+    out.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+}
+
+/// `mov gs:[disp32], rax` — `65 48 89 04 25 <disp32>`.
+fn mov_gs_rax(out: &mut Vec<u8>, disp: i32) {
+    out.extend_from_slice(&[0x65, 0x48, 0x89, 0x04, 0x25]);
+    emit_u32(out, disp as u32);
+}
+
+/// `movabs rax, imm64` — `48 B8 <imm64>`.
+fn movabs_rax(out: &mut Vec<u8>, imm: u64) {
+    out.extend_from_slice(&[0x48, 0xB8]);
+    out.extend_from_slice(&imm.to_le_bytes());
+}
+
+fn emit_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// Reserve four bytes for a `rel32` displacement and return their offset.
+fn take_rel32(out: &mut Vec<u8>) -> usize {
+    let at = out.len();
+    out.extend_from_slice(&[0; 4]);
+    at
+}
+
+/// Write the `rel32` at `rel` so the branch reaches `target` (both byte
+/// offsets within `out`). A `rel32` is measured from the end of its 4 bytes.
+fn write_rel32(out: &mut [u8], rel: usize, target: usize) {
+    let disp = target as i64 - (rel as i64 + 4);
+    out[rel..rel + 4].copy_from_slice(&(disp as i32).to_le_bytes());
+}
+
+/// The second byte of the `0F 8x` near-conditional-branch encoding for a
+/// `Jcc` instruction, or `None` for conditional forms the linker does not
+/// lower (`loop`, `loopcc`, `jrcxz`/`jecxz`).
+fn jcc_opcode(code: Code) -> Option<u8> {
+    Some(match code {
+        Code::Jo_rel8_64 | Code::Jo_rel32_64 => 0x80,
+        Code::Jno_rel8_64 | Code::Jno_rel32_64 => 0x81,
+        Code::Jb_rel8_64 | Code::Jb_rel32_64 => 0x82,
+        Code::Jae_rel8_64 | Code::Jae_rel32_64 => 0x83,
+        Code::Je_rel8_64 | Code::Je_rel32_64 => 0x84,
+        Code::Jne_rel8_64 | Code::Jne_rel32_64 => 0x85,
+        Code::Jbe_rel8_64 | Code::Jbe_rel32_64 => 0x86,
+        Code::Ja_rel8_64 | Code::Ja_rel32_64 => 0x87,
+        Code::Js_rel8_64 | Code::Js_rel32_64 => 0x88,
+        Code::Jns_rel8_64 | Code::Jns_rel32_64 => 0x89,
+        Code::Jp_rel8_64 | Code::Jp_rel32_64 => 0x8A,
+        Code::Jnp_rel8_64 | Code::Jnp_rel32_64 => 0x8B,
+        Code::Jl_rel8_64 | Code::Jl_rel32_64 => 0x8C,
+        Code::Jge_rel8_64 | Code::Jge_rel32_64 => 0x8D,
+        Code::Jle_rel8_64 | Code::Jle_rel32_64 => 0x8E,
+        Code::Jg_rel8_64 | Code::Jg_rel32_64 => 0x8F,
+        _ => return None,
+    })
 }
 
 /// Emit the appropriate exit sequence for a terminator instruction.
