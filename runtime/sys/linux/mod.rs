@@ -5,6 +5,7 @@
 pub mod elf;
 pub mod exec;
 pub mod fault;
+mod hostfs;
 pub mod signal;
 pub mod syscall;
 mod vfs;
