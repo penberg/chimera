@@ -19,10 +19,20 @@ pub fn init() -> Result<(), Error> {
     match INIT.get_or_init(|| {
         let cpuid = std::arch::x86_64::__cpuid(1);
         if cpuid.ecx & (1 << 27) == 0 {
-            Err("host CPU lacks OSXSAVE; XSAVE-based FP/SIMD context switching unavailable")
-        } else {
-            Ok(())
+            return Err(
+                "host CPU lacks OSXSAVE; XSAVE-based FP/SIMD context switching unavailable",
+            );
         }
+        // The exit trampolines save guest FP/SIMD state with XSAVEOPT, whose
+        // init/modified optimizations let a syscall that never touched FP/SIMD
+        // skip the bulk of the save. It is reported in CPUID.(EAX=0Dh,ECX=1):
+        // EAX[0] and has shipped on every x86-64 part since ~2012 — a weaker
+        // requirement than the FSGSBASE the trampolines already assume.
+        let xstate = std::arch::x86_64::__cpuid_count(0xd, 1);
+        if xstate.eax & 1 == 0 {
+            return Err("host CPU lacks XSAVEOPT; FP/SIMD context switching unavailable");
+        }
+        Ok(())
     }) {
         Ok(()) => Ok(()),
         Err(msg) => Err(Error::Unsupported((*msg).into())),

@@ -41,7 +41,10 @@ dispatch:
     // would touch only x87+SSE and leave the upper 128 bits of every YMM (and
     // all ZMM/opmask) register untouched. EDX:EAX is the state-component mask
     // (0xe7 = x87|SSE|AVX|opmask|ZMM_Hi256|Hi16_ZMM), intersected with XCR0 by
-    // the CPU. rdi still holds ctx; eax/edx are reloaded from ctx further down.
+    // the CPU. This restore also arms the modified-state tracking that the
+    // paired `xsaveopt64` on exit reads to decide which components it may skip;
+    // the save area address here must match the one that xsaveopt64 writes.
+    // rdi still holds ctx; eax/edx are reloaded from ctx further down.
     mov eax, 0xe7
     xor edx, edx
     xrstor64 [rdi + {TS_FPSTATE}]
@@ -109,12 +112,19 @@ exit_block:
     pushfq
     pop rax
     mov gs:[{TS_RFLAGS}], rax
-    // Save guest extended FP/SIMD state via XSAVE (see dispatch for why and
-    // for the 0xe7 component mask). rax holds no live guest value here (the
-    // exit stub already stashed guest rax in gs:[TS_RAX]) and rdx is saved.
+    // Save guest extended FP/SIMD state via XSAVEOPT (see dispatch for why and
+    // for the 0xe7 component mask). XSAVEOPT — over plain XSAVE — applies the
+    // init and modified optimizations: it skips writing any component the guest
+    // left in its initial state, and any component unmodified since the paired
+    // `xrstor64` in dispatch loaded this very save area (the CPU tracks the
+    // restore's linear address). A guest block that never touches FP/SIMD —
+    // most of them — saves nothing but the header. The skipped components keep
+    // the bytes the matching xrstor64 read, so the next entry restores them
+    // intact. rax holds no live guest value here (the exit stub already stashed
+    // guest rax in gs:[TS_RAX]) and rdx is saved.
     mov eax, 0xe7
     xor edx, edx
-    xsave64 gs:[{TS_FPSTATE}]
+    xsaveopt64 gs:[{TS_FPSTATE}]
     // Restore Chimera's FS base so Rust TLS works again.
     mov rax, gs:[{TS_CHIMERA_FS}]
     wrfsbase rax
@@ -154,13 +164,16 @@ exit_syscall:
     mov gs:[{TS_R13}], r13
     mov gs:[{TS_R14}], r14
     mov gs:[{TS_R15}], r15
-    // Save guest extended FP/SIMD state via XSAVE (see dispatch for the 0xe7
-    // component mask). rax is free (the exit stub stashed guest rax) and rdx
-    // is already saved; both are clobbered by the mask setup. No flags are
-    // captured here, so the flag-clobbering `xor` is harmless.
+    // Save guest extended FP/SIMD state via XSAVEOPT (see exit_block for the
+    // init/modified optimizations and dispatch for the 0xe7 component mask). A
+    // syscall block that touched no FP/SIMD register since entry — the common
+    // case, e.g. a bare getpid — saves only the header here. rax is free (the
+    // exit stub stashed guest rax) and rdx is already saved; both are clobbered
+    // by the mask setup. No flags are captured here, so the flag-clobbering
+    // `xor` is harmless.
     mov eax, 0xe7
     xor edx, edx
-    xsave64 gs:[{TS_FPSTATE}]
+    xsaveopt64 gs:[{TS_FPSTATE}]
     // TS_RFLAGS materialized by the per-block stub.
     mov qword ptr gs:[{TS_EXIT_KIND}], {EXIT_KIND_SYSCALL}
     // Restore Chimera's FS base.
