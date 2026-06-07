@@ -54,6 +54,7 @@ global_asm!(
     TS_EXIT_KIND   = const offset_of!(ThreadState, exit_kind),
     TS_GUEST_FS    = const offset_of!(ThreadState, guest_fs_base),
     TS_FPSTATE     = const offset_of!(ThreadState, fpstate),
+    TS_FP_IN_REGS  = const offset_of!(ThreadState, fp_in_regs),
     TS_CHIMERA_FS  = const offset_of!(ThreadState, chimera_fs_base),
     EXIT_KIND_SYSCALL = const EXIT_KIND_SYSCALL,
     EXIT_KIND_TRAP = const EXIT_KIND_TRAP,

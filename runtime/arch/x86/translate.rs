@@ -10,8 +10,9 @@ use std::{
 };
 
 use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderError, DecoderOptions, FlowControl,
-    Instruction, InstructionBlock, MemoryOperand, OpKind, Register,
+    BlockEncoder, BlockEncoderOptions, Code, CpuidFeature, Decoder, DecoderError, DecoderOptions,
+    FlowControl, Instruction, InstructionBlock, InstructionInfoFactory, MemoryOperand, OpKind,
+    Register,
 };
 
 use crate::Error;
@@ -541,6 +542,19 @@ pub fn translate(
 
     rewrite_rip_relative_leas(&mut instrs)?;
 
+    // A block that touches FP/SIMD state opens with a lazy-restore prologue:
+    // `dispatch` no longer restores ts.fpstate on entry, so the first such block
+    // of a residency loads it (and sets ts.fp_in_regs) before its body runs.
+    // Integer-only blocks emit no prologue and `host_pc` is their first body
+    // instruction; the prologue, when present, sits at `host_pc` so links and
+    // the indirect-branch table reach it (and re-run the fp_in_regs check) just
+    // like any other entry.
+    if block_uses_fp(&instrs, &term) {
+        let prologue = build_fp_prologue(block_flags_live_in(&instrs, &term));
+        cache.emit(&prologue)?;
+    }
+    let body_pc = cache.next_pc();
+
     // A terminator with statically known target(s) — a direct jmp, a direct
     // call, or a supported conditional branch — gets the linkable layout: the
     // straight-line body, then a fast-path direct branch (initially aimed at a
@@ -549,7 +563,7 @@ pub fn translate(
     // unsupported conditional forms) keeps the original "compute next guest PC,
     // exit to dispatcher" terminator and contributes no links.
     let edges = if let Some(link) = classify_terminator(&term) {
-        emit_body(cache, &instrs, host_pc, guest_pc)?;
+        emit_body(cache, &instrs, body_pc, guest_pc)?;
         let term_pc = cache.next_pc() as usize;
         let (bytes, rel_edges) = build_linked_terminator(&link, exit_tramp, guest_pc, term_pc);
         cache.emit(&bytes)?;
@@ -562,7 +576,7 @@ pub fn translate(
             .collect()
     } else {
         emit_terminator(&mut instrs, &term, syscall_tramp, trap_tramp)?;
-        emit_body(cache, &instrs, host_pc, guest_pc)?;
+        emit_body(cache, &instrs, body_pc, guest_pc)?;
         Vec::new()
     };
 
@@ -610,6 +624,83 @@ fn rewrite_rip_relative_leas(instrs: &mut [Instruction]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Whether any instruction in the block (body or terminator) reads or writes
+/// FP/SIMD state — x87, MMX, SSE/AVX/AVX-512 vector registers, opmask (`k`) or
+/// tile registers — and therefore needs the guest's `fpstate` live in the
+/// physical registers. Register-naming instructions are caught by their used
+/// registers; the few that touch state without naming a vector register
+/// (`ldmxcsr`/`stmxcsr`, `vzeroupper`/`vzeroall`, the x87 control-word ops) are
+/// caught by their CPUID feature. Over-approximating only costs an unnecessary
+/// save/restore, never correctness; under-approximating would drop guest state,
+/// so the two signals are combined.
+fn block_uses_fp(body: &[Instruction], term: &Instruction) -> bool {
+    let mut info = InstructionInfoFactory::new();
+    body.iter()
+        .chain(std::iter::once(term))
+        .any(|i| instr_uses_fp(&mut info, i))
+}
+
+fn instr_uses_fp(info: &mut InstructionInfoFactory, instr: &Instruction) -> bool {
+    let touches_vector_reg = info.info(instr).used_registers().iter().any(|u| {
+        let r = u.register();
+        r.is_xmm() || r.is_ymm() || r.is_zmm() || r.is_mm() || r.is_st() || r.is_k() || r.is_tmm()
+    });
+    touches_vector_reg || instr.cpuid_features().iter().any(|&f| is_fp_feature(f))
+}
+
+/// Whether a CPUID feature implies the instruction touches FP/SIMD/x87 state.
+/// Covers the operations `block_uses_fp`'s register scan misses because they
+/// name no vector register: the control words (`ldmxcsr` is SSE, `vzeroupper`
+/// is AVX, `fldcw`/`fnstcw` are x87/`FPU`) and, critically, the whole-state
+/// save/restore family (`fxsave`, `xsave`/`xsavec`/`xsaves`/`xsaveopt`,
+/// `fxrstor`/`xrstor`/`xrstors`) that glibc's lazy-PLT resolver
+/// (`_dl_runtime_resolve_xsavec`) spills the caller's vector registers through.
+/// Such a block needs the guest's `fpstate` live in the physical registers
+/// before it runs, exactly like an arithmetic SIMD block. The arithmetic forms
+/// of every vector extension already name a register and are caught there.
+fn is_fp_feature(f: CpuidFeature) -> bool {
+    use CpuidFeature::*;
+    matches!(
+        f,
+        FPU | FPU287
+            | FPU387
+            | MMX
+            | SSE
+            | SSE2
+            | SSE3
+            | SSSE3
+            | SSE4_1
+            | SSE4_2
+            | SSE4A
+            | AVX
+            | AVX2
+            | FMA
+            | F16C
+            | XOP
+            | FMA4
+            | FXSR
+            | XSAVE
+            | XSAVEC
+            | XSAVES
+            | XSAVEOPT
+    )
+}
+
+/// Whether the block reads any status flag a predecessor block left live before
+/// defining it itself. The FP-block prologue's `fp_in_regs` test clobbers flags,
+/// so when this holds the prologue must save and restore them (`lahf`/`seto` …
+/// `sahf`); otherwise it can skip that and just branch.
+fn block_flags_live_in(body: &[Instruction], term: &Instruction) -> bool {
+    let mut defined = 0u32;
+    for i in body.iter().chain(std::iter::once(term)) {
+        if i.rflags_read() & !defined != 0 {
+            return true;
+        }
+        defined |= i.rflags_modified();
+    }
+    false
 }
 
 /// Encode the straight-line instruction list at `host_pc` (with RIP-relative
@@ -1007,6 +1098,95 @@ fn emit_restore_flags(out: &mut Vec<u8>, d_flags: i32) {
     gs_load(out, MODRM_RAX, d_flags); // mov rax, gs:[flags]
     out.extend_from_slice(&[0x04, 0x7f]); // add al, 0x7f
     out.push(0x9e); // sahf
+}
+
+/// Build the lazy FP-restore prologue emitted at the head of every block that
+/// touches FP/SIMD. On entry the prologue checks `ts.fp_in_regs`: if some
+/// earlier block this residency already loaded the guest's `fpstate` into the
+/// physical registers, it falls straight through; otherwise it restores
+/// `fpstate` with `xrstor64` (the full `0xe7` component mask) and marks the
+/// state live. The body then runs with the guest's FP/SIMD registers in place.
+///
+/// `fp_in_regs` is cleared by `dispatch` on every cache entry, so the first FP
+/// block of each residency takes the restore and the rest skip it; the exit
+/// trampolines mirror the flag to decide whether to save (see `trampoline.S`).
+///
+/// The check borrows rax (and, on the restore path, rdx, which `xrstor64`'s
+/// `edx` mask half clobbers), parked in gs slots and reloaded before the body.
+/// When `flags_live_in` the block reads a predecessor's flags, so the prologue
+/// also preserves them around its own `cmp` via `lahf`/`seto` … `add al,0x7f`/
+/// `sahf`, exactly as the indirect-branch lookup routine does.
+fn build_fp_prologue(flags_live_in: bool) -> Vec<u8> {
+    let d_in = offset_of!(ThreadState, fp_in_regs) as i32;
+    let d_fps = offset_of!(ThreadState, fpstate) as i32;
+    let d_flags = offset_of!(ThreadState, fp_flags) as i32;
+    let d_scr = offset_of!(ThreadState, fp_scratch) as i32;
+    let mut out = Vec::new();
+
+    if flags_live_in {
+        // Save rax, stash the guest flags (lahf/seto) so the cmp below can
+        // clobber them, then check fp_in_regs.
+        gs_store(&mut out, MODRM_RAX, RAX_SLOT); // mov gs:[rax], rax
+        out.push(0x9f); // lahf
+        out.extend_from_slice(&[0x0f, 0x90, 0xc0]); // seto al
+        gs_store(&mut out, MODRM_RAX, d_flags); // mov gs:[fp_flags], rax
+        cmp_gs_byte_zero(&mut out, d_in); // cmp byte gs:[fp_in_regs], 0
+        out.push(0x75); // jne restore_flags (skip the xrstor)
+        let jne = out.len();
+        out.push(0);
+        emit_fp_restore(&mut out, d_fps, d_scr, d_in);
+        let restore_flags = out.len();
+        out[jne] = jcc_rel8(jne, restore_flags);
+        emit_restore_flags(&mut out, d_flags); // rax<-flags; add al,0x7f; sahf
+        gs_load(&mut out, MODRM_RAX, RAX_SLOT); // mov rax, gs:[rax]
+    } else {
+        // No flags live in, so the cmp may clobber them freely.
+        cmp_gs_byte_zero(&mut out, d_in); // cmp byte gs:[fp_in_regs], 0
+        out.push(0x75); // jne done
+        let jne = out.len();
+        out.push(0);
+        gs_store(&mut out, MODRM_RAX, RAX_SLOT); // mov gs:[rax], rax
+        emit_fp_restore(&mut out, d_fps, d_scr, d_in);
+        gs_load(&mut out, MODRM_RAX, RAX_SLOT); // mov rax, gs:[rax]
+        let done = out.len();
+        out[jne] = jcc_rel8(jne, done);
+    }
+    out
+}
+
+/// Emit the FP restore proper, shared by both prologue forms: park rdx, restore
+/// the full extended state from `gs:[fpstate]` via `xrstor64` (mask `0xe7` in
+/// edx:eax), reload rdx, and set `fp_in_regs`. Assumes rax is already saved (it
+/// is loaded with the mask's low half) and that the caller reloads rax after.
+fn emit_fp_restore(out: &mut Vec<u8>, d_fps: i32, d_scr: i32, d_in: i32) {
+    gs_store(out, MODRM_RDX, d_scr); // mov gs:[fp_scratch], rdx
+    out.extend_from_slice(&[0xb8, 0xe7, 0x00, 0x00, 0x00]); // mov eax, 0xe7
+    out.extend_from_slice(&[0x31, 0xd2]); // xor edx, edx
+    out.extend_from_slice(&[0x65, 0x48, 0x0f, 0xae, 0x2c, 0x25]); // xrstor64 gs:[
+    emit_u32(out, d_fps as u32); //   fpstate]
+    gs_load(out, MODRM_RDX, d_scr); // mov rdx, gs:[fp_scratch]
+    mov_gs_byte_one(out, d_in); // mov byte gs:[fp_in_regs], 1
+}
+
+/// `cmp byte ptr gs:[disp32], 0` — `65 80 3c 25 <disp32> 00`.
+fn cmp_gs_byte_zero(out: &mut Vec<u8>, disp: i32) {
+    out.extend_from_slice(&[0x65, 0x80, 0x3c, 0x25]);
+    emit_u32(out, disp as u32);
+    out.push(0x00);
+}
+
+/// `mov byte ptr gs:[disp32], 1` — `65 c6 04 25 <disp32> 01`.
+fn mov_gs_byte_one(out: &mut Vec<u8>, disp: i32) {
+    out.extend_from_slice(&[0x65, 0xc6, 0x04, 0x25]);
+    emit_u32(out, disp as u32);
+    out.push(0x01);
+}
+
+/// The `rel8` byte for a short `jcc`/`jmp` whose displacement field is at
+/// `from` (one byte) and whose target is `to`, both offsets within the buffer.
+fn jcc_rel8(from: usize, to: usize) -> u8 {
+    let disp = to as i64 - (from as i64 + 1);
+    i8::try_from(disp).expect("fp prologue jump out of rel8 range") as u8
 }
 
 /// Reserve four bytes for a `rel32` displacement and return their offset.
