@@ -154,6 +154,7 @@ impl Thread {
                 fp_flags: 0,
                 fp_scratch: 0,
                 fpstate: [0; XSAVE_AREA_SIZE],
+                fs_is_guest: 0,
                 pending_set: 0,
                 tid: AtomicI32::new(0),
             }),
@@ -792,20 +793,20 @@ pub struct ThreadState {
     /// guest state. `dispatch` clears it on every cache entry (the Rust code
     /// that ran since the last exit has clobbered the vector registers); the
     /// first translated block that actually touches FP restores `fpstate` and
-    /// sets it (see the translator's FP-block prologue). The exit trampolines
-    /// save `fpstate` only when it is set, so a residency that never touches FP
-    /// pays neither XRSTOR nor XSAVE. Read and written by both `trampoline.S`
-    /// and the emitted prologue, so it sits in the gs-reachable region.
+    /// sets it (see the translator's block prologue). The exit trampolines save
+    /// `fpstate` only when it is set, so a residency that never touches FP pays
+    /// neither XRSTOR nor XSAVE. Read and written by both `trampoline.S` and the
+    /// emitted prologue, so it sits in the gs-reachable region.
     /// 32-bit so it packs against `exit_requested` and `fpstate` stays at
     /// offset 256; only 0 and 1 are ever stored.
     pub fp_in_regs: u32,
-    /// Scratch slot the FP-block prologue uses to park the guest's status flags
-    /// (via `lahf`/`seto`) across its `fp_in_regs` check, for the blocks whose
-    /// first instructions read flags set by a predecessor. Live only for the
-    /// few instructions of one prologue.
+    /// Scratch slot the block prologue uses to park the guest's status flags
+    /// (via `lahf`/`seto`) across its checks, for the blocks whose first
+    /// instructions read flags set by a predecessor. Live only for the few
+    /// instructions of one prologue.
     pub fp_flags: u64,
-    /// Scratch slot the FP-block prologue uses to park the guest's rdx across
-    /// the `xrstor64` (whose `edx` mask half clobbers it). Live only for the
+    /// Scratch slot the block prologue uses to park the guest's rdx across the
+    /// `xrstor64` (whose `edx` mask half clobbers it). Live only for the
     /// duration of one restore.
     pub fp_scratch: u64,
     /// XSAVE area for the guest's extended FP/SIMD state (x87, SSE, AVX,
@@ -813,6 +814,14 @@ pub struct ThreadState {
     /// saved and restored only around blocks that touch FP (see `fp_in_regs`).
     /// Must be 64-byte aligned; the field layout above guarantees offset 256.
     pub fpstate: [u8; XSAVE_AREA_SIZE],
+    /// Whether the FS base register currently holds the guest's base (rather
+    /// than Chimera's, used by Rust TLS). Mirrors `fp_in_regs` for the FS-base
+    /// swap: `dispatch` clears it and leaves FS holding Chimera's base, the
+    /// first block that reads guest TLS (`fs:`) installs `guest_fs_base` and
+    /// sets it, and the exit trampolines restore Chimera's base only when it is
+    /// set. A residency that never touches `fs:` keeps both `wrfsbase`s off the
+    /// path. Placed after `fpstate` so that field stays 64-byte aligned.
+    pub fs_is_guest: u64,
     /// Address of this thread's `PendingSet` (owned by its `Signals`), read by
     /// the host signal catcher via `gs:[]` so a caught signal is recorded on
     /// the thread that caught it — pending state is per-thread, and this
@@ -856,6 +865,7 @@ impl ThreadState {
         self.fp_in_regs = 0;
         self.fp_flags = 0;
         self.fp_scratch = 0;
+        self.fs_is_guest = 0;
         self.fpstate.fill(0);
 
         // XRSTOR loads MXCSR from the legacy region (bytes 24..28) of the save
@@ -905,6 +915,7 @@ impl ThreadState {
             fp_flags: 0,
             fp_scratch: 0,
             fpstate: self.fpstate,
+            fs_is_guest: 0,
             // Cleared, not inherited: the child's own `PendingSet` address is
             // published by `Thread::from_state`. Copying the parent's pointer
             // would let the catcher record the child's signals on the parent.

@@ -34,20 +34,21 @@ dispatch:
     // Stash Chimera state in ThreadState (reached via GS).
     mov gs:[{TS_CHIMERA_RSP}], rsp
     mov gs:[{TS_HOST_PC}], rsi
-    // Install the guest's FS base. rax is free at this point.
-    mov rax, [rdi + {TS_GUEST_FS}]
-    wrfsbase rax
-    // Do NOT restore the guest's FP/SIMD state here. The Rust code that ran
-    // since the last cache exit has clobbered the physical vector registers, so
-    // a restore would be needed before any guest FP use — but most residencies
-    // (a bare syscall loop, an integer hot loop) never touch FP at all, and an
-    // unconditional XRSTOR of the full 832-byte area was the single costliest
-    // instruction on the syscall path. Defer it: clear the "FP regs are live"
-    // flag, and let the first block that actually touches FP restore ts.fpstate
-    // from its prologue (which then sets the flag). The exit trampolines save
-    // ts.fpstate only when the flag is set, so an FP-free residency pays neither
-    // XRSTOR nor XSAVE. eax/edx are reloaded as guest registers further down.
+    // Install neither the guest's FS base nor its FP/SIMD state here; both are
+    // done lazily by the translator's per-block prologue. The Rust code that
+    // ran since the last cache exit holds Chimera's FS base (for its TLS) and
+    // has clobbered the physical vector registers, so a guest that uses TLS or
+    // FP would need them installed first — but most residencies (a bare syscall
+    // loop, an integer hot loop) touch neither, and an unconditional `wrfsbase`
+    // plus a full 832-byte XRSTOR were the costliest instructions on the
+    // syscall path. Defer both: leave FS as Chimera's, leave the vector
+    // registers as they are, and clear the two "installed" flags. The first
+    // block that reads guest TLS (`fs:`) loads the guest FS base; the first that
+    // touches FP restores ts.fpstate; each sets its flag, and the exit
+    // trampolines undo only what was installed. eax/edx are reloaded as guest
+    // registers further down.
     mov dword ptr [rdi + {TS_FP_IN_REGS}], 0
+    mov qword ptr [rdi + {TS_FS_IS_GUEST}], 0
     // Load guest GPRs from *ctx (rdi). rdi and rsp are loaded last: rdi is
     // still needed as the base register, and rsp must stay on Chimera's stack
     // until after the rflags restore below.
@@ -126,9 +127,15 @@ exit_block:
     xor edx, edx
     xsaveopt64 gs:[{TS_FPSTATE}]
 1:
-    // Restore Chimera's FS base so Rust TLS works again.
+    // Restore Chimera's FS base for Rust TLS, but only if a block this
+    // residency installed the guest's (setting TS_FS_IS_GUEST). Otherwise FS
+    // still holds Chimera's base and the wrfsbase is pure cost. The cmp
+    // clobbers flags, already captured above.
+    cmp qword ptr gs:[{TS_FS_IS_GUEST}], 0
+    je 3f
     mov rax, gs:[{TS_CHIMERA_FS}]
     wrfsbase rax
+3:
     pop r15
     pop r14
     pop r13
@@ -177,9 +184,13 @@ exit_syscall:
 2:
     // TS_RFLAGS materialized by the per-block stub.
     mov qword ptr gs:[{TS_EXIT_KIND}], {EXIT_KIND_SYSCALL}
-    // Restore Chimera's FS base.
+    // Restore Chimera's FS base only if a block installed the guest's (see
+    // exit_block). The cmp clobbers flags; none are live here.
+    cmp qword ptr gs:[{TS_FS_IS_GUEST}], 0
+    je 4f
     mov rax, gs:[{TS_CHIMERA_FS}]
     wrfsbase rax
+4:
     mov rsp, gs:[{TS_CHIMERA_RSP}]
     pop r15
     pop r14
@@ -221,14 +232,19 @@ exit_trap:
     // guest value and an unconditional save would clobber the canonical
     // ts.fpstate with them.
     cmp dword ptr gs:[{TS_FP_IN_REGS}], 0
-    je 3f
+    je 5f
     mov eax, 0xe7
     xor edx, edx
     xsaveopt64 gs:[{TS_FPSTATE}]
-3:
+5:
     mov qword ptr gs:[{TS_EXIT_KIND}], {EXIT_KIND_TRAP}
+    // Restore Chimera's FS base only if a block installed the guest's (see
+    // exit_block). The cmp clobbers flags; rflags is already captured above.
+    cmp qword ptr gs:[{TS_FS_IS_GUEST}], 0
+    je 6f
     mov rax, gs:[{TS_CHIMERA_FS}]
     wrfsbase rax
+6:
     pop r15
     pop r14
     pop r13
