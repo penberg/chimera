@@ -504,6 +504,26 @@ impl Personality {
     }
 
     fn open(&self, dirfd: i32, pathptr: u64, flags: i32, mode: u32) -> Result<i64, Errno> {
+        // open(2) ignores `mode` unless the call creates a file (O_CREAT or
+        // O_TMPFILE) — the third argument is variadic and callers routinely
+        // pass a stale value on plain reads. openat2, which HostFs resolves
+        // through, instead rejects a nonzero mode on a non-creating open
+        // with EINVAL, so apply the kernel's open(2) rule before any
+        // filesystem sees it.
+        let mode = if flags & libc::O_CREAT != 0 || flags & libc::O_TMPFILE == libc::O_TMPFILE {
+            mode
+        } else {
+            0
+        };
+        // The same treatment for O_PATH companions: open(2) silently masks
+        // everything but O_CLOEXEC, O_DIRECTORY, and O_NOFOLLOW out of an
+        // O_PATH open, while openat2 rejects the extras with EINVAL — and
+        // callers do pass them (Bun's existence probes open O_PATH|O_LARGEFILE).
+        let flags = if flags & libc::O_PATH != 0 {
+            flags & (libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        } else {
+            flags
+        };
         let raw = unsafe { read_cstr(pathptr) };
         let abs = self.abs_path(dirfd, &raw)?;
         let follow = flags & libc::O_NOFOLLOW == 0;
@@ -651,7 +671,12 @@ impl Personality {
         let raw = unsafe { read_cstr(pathptr) };
         let abs = self.abs_path(dirfd, &raw)?;
         let r = self.ns.resolve(&abs, follow)?;
-        let s = r.fs.stat(&r.rel, follow)?;
+        // Reuse the stat the resolver already took, if any (walked path); the
+        // confining fast path leaves it to the filesystem here.
+        let s = match r.stat {
+            Some(s) => s,
+            None => r.fs.stat(&r.rel, follow)?,
+        };
         write_stat(buf, &s);
         Ok(0)
     }
@@ -664,7 +689,10 @@ impl Personality {
             let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
             let abs = self.abs_path(dirfd, &raw)?;
             let r = self.ns.resolve(&abs, follow)?;
-            r.fs.stat(&r.rel, follow)?
+            match r.stat {
+                Some(s) => s,
+                None => r.fs.stat(&r.rel, follow)?,
+            }
         };
         write_statx(buf, &s);
         Ok(0)
@@ -676,7 +704,10 @@ impl Personality {
         let raw = unsafe { read_cstr(pathptr) };
         let abs = self.abs_path(dirfd, &raw)?;
         let r = self.ns.resolve(&abs, true)?;
-        r.fs.stat(&r.rel, true)?;
+        // Confirm the target exists (the resolver may already have stat'd it).
+        if r.stat.is_none() {
+            r.fs.stat(&r.rel, true)?;
+        }
         if mode & libc::W_OK != 0 && !r.writable {
             return Err(Errno::EROFS);
         }

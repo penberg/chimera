@@ -87,6 +87,18 @@ pub trait Vfs: Send + Sync {
     fn host_path(&self, _path: &Path) -> Option<PathBuf> {
         None
     }
+
+    /// Whether this filesystem resolves and confines paths itself (e.g.
+    /// [`HostFs`] via `openat2(RESOLVE_IN_ROOT)`). When the namespace is a single
+    /// mount of a confining filesystem, the resolver skips its per-component walk
+    /// and hands the raw path straight in, since the filesystem will follow
+    /// symlinks and `..` scoped to its root. A filesystem that returns `false`
+    /// relies on the namespace walker to resolve and confine on its behalf.
+    ///
+    /// [`HostFs`]: super::hostfs::HostFs
+    fn confines(&self) -> bool {
+        false
+    }
 }
 
 /// One open file or directory. Positional: there is no internal cursor, so the

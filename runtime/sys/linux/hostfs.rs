@@ -1,12 +1,13 @@
 //! [`HostFs`]: a [`Vfs`] that passes through to a host directory. The reference
 //! filesystem — mount one at `/` and the guest sees the real tree under it.
 //!
-//! Unlike libfuse's `passthrough_hp` (and the FUSE-shaped `HostFS` it is modeled
-//! on), this does not cache inodes behind `O_PATH` handles: the namespace
-//! resolver above hands every method a path that is already mount-relative,
-//! normalized, symlink-resolved to the degree the call asks for, and confined to
-//! the mount, so `HostFs` just joins it onto its root and issues the matching
-//! libc call. Identity the guest observes still rides through as the host's real
+//! `HostFs` confines itself: it holds an `O_PATH` descriptor for its root and
+//! resolves the read path with `openat2(RESOLVE_IN_ROOT)`, so the kernel follows
+//! symlinks and `..` scoped to the root in a single syscall. Because it confines
+//! ([`Vfs::confines`] returns `true`), the namespace skips its per-component
+//! walk for a single `HostFs` mount and hands the raw path straight here — the
+//! kernel does the resolution the walk would otherwise do one `stat` at a time.
+//! Identity the guest observes still rides through as the host's real
 //! `st_ino`/`st_dev` inside [`Stat`].
 
 // Scaffolding: no Personality drives this yet, so the public surface is unused
@@ -51,8 +52,6 @@ fn relocate_high(fd: OwnedFd) -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(high) }
 }
 
-/// A filesystem backed by a host directory. Mount-relative paths are joined onto
-/// `root`; the host kernel does the rest.
 /// Linux x86-64 `struct statfs`, including the fields Rust's `libc` binding
 /// still hides behind a stale definition.
 #[repr(C)]
@@ -70,8 +69,26 @@ struct RawStatFs {
     f_flags: libc::c_long,
     f_spare: [libc::c_long; 4],
 }
+
+/// `resolve` flags for `openat2` (`<linux/openat2.h>`; libc has no binding).
+/// `RESOLVE_IN_ROOT` scopes the whole walk — `..` and absolute symlinks
+/// included — to the dirfd, which is exactly the namespace's confinement model.
+const RESOLVE_IN_ROOT: u64 = 0x10;
+
+/// `struct open_how` for `openat2`.
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// A filesystem backed by a host directory. Read operations resolve through
+/// `root_fd` with `openat2(RESOLVE_IN_ROOT)`, confined to the root in-kernel.
 pub struct HostFs {
     root: PathBuf,
+    /// `O_PATH` descriptor for the root, the dirfd every `openat2` is scoped to.
+    root_fd: OwnedFd,
 }
 
 impl HostFs {
@@ -83,43 +100,87 @@ impl HostFs {
         if !meta.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        Ok(Self { root })
+        let croot = cpath(&root)?;
+        let fd = unsafe {
+            libc::open(
+                croot.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(last_errno());
+        }
+        Ok(Self {
+            root,
+            // The root handle lives for the whole run; keep it out of the
+            // guest's low fd space like any other backing descriptor.
+            root_fd: relocate_high(unsafe { OwnedFd::from_raw_fd(fd) }),
+        })
     }
 
-    /// Join a mount-relative guest path onto the host root. The resolver has
-    /// already stripped `..` escapes and confined the path, so a leading `/` is
-    /// the only thing to drop before treating it as relative to `root`.
+    /// Join a mount-relative guest path onto the host root. Used by the path
+    /// mutators, which are not yet `openat2`-confined (they are reachable only
+    /// under a writable mount).
     fn host_path(&self, rel: &Path) -> PathBuf {
         let rel = rel.strip_prefix("/").unwrap_or(rel);
         self.root.join(rel)
+    }
+
+    /// Open `path` (mount-relative) confined to the root via `openat2`. `flags`
+    /// is the raw open-flag set; the kernel scopes resolution with
+    /// `RESOLVE_IN_ROOT`, so symlinks and `..` cannot escape.
+    fn open_in_root(&self, path: &Path, flags: libc::c_int, mode: u32) -> Result<OwnedFd, Errno> {
+        // `openat2` is relative to root_fd; strip the leading `/`, and name the
+        // root itself as ".".
+        let rel = path.strip_prefix("/").unwrap_or(path);
+        let bytes = rel.as_os_str().as_bytes();
+        let crel = CString::new(if bytes.is_empty() {
+            b"." as &[u8]
+        } else {
+            bytes
+        })
+        .map_err(|_| Errno::EINVAL)?;
+        let how = OpenHow {
+            flags: flags as u64,
+            mode: mode as u64,
+            resolve: RESOLVE_IN_ROOT,
+        };
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                self.root_fd.as_raw_fd(),
+                crel.as_ptr(),
+                &how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if fd < 0 {
+            return Err(last_errno());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
     }
 }
 
 impl Vfs for HostFs {
     fn open(&self, path: &Path, flags: OpenFlags, mode: Mode) -> Result<Box<dyn File>, Errno> {
-        let cpath = cpath(&self.host_path(path))?;
         // The guest runs the same OS and ISA, so its O_* flag bits are the
-        // host's; forward them verbatim. O_NOFOLLOW (set by the resolver for a
-        // final-symlink lstat-style open) is honored by the host kernel.
-        let fd = unsafe { libc::open(cpath.as_ptr(), flags.raw(), mode.0 as libc::c_uint) };
-        if fd < 0 {
-            return Err(last_errno());
-        }
+        // host's; forward them verbatim. The kernel confines resolution to the
+        // root, and honors O_NOFOLLOW on the final component.
+        let fd = self.open_in_root(path, flags.raw(), mode.0)?;
         Ok(Box::new(HostFile {
-            fd: relocate_high(unsafe { OwnedFd::from_raw_fd(fd) }),
+            fd: relocate_high(fd),
         }))
     }
 
     fn stat(&self, path: &Path, follow: bool) -> Result<Stat, Errno> {
-        let cpath = cpath(&self.host_path(path))?;
+        // Resolve to an O_PATH handle confined to the root, then stat the
+        // handle. O_NOFOLLOW makes the handle name a final symlink itself
+        // (lstat); without it the final symlink is followed (stat).
+        let oflags = libc::O_PATH | if follow { 0 } else { libc::O_NOFOLLOW };
+        let fd = self.open_in_root(path, oflags, 0)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let r = unsafe {
-            if follow {
-                libc::stat(cpath.as_ptr(), &mut st)
-            } else {
-                libc::lstat(cpath.as_ptr(), &mut st)
-            }
-        };
+        let r =
+            unsafe { libc::fstatat(fd.as_raw_fd(), c"".as_ptr(), &mut st, libc::AT_EMPTY_PATH) };
         if r < 0 {
             return Err(last_errno());
         }
@@ -127,17 +188,26 @@ impl Vfs for HostFs {
     }
 
     fn readlink(&self, path: &Path) -> Result<PathBuf, Errno> {
-        let cpath = cpath(&self.host_path(path))?;
+        // O_PATH | O_NOFOLLOW names the symlink itself; readlinkat with an empty
+        // path then reads its target.
+        let fd = self.open_in_root(path, libc::O_PATH | libc::O_NOFOLLOW, 0)?;
         let mut buf = vec![0u8; libc::PATH_MAX as usize];
         let n = unsafe {
-            libc::readlink(
-                cpath.as_ptr(),
+            libc::readlinkat(
+                fd.as_raw_fd(),
+                c"".as_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_char,
                 buf.len(),
             )
         };
         if n < 0 {
-            return Err(last_errno());
+            let e = last_errno();
+            // The empty-path readlinkat reports ENOENT when the handle is not
+            // a symlink, but readlink(2) by path says EINVAL — and glibc's
+            // realpath depends on EINVAL to mean "a real component, keep
+            // walking". The open above already proved the path exists, so
+            // ENOENT here can only mean "not a symlink".
+            return Err(if e == Errno::ENOENT { Errno::EINVAL } else { e });
         }
         buf.truncate(n as usize);
         Ok(PathBuf::from(OsString::from_vec(buf)))
@@ -194,12 +264,16 @@ impl Vfs for HostFs {
     }
 
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno> {
-        let cpath = cpath(&self.host_path(path))?;
-        Ok(statfs_to_statfs(&raw_statfs(cpath.as_c_str())?))
+        let fd = self.open_in_root(path, libc::O_PATH, 0)?;
+        Ok(statfs_to_statfs(&raw_fstatfs(fd.as_raw_fd())?))
     }
 
     fn host_path(&self, path: &Path) -> Option<PathBuf> {
         Some(HostFs::host_path(self, path))
+    }
+
+    fn confines(&self) -> bool {
+        true
     }
 }
 

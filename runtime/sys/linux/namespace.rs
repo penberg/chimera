@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
 };
 
-use super::vfs::{Errno, FileType, Vfs};
+use super::vfs::{Errno, FileType, Stat, Vfs};
 
 /// How many symlinks a single resolution may expand before giving up with
 /// `ELOOP`, matching Linux's `MAXSYMLINKS`.
@@ -47,13 +47,19 @@ pub struct Namespace {
 }
 
 /// The outcome of resolving a guest path: the serving filesystem, the path
-/// relative to that filesystem's mount point, whether writes are allowed, and
-/// the canonical absolute path within the namespace.
+/// relative to that filesystem's mount point, whether writes are allowed, the
+/// absolute path within the namespace, and — when the per-component walk already
+/// stat'd the final target — its [`Stat`], so the caller need not stat again.
+///
+/// `abs` is canonical (symlink-resolved) on the walked path and lexically
+/// normalized on the confining fast path; either way it is only an anchor for
+/// later `dirfd`-relative resolution, which re-resolves through the filesystem.
 pub struct Resolved {
     pub fs: Arc<dyn Vfs>,
     pub rel: PathBuf,
     pub writable: bool,
     pub abs: PathBuf,
+    pub stat: Option<Stat>,
 }
 
 impl Namespace {
@@ -85,56 +91,74 @@ impl Namespace {
     /// The path must be absolute; the Personality joins it against the cwd or a
     /// dirfd first. `..` is confined — popping at the root stays at the root.
     pub fn resolve(&self, path: &Path, follow_final: bool) -> Result<Resolved, Errno> {
+        // Fast path: a single mount of a self-confining filesystem (HostFs)
+        // resolves and confines internally, so the per-component walk is
+        // unnecessary. Hand it the raw path; the kernel does the resolution the
+        // walk would otherwise do one stat at a time. The mount is at `/`, so the
+        // mount-relative path is the path itself.
+        if self.mounts.len() == 1 && self.mounts[0].fs.confines() {
+            let m = &self.mounts[0];
+            return Ok(Resolved {
+                fs: Arc::clone(&m.fs),
+                rel: path.to_path_buf(),
+                writable: !m.flags.rdonly,
+                abs: normalize(path),
+                stat: None,
+            });
+        }
+
         let mut pending: VecDeque<Part> = parts(path).into();
-        let mut cur: Vec<OsString> = Vec::new();
+        let mut acc = PathBuf::from("/"); // resolved-so-far absolute path
         let mut symlinks = 0u32;
+        let mut last = None; // stat of the final component, if it exists
 
         while let Some(part) = pending.pop_front() {
             let name = match part {
                 Part::Dot => continue,
                 Part::DotDot => {
-                    cur.pop();
+                    acc.pop(); // popping at `/` stays at `/` — confined
                     continue;
                 }
                 Part::Name(name) => name,
             };
 
             let is_final = pending.is_empty();
-            let mut probe = cur.clone();
-            probe.push(name.clone());
-            let abs = join_abs(&probe);
-            let (mount, rel) = self.lookup(&abs);
+            acc.push(&name);
+            let (mount, rel) = self.lookup(&acc);
 
             match mount.fs.stat(&rel, false) {
                 Ok(st) if st.file_type == FileType::Symlink && (!is_final || follow_final) => {
+                    acc.pop(); // drop the symlink; resolve its target instead
                     symlinks += 1;
                     if symlinks > MAX_SYMLINKS {
                         return Err(Errno::ELOOP);
                     }
                     let target = mount.fs.readlink(&rel)?;
                     if target.is_absolute() {
-                        cur.clear(); // absolute target restarts at the namespace root
+                        acc = PathBuf::from("/"); // absolute target restarts at the root
                     }
                     for p in parts(&target).into_iter().rev() {
                         pending.push_front(p);
                     }
+                    last = None;
                 }
-                // Exists (and not a symlink we're following): take the component.
-                Ok(_) => cur.push(name),
+                // Exists (and not a symlink we're following): keep the component
+                // and remember its stat — the final one is the caller's answer.
+                Ok(st) => last = Some(st),
                 // A missing *final* component is fine — the caller may be
                 // creating it (`open(O_CREAT)`, `mkdir`, `rename` target).
-                Err(Errno::ENOENT) if is_final => cur.push(name),
+                Err(Errno::ENOENT) if is_final => last = None,
                 Err(e) => return Err(e),
             }
         }
 
-        let abs = join_abs(&cur);
-        let (mount, rel) = self.lookup(&abs);
+        let (mount, rel) = self.lookup(&acc);
         Ok(Resolved {
             fs: Arc::clone(&mount.fs),
             rel,
             writable: !mount.flags.rdonly,
-            abs,
+            abs: acc,
+            stat: last,
         })
     }
 
@@ -230,17 +254,40 @@ mod tests {
         }
     }
 
-    /// A namespace whose root is a `HostFs` over a fresh scratch directory.
+    /// A namespace that is a single confining `HostFs` mount — exercises the
+    /// fast path (no per-component walk).
     fn ns(scratch: &Scratch, flags: MountFlags) -> Namespace {
         let root = Arc::new(HostFs::new(&scratch.path).unwrap());
         Namespace::with_root(root, flags)
     }
 
+    /// A namespace with a second mount, so `resolve` takes the per-component
+    /// walker (the single-confining-mount fast path needs exactly one mount).
+    /// These tests pin the walker's behavior; the root still serves every path
+    /// here, since nothing lives under the extra mount point.
+    fn walked_ns(scratch: &Scratch, flags: MountFlags) -> Namespace {
+        let root: Arc<dyn Vfs> = Arc::new(HostFs::new(&scratch.path).unwrap());
+        let mut ns = Namespace::with_root(Arc::clone(&root), flags);
+        ns.mount("/__force_walk", root, MountFlags::NONE);
+        ns
+    }
+
+    fn read6(r: &Resolved) -> [u8; 6] {
+        let f =
+            r.fs.open(&r.rel, OpenFlags(libc::O_RDONLY), Mode(0))
+                .unwrap();
+        let mut buf = [0u8; 6];
+        f.pread(&mut buf, 0).unwrap();
+        buf
+    }
+
+    // --- walker (forced via a second mount) ---
+
     #[test]
     fn dotdot_is_confined_to_the_root() {
         let s = Scratch::new();
         std::fs::create_dir(s.path.join("sub")).unwrap();
-        let ns = ns(&s, MountFlags::NONE);
+        let ns = walked_ns(&s, MountFlags::NONE);
         // Climbing above the root lands back at the root, never outside it.
         let r = ns.resolve(Path::new("/sub/../../../.."), true).unwrap();
         assert_eq!(r.abs, PathBuf::from("/"));
@@ -251,27 +298,18 @@ mod tests {
         let s = Scratch::new();
         std::fs::create_dir(s.path.join("etc")).unwrap();
         std::fs::write(s.path.join("etc/passwd"), b"jailed").unwrap();
-        // A link to the *host* /etc/passwd must resolve to the in-root one.
         std::os::unix::fs::symlink("/etc/passwd", s.path.join("escape")).unwrap();
-        let ns = ns(&s, MountFlags::NONE);
+        let ns = walked_ns(&s, MountFlags::NONE);
 
         let r = ns.resolve(Path::new("/escape"), true).unwrap();
         assert_eq!(r.abs, PathBuf::from("/etc/passwd"));
-        let data = {
-            let f =
-                r.fs.open(&r.rel, OpenFlags(libc::O_RDONLY), Mode(0))
-                    .unwrap();
-            let mut buf = [0u8; 6];
-            f.pread(&mut buf, 0).unwrap();
-            buf
-        };
-        assert_eq!(&data, b"jailed"); // the confined file, not the host's
+        assert_eq!(&read6(&r), b"jailed"); // the confined file, not the host's
     }
 
     #[test]
     fn dangling_intermediate_is_enoent_but_missing_final_is_kept() {
         let s = Scratch::new();
-        let ns = ns(&s, MountFlags::NONE);
+        let ns = walked_ns(&s, MountFlags::NONE);
         assert_eq!(
             ns.resolve(Path::new("/nope/inner"), true).err(),
             Some(Errno::ENOENT)
@@ -285,9 +323,45 @@ mod tests {
     fn symlink_loop_is_eloop() {
         let s = Scratch::new();
         std::os::unix::fs::symlink("a", s.path.join("a")).unwrap();
-        let ns = ns(&s, MountFlags::NONE);
+        let ns = walked_ns(&s, MountFlags::NONE);
         assert_eq!(ns.resolve(Path::new("/a"), true).err(), Some(Errno::ELOOP));
     }
+
+    #[test]
+    fn nofollow_final_names_the_symlink() {
+        let s = Scratch::new();
+        std::fs::write(s.path.join("target"), b"x").unwrap();
+        std::os::unix::fs::symlink("target", s.path.join("link")).unwrap();
+        let ns = walked_ns(&s, MountFlags::NONE);
+
+        // follow → the target; no-follow → the link itself.
+        assert_eq!(
+            ns.resolve(Path::new("/link"), true).unwrap().abs,
+            PathBuf::from("/target")
+        );
+        assert_eq!(
+            ns.resolve(Path::new("/link"), false).unwrap().abs,
+            PathBuf::from("/link")
+        );
+    }
+
+    #[test]
+    fn walker_returns_the_final_stat() {
+        let s = Scratch::new();
+        std::fs::write(s.path.join("f"), b"x").unwrap();
+        let ns = walked_ns(&s, MountFlags::NONE);
+        // The walk already stat'd the final component, so the caller can reuse it.
+        assert_eq!(
+            ns.resolve(Path::new("/f"), true)
+                .unwrap()
+                .stat
+                .unwrap()
+                .file_type,
+            FileType::Regular
+        );
+    }
+
+    // --- fast path (single confining mount) ---
 
     #[test]
     fn readonly_mount_marks_unwritable() {
@@ -298,20 +372,22 @@ mod tests {
     }
 
     #[test]
-    fn nofollow_final_names_the_symlink() {
+    fn fast_path_confines_via_hostfs() {
         let s = Scratch::new();
-        std::fs::write(s.path.join("target"), b"x").unwrap();
-        std::os::unix::fs::symlink("target", s.path.join("link")).unwrap();
-        let ns = ns(&s, MountFlags::NONE);
+        std::fs::create_dir(s.path.join("etc")).unwrap();
+        std::fs::write(s.path.join("etc/passwd"), b"jailed").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", s.path.join("escape")).unwrap();
+        let ns = ns(&s, MountFlags::NONE); // single confining mount → fast path
 
-        // follow → the target; no-follow → the link itself.
+        // An absolute symlink and a climbing `..` both stay inside the root —
+        // confinement done by HostFs's openat2(RESOLVE_IN_ROOT), not the walker.
         assert_eq!(
-            ns.resolve(Path::new("/link"), true).unwrap().abs,
-            PathBuf::from("/target")
+            &read6(&ns.resolve(Path::new("/escape"), true).unwrap()),
+            b"jailed"
         );
         assert_eq!(
-            ns.resolve(Path::new("/link"), false).unwrap().abs,
-            PathBuf::from("/link")
+            &read6(&ns.resolve(Path::new("/../../etc/passwd"), true).unwrap()),
+            b"jailed"
         );
     }
 }
