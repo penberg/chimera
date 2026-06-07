@@ -5,7 +5,7 @@
 <h1 align="center">Chimera</h1>
 
 <p align="center">
-  <em><strong>Run any command in a zero-setup sandbox.</strong></em>
+  <em><strong>Sandbox untrusted code with safe access to the host.</strong></em>
 </p>
 
 <p align="center">
@@ -16,11 +16,20 @@
 
 ---
 
-Chimera runs unmodified binaries through same-ISA dynamic binary translation.
-It ships as two pieces: a `chimera` command-line tool for wrapping a process
-at the shell, and a Rust library for embedding the same runtime in your own
-program. Library users specify a system-call handler that decide what every
-guest syscall does: forward it to the host kernel, log it, or virtualize it.
+Chimera is a userspace sandbox for code you don't fully trust — a natural fit
+for coding agents that run arbitrary, generated commands on a machine they share
+with you. It confines what a process can do to the host while still letting it
+reach the host's files and tools, so the code stays useful without being free to
+corrupt the system. Because it runs as an ordinary program, Chimera needs no VM,
+no container, and no special hardware, kernel features, or privileges — it works
+wherever your code already runs.
+
+It achieves this by running unmodified binaries through same-ISA dynamic binary
+translation, intercepting each guest system call so the sandbox decides what it
+does. Chimera ships as two pieces: a `chimera` command-line tool for wrapping a
+process at the shell, and a Rust library for embedding the same runtime in your
+own program. Embedders supply a system-call handler that decides what every guest
+syscall does — forward it to the host kernel, log it, or virtualize it.
 
 Chimera currently supports **Linux/x86** target with work-in-progress port to **Darwin/arm64**.
 
