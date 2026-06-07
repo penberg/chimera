@@ -10,7 +10,7 @@
 //! incrementally — repeated denials of the same call are silent.
 //!
 //! Example:
-//!   cargo run --example sandbox -- --allow '^(read|write|brk|mprotect)$' /bin/echo hi
+//!   cargo run --example sandbox -- --allow '^(read|write|brk)$' /bin/echo hi
 //!
 //! This is the smallest non-trivial use of Chimera's `SystemCalls`
 //! trait: classify by name and either forward or refuse. The `strace`

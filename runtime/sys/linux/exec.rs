@@ -259,6 +259,7 @@ fn record_regions(
     stack_start: usize,
     stack_len: usize,
 ) {
+    addr_space.set_program_break(current_program_break());
     for &(start, len) in &main.regions {
         addr_space.add_region(start as usize, len as usize);
     }
@@ -268,6 +269,13 @@ fn record_regions(
         }
     }
     addr_space.add_region(stack_start, stack_len);
+}
+
+fn current_program_break() -> usize {
+    // Guest `brk` is forwarded to the host kernel, so guest-region bookkeeping
+    // has to start from the process's live break rather than the ELF image's
+    // nominal end-of-data address.
+    unsafe { libc::syscall(libc::SYS_brk, 0) as usize }
 }
 
 /// A decoded `execve`/`execveat` request, copied out of guest memory.

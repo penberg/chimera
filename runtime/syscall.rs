@@ -76,12 +76,16 @@ impl SystemCall {
 /// syscalls are handed to [`SystemCalls::do_syscall`], while
 /// [`SystemCalls::pre_syscall`] and [`SystemCalls::post_syscall`] can observe
 /// every guest syscall, including the few Chimera intercepts for its own
-/// correctness (`exit`, `execve`, `arch_prctl`, `mmap`, `munmap`, `mremap`).
+/// correctness (`exit`, `execve`, `arch_prctl`, `mmap`, `munmap`, `mremap`,
+/// `mprotect`, `pkey_mprotect`).
 ///
 /// Chimera also rewrites the `prot` argument of `mmap`, `mprotect`, and
 /// `pkey_mprotect` before servicing them, clearing `PROT_EXEC` (see
 /// [`crate::syscall::syscall`]). `pre_syscall` sees the guest's original
 /// request; every later stage, including `do_syscall`, sees the rewritten one.
+/// `mmap` always stays runtime-owned, while `mprotect`/`pkey_mprotect` are only
+/// runtime-owned for ranges entirely inside the guest address space; other
+/// ranges still reach `do_syscall`.
 ///
 /// A single handler serves every guest thread, so the trait is `Send + Sync`
 /// and its methods take `&self`: each guest thread runs on its own host thread
@@ -233,10 +237,15 @@ mod host {
     /// `ARCH_SET_GS`/`ARCH_GET_GS` return `EINVAL`. Unknown subfunctions fall
     /// through to the embedder.
     ///
-    /// `mmap`/`munmap`/`mremap` are also runtime-owned: Chimera forwards them
-    /// to the host kernel itself so its guest-mapping bookkeeping stays
-    /// authoritative. Embedders can observe them in `pre_syscall()` and
-    /// `post_syscall()`, but they do not reach `do_syscall()`.
+    /// `mmap`/`munmap`/`mremap` are runtime-owned so Chimera's guest-mapping
+    /// bookkeeping stays authoritative. Successful `brk` calls still run
+    /// through the embedder, but their returned break updates that same
+    /// bookkeeping so heap pages grown through `brk` remain part of the
+    /// tracked guest address space. `mprotect`/`pkey_mprotect` are
+    /// runtime-owned only when the entire range lies inside that tracked guest
+    /// address space; otherwise they fall through to the embedder so it can
+    /// enforce host-process policy. Embedders can still observe all of these in
+    /// `pre_syscall()` and `post_syscall()`.
     ///
     /// Finally, Chimera enforces a W^X invariant on the guest: the guest never
     /// executes its own pages natively — the dispatcher reads them and runs
@@ -246,10 +255,9 @@ mod host {
     /// (always `args[2]`) has `PROT_EXEC` replaced with `PROT_READ`, so a stray
     /// native jump into guest code faults instead of running untranslated while
     /// the translator can still read the bytes it will translate (an
-    /// execute-only mapping would otherwise become `PROT_NONE`). Unlike the
-    /// `mmap` family, `mprotect`/`pkey_mprotect` are not otherwise
-    /// runtime-owned: they still reach `do_syscall()`, only with `PROT_EXEC`
-    /// already cleared from their argument.
+    /// execute-only mapping would otherwise become `PROT_NONE`). For guest-owned
+    /// mappings, the runtime forwards the rewritten call itself, so the guest
+    /// can never reach the kernel with `PROT_EXEC` set on its own pages.
     ///
     /// A `clone` creating a new thread of this process (the `CLONE_THREAD`
     /// shape) cannot be forwarded: the new host task would execute guest code
@@ -344,13 +352,21 @@ mod host {
                     handler.post_syscall(call);
                     return;
                 }
-                // Not runtime-owned: strip PROT_EXEC from the requested
-                // protection, then hand off to the embedder unchanged.
+                // Keep guest mappings runtime-owned so W^X is enforced inside
+                // the tracked guest address space, but delegate any other range
+                // back to the embedder so it can keep policing the host process.
                 let prot = call.args[2] as libc::c_int;
                 if prot & libc::PROT_EXEC != 0 {
                     call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
                 }
-                handler.do_syscall(call);
+                if thread
+                    .addr_space()
+                    .contains_region(call.args[0] as usize, call.args[1] as usize)
+                {
+                    call.set_result(host_syscall(call));
+                } else {
+                    handler.do_syscall(call);
+                }
                 // A protection change resets the host page (un-arming it) and may
                 // precede a rewrite of code on a W^X-toggled JIT page, so drop the
                 // affected pages' stale translations.
@@ -405,6 +421,12 @@ mod host {
                     space.note_unmap(new_start as usize, new_len);
                 }
                 call.set_result(result);
+            }
+            libc::SYS_brk => {
+                handler.do_syscall(call);
+                if let Some(SyscallResult::Ok(brk)) = call.result() {
+                    thread.addr_space().update_program_break(brk as usize);
+                }
             }
             libc::SYS_exit => {
                 // Thread-local: end only this thread. The run loop stops on its
@@ -773,7 +795,8 @@ mod host {
             _ => {
                 handler.do_syscall(call);
             }
-        };
+        }
+
         handler.post_syscall(call);
     }
 
