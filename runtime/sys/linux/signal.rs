@@ -18,6 +18,7 @@
 //! and delivers at its next iteration.
 
 use std::{
+    cell::UnsafeCell,
     mem, ptr,
     sync::{
         Once,
@@ -173,19 +174,67 @@ static PENDING: AtomicU64 = AtomicU64::new(0);
 /// signals do not use this.
 static COUNTS: [AtomicU32; NSIG] = [const { AtomicU32::new(0) }; NSIG];
 
+/// Size of the kernel `siginfo_t` on x86-64.
+const SIGINFO_SIZE: usize = 128;
+
+const _: () = assert!(mem::size_of::<SigInfo>() == SIGINFO_SIZE);
+
+/// A captured `siginfo_t`, one slot per signal. Written by the catcher (a signal
+/// handler) and read by the dispatch loop, so access is unsynchronized; the
+/// `memcpy` is async-signal-safe and the dispatch loop only reads a slot after
+/// the catcher that filled it has run. For a real-time signal with several
+/// queued instances this keeps only the most recent `siginfo` (full per-instance
+/// queueing is a follow-up).
+struct SigInfoSlot(UnsafeCell<[u8; SIGINFO_SIZE]>);
+
+// SAFETY: writes happen only in the async-signal-safe catcher; reads only at a
+// dispatch-loop safe point after the corresponding catcher has completed.
+unsafe impl Sync for SigInfoSlot {}
+
+static SIGINFO: [SigInfoSlot; NSIG] =
+    [const { SigInfoSlot(UnsafeCell::new([0u8; SIGINFO_SIZE])) }; NSIG];
+
 /// Host signal catcher. Runs asynchronously on whatever context the host thread
 /// happened to be in (translated guest code or Chimera Rust), so it must be
-/// async-signal-safe: it only touches plain global atomics — no TLS, no
-/// allocation, no locks, no panics. For a real-time signal it bumps the queue
-/// depth before marking the bit, so a drainer that observes the bit set always
-/// sees a positive count.
-extern "C" fn chimera_sigcatch(signo: libc::c_int) {
+/// async-signal-safe: it only touches plain global atomics and does a fixed-size
+/// `memcpy` — no TLS, no allocation, no locks, no panics. Installed with
+/// `SA_SIGINFO`, so it captures the kernel's `siginfo_t` for the guest handler.
+/// For a real-time signal it bumps the queue depth before marking the bit, so a
+/// drainer that observes the bit set always sees a positive count.
+extern "C" fn chimera_sigcatch(
+    signo: libc::c_int,
+    info: *const libc::siginfo_t,
+    _uc: *mut libc::c_void,
+) {
     if signo >= 1 && signo as usize <= NSIG {
+        let idx = signo as usize - 1;
+        if !info.is_null() {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    info as *const u8,
+                    SIGINFO[idx].0.get() as *mut u8,
+                    SIGINFO_SIZE,
+                );
+            }
+        }
         if signo as u32 >= SIGRTMIN_KERNEL {
-            COUNTS[signo as usize - 1].fetch_add(1, Ordering::AcqRel);
+            COUNTS[idx].fetch_add(1, Ordering::AcqRel);
         }
         PENDING.fetch_or(1u64 << (signo as u64 - 1), Ordering::Release);
     }
+}
+
+/// Copy the captured `siginfo_t` for `signo` out of its slot.
+fn captured_siginfo(signo: u32) -> SigInfo {
+    let mut si: SigInfo = unsafe { mem::zeroed() };
+    unsafe {
+        ptr::copy_nonoverlapping(
+            SIGINFO[signo as usize - 1].0.get() as *const u8,
+            &mut si as *mut SigInfo as *mut u8,
+            SIGINFO_SIZE,
+        );
+    }
+    si
 }
 
 /// Snapshot the set of signals the host catcher has recorded as pending but the
@@ -358,18 +407,18 @@ fn wait_for_set(set: u64, blocked: u64, deadline: Option<u128>) -> WaitResult {
 /// handler is deliberately installed without `SA_RESTART` so a forwarded
 /// blocking syscall is interrupted and the dispatch loop regains control.
 fn install_host(signo: usize, handler: u64) {
-    let host = match handler {
-        SIG_DFL => libc::SIG_DFL,
-        SIG_IGN => libc::SIG_IGN,
-        _ => chimera_sigcatch as *const () as usize,
+    let (host, flags) = match handler {
+        SIG_DFL => (libc::SIG_DFL, 0),
+        SIG_IGN => (libc::SIG_IGN, 0),
+        // SA_SIGINFO so the kernel hands the catcher the real siginfo_t. Still no
+        // SA_RESTART: a forwarded blocking syscall must return EINTR so the
+        // dispatch loop regains control and can deliver.
+        _ => (chimera_sigcatch as *const () as usize, libc::SA_SIGINFO),
     };
     unsafe {
         let mut sa: libc::sigaction = mem::zeroed();
         sa.sa_sigaction = host;
-        // No SA_RESTART: a forwarded blocking syscall must return EINTR so the
-        // dispatch loop regains control and can deliver. No SA_SIGINFO: the
-        // catcher ignores siginfo (capturing it is a fidelity follow-up).
-        sa.sa_flags = 0;
+        sa.sa_flags = flags;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(signo as i32, &sa, ptr::null_mut());
     }
@@ -734,6 +783,7 @@ impl Signals {
             mc.eflags = state.rflags;
             mc.fpstate = fpstate_ptr;
         }
+        f.info = captured_siginfo(signo);
         f.info.si_signo = signo as i32;
         unsafe { ptr::write(frame, f) };
 
