@@ -169,6 +169,14 @@ extern "C" fn chimera_sigcatch(signo: libc::c_int) {
     }
 }
 
+/// Snapshot the set of signals the host catcher has recorded as pending but the
+/// dispatch loop has not yet delivered, as a sigset bitmask. Unblocked pending
+/// signals are drained at each block boundary, so by the time the guest observes
+/// this (at a syscall) the remaining bits are the blocked-and-pending ones.
+pub fn pending_snapshot() -> u64 {
+    PENDING.load(Ordering::Acquire)
+}
+
 /// Atomically remove and return the lowest-numbered deliverable (pending and not
 /// `blocked`) signal, or `None`. Blocked signals stay pending.
 pub fn pending_take_one(blocked: u64) -> Option<u32> {
@@ -330,6 +338,19 @@ impl Signals {
             }
             // SIGKILL and SIGSTOP can never be blocked.
             self.blocked &= !((1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1)));
+        }
+        SyscallResult::Ok(0)
+    }
+
+    /// Service guest `rt_sigpending`: report the emulated pending set. The host
+    /// kernel never sees the guest's pending signals (the catcher clears them
+    /// into `PENDING`), so this must be answered from Chimera's own state.
+    pub fn sigpending(&self, set: u64, sigsetsize: u64) -> SyscallResult {
+        if sigsetsize as usize != mem::size_of::<u64>() {
+            return SyscallResult::Error(libc::EINVAL);
+        }
+        if set != 0 {
+            unsafe { (set as *mut u64).write_unaligned(pending_snapshot()) };
         }
         SyscallResult::Ok(0)
     }
