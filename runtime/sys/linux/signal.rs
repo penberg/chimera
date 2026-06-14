@@ -380,7 +380,14 @@ impl Signals {
 
     /// Build a signal frame on the guest stack and redirect `state` to the
     /// handler for `signo`. Called only at a safe point (block boundary).
-    pub fn deliver(&mut self, state: &mut ThreadState, signo: u32) {
+    ///
+    /// `restart` carries `(resume rip after the interrupted syscall, original
+    /// syscall number)` when the signal interrupted a restartable forwarded
+    /// syscall that returned `EINTR`. If the handler has `SA_RESTART`, the saved
+    /// context is rewound so the handler returns into a re-execution of the
+    /// syscall rather than seeing `EINTR` — mirroring the kernel, which rewinds
+    /// the saved `rip` by the 2-byte `syscall` and restores the original `rax`.
+    pub fn deliver(&mut self, state: &mut ThreadState, signo: u32, restart: Option<(u64, u64)>) {
         let act = self.table[signo as usize - 1];
         // The disposition may have changed since the host caught the signal.
         // SIG_IGN discards it; SIG_DFL means we must carry out the kernel's
@@ -438,6 +445,19 @@ impl Signals {
                 ss_size: 0,
             },
         };
+        // When the signal interrupted a restartable syscall and the handler asked
+        // to restart, the saved context resumes by re-executing the `syscall`
+        // (rip back by 2) with its original number in rax; otherwise it resumes
+        // after the syscall with the EINTR result already in rax.
+        let (resume_rip, resume_rax) = match restart {
+            Some((next_ip, nr))
+                if next_ip == state.rip && act.flags & libc::SA_RESTART as u64 != 0 =>
+            {
+                (next_ip - 2, nr)
+            }
+            _ => (state.rip, state.regs[RAX]),
+        };
+
         {
             let mc = &mut f.uc.uc_mcontext;
             mc.r8 = state.regs[8];
@@ -453,10 +473,10 @@ impl Signals {
             mc.rbp = state.regs[RBP];
             mc.rbx = state.regs[RBX];
             mc.rdx = state.regs[RDX];
-            mc.rax = state.regs[RAX];
+            mc.rax = resume_rax;
             mc.rcx = state.regs[RCX];
             mc.rsp = state.regs[RSP];
-            mc.rip = state.rip;
+            mc.rip = resume_rip;
             mc.eflags = state.rflags;
             mc.fpstate = fpstate_ptr;
         }
