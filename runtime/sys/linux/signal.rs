@@ -21,7 +21,7 @@ use std::{
     mem, ptr,
     sync::{
         Once,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -154,17 +154,36 @@ struct RtSigframe {
     info: SigInfo,
 }
 
+/// The lowest real-time signal number at the kernel ABI level. Signals
+/// `1..SIGRTMIN_KERNEL` are standard (coalescing); `SIGRTMIN_KERNEL..=NSIG` are
+/// real-time and queue. glibc reserves the first few for NPTL but they are still
+/// real-time at the ABI Chimera operates on.
+const SIGRTMIN_KERNEL: u32 = 32;
+
 /// Process-wide set of signals the host catcher has seen but Chimera has not yet
-/// delivered to the guest. Written only by [`chimera_sigcatch`] (async-signal-
-/// safely, via a single atomic OR), drained by the dispatch loop.
+/// delivered to the guest. A set bit means "at least one instance pending". For
+/// real-time signals the depth is tracked in [`COUNTS`]; standard signals simply
+/// coalesce. Written by [`chimera_sigcatch`] (async-signal-safely, via atomic
+/// OR), drained by the dispatch loop.
 static PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// Per-signal queue depth for real-time signals (indexed by `signo - 1`). Bumped
+/// by the catcher and decremented as each queued instance is delivered, so the
+/// `PENDING` bit for an RT signal stays set until its queue drains. Standard
+/// signals do not use this.
+static COUNTS: [AtomicU32; NSIG] = [const { AtomicU32::new(0) }; NSIG];
 
 /// Host signal catcher. Runs asynchronously on whatever context the host thread
 /// happened to be in (translated guest code or Chimera Rust), so it must be
-/// async-signal-safe: it only ORs a bit into a plain global atomic — no TLS, no
-/// allocation, no locks, no panics.
+/// async-signal-safe: it only touches plain global atomics — no TLS, no
+/// allocation, no locks, no panics. For a real-time signal it bumps the queue
+/// depth before marking the bit, so a drainer that observes the bit set always
+/// sees a positive count.
 extern "C" fn chimera_sigcatch(signo: libc::c_int) {
     if signo >= 1 && signo as usize <= NSIG {
+        if signo as u32 >= SIGRTMIN_KERNEL {
+            COUNTS[signo as usize - 1].fetch_add(1, Ordering::AcqRel);
+        }
         PENDING.fetch_or(1u64 << (signo as u64 - 1), Ordering::Release);
     }
 }
@@ -178,7 +197,9 @@ pub fn pending_snapshot() -> u64 {
 }
 
 /// Atomically remove and return the lowest-numbered pending signal within the
-/// `allowed` set, or `None`.
+/// `allowed` set, or `None`. A standard signal clears its bit (coalesced); a
+/// real-time signal consumes one queued instance and keeps its bit set while
+/// more remain.
 fn pending_take(allowed: u64) -> Option<u32> {
     loop {
         let cur = PENDING.load(Ordering::Acquire);
@@ -187,12 +208,41 @@ fn pending_take(allowed: u64) -> Option<u32> {
             return None;
         }
         let bit = avail & avail.wrapping_neg();
+        let signo = bit.trailing_zeros() + 1;
+
+        if signo >= SIGRTMIN_KERNEL {
+            let idx = signo as usize - 1;
+            let depth = COUNTS[idx].load(Ordering::Acquire);
+            if depth == 0 {
+                // Bit set with an empty queue (already drained elsewhere): clear
+                // it and re-pick.
+                PENDING.fetch_and(!bit, Ordering::AcqRel);
+                continue;
+            }
+            if COUNTS[idx]
+                .compare_exchange_weak(depth, depth - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            if depth == 1 {
+                // Took the last queued instance; clear the bit, then re-arm it if
+                // the catcher enqueued another in the meantime.
+                PENDING.fetch_and(!bit, Ordering::AcqRel);
+                if COUNTS[idx].load(Ordering::Acquire) > 0 {
+                    PENDING.fetch_or(bit, Ordering::Release);
+                }
+            }
+            return Some(signo);
+        }
+
+        // Standard signal: coalesced, clear the single bit.
         let new = cur & !bit;
         if PENDING
             .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            return Some(bit.trailing_zeros() + 1);
+            return Some(signo);
         }
     }
 }
