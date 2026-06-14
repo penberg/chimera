@@ -288,6 +288,20 @@ pub fn pending_snapshot() -> u64 {
     PENDING.load(Ordering::Acquire)
 }
 
+/// Clear the process-wide pending-signal state in a freshly forked child. POSIX
+/// requires a child to start with an empty pending set, but the host `fork`
+/// copied Chimera's pending bitmask, real-time queue depths, and ring indices
+/// from the parent, so the child must reset them. The disposition table and
+/// blocked mask are per-thread state, correctly inherited, and left untouched.
+pub fn reset_pending_after_fork() {
+    PENDING.store(0, Ordering::Release);
+    for i in 0..NSIG {
+        COUNTS[i].store(0, Ordering::Release);
+        RT_HEAD[i].store(0, Ordering::Release);
+        RT_TAIL[i].store(0, Ordering::Release);
+    }
+}
+
 /// Atomically remove and return the lowest-numbered pending signal within the
 /// `allowed` set, or `None`. A standard signal clears its bit (coalesced); a
 /// real-time signal consumes one queued instance and keeps its bit set while
