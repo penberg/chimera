@@ -211,6 +211,33 @@ fn install_host(signo: usize, handler: u64) {
     }
 }
 
+/// Carry out a signal's default action when it reaches delivery with a SIG_DFL
+/// disposition (the disposition reverted to default while the signal was already
+/// pending). The fatal signals — those whose default action is Term or Core —
+/// terminate the guest by re-raising on the host with the default disposition
+/// restored and the signal unblocked, so the host kernel produces the correct
+/// termination status (and core dump). The signals whose default action is Ign,
+/// Cont, or Stop are dropped, since Chimera does not yet model job control.
+fn default_action(signo: u32) {
+    // SIGCHLD/SIGURG/SIGWINCH (Ign), SIGCONT (Cont), and SIGSTOP/SIGTSTP/
+    // SIGTTIN/SIGTTOU (Stop) do not terminate; drop them.
+    if matches!(signo, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 28) {
+        return;
+    }
+    unsafe {
+        let mut sa: libc::sigaction = mem::zeroed();
+        sa.sa_sigaction = libc::SIG_DFL;
+        sa.sa_flags = 0;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(signo as i32, &sa, ptr::null_mut());
+        let mut set: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, signo as i32);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &set, ptr::null_mut());
+        libc::raise(signo as i32); // fatal default action: does not return
+    }
+}
+
 /// The built-in `rt_sigreturn` restorer, used for handlers registered without
 /// `SA_RESTORER`. A one-page guest mapping holding `mov eax, 15; syscall`,
 /// readable (so the translator can read it) but not executable (W^X).
@@ -355,10 +382,14 @@ impl Signals {
     /// handler for `signo`. Called only at a safe point (block boundary).
     pub fn deliver(&mut self, state: &mut ThreadState, signo: u32) {
         let act = self.table[signo as usize - 1];
-        // Disposition may have changed to ignore/default since the host caught
-        // it; drop the signal rather than jump to 0/1. (A proper default action
-        // for fatal signals is future work.)
-        if act.handler == SIG_DFL || act.handler == SIG_IGN {
+        // The disposition may have changed since the host caught the signal.
+        // SIG_IGN discards it; SIG_DFL means we must carry out the kernel's
+        // default action rather than jump to 0/1.
+        if act.handler == SIG_IGN {
+            return;
+        }
+        if act.handler == SIG_DFL {
+            default_action(signo);
             return;
         }
 
