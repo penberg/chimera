@@ -415,6 +415,10 @@ mod host {
                 let r = thread.signals_mut().sigpending(call.args[0], call.args[1]);
                 call.set_result(r);
             }
+            libc::SYS_rt_sigsuspend => {
+                let r = thread.signals_mut().sigsuspend(call.args[0], call.args[1]);
+                call.set_result(r);
+            }
             libc::SYS_sigaltstack => {
                 let r = thread.signals_mut().sigaltstack(call.args[0], call.args[1]);
                 call.set_result(r);

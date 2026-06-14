@@ -197,6 +197,42 @@ pub fn pending_take_one(blocked: u64) -> Option<u32> {
     }
 }
 
+/// Build a host `sigset_t` holding the signals set in the `mask` bitmask.
+fn host_sigset(mask: u64) -> libc::sigset_t {
+    unsafe {
+        let mut s: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut s);
+        for i in 0..NSIG {
+            if mask & (1u64 << i) != 0 {
+                libc::sigaddset(&mut s, i as i32 + 1);
+            }
+        }
+        s
+    }
+}
+
+/// Block the calling host thread until a signal deliverable under `blocked`
+/// (pending and not blocked) has been recorded by the host catcher. Race-free:
+/// all host signals are blocked first, the already-pending set is checked, then
+/// `sigsuspend` atomically unblocks the deliverable ones and waits, so a signal
+/// arriving in the window is not lost. Returns once such a signal is pending,
+/// leaving it in `PENDING` for the dispatch loop to deliver.
+fn wait_for_signal(blocked: u64) {
+    unsafe {
+        let mut all: libc::sigset_t = mem::zeroed();
+        libc::sigfillset(&mut all);
+        let mut prev: libc::sigset_t = mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut prev);
+        // During the wait, keep the guest's blocked signals masked so only a
+        // deliverable signal wakes us.
+        let wait = host_sigset(blocked);
+        while pending_snapshot() & !blocked == 0 {
+            libc::sigsuspend(&wait);
+        }
+        libc::pthread_sigmask(libc::SIG_SETMASK, &prev, ptr::null_mut());
+    }
+}
+
 /// Install the host disposition for `signo`: the real handler for `SIG_DFL`/
 /// `SIG_IGN`, or [`chimera_sigcatch`] for any custom guest handler. The host
 /// handler is deliberately installed without `SA_RESTART` so a forwarded
@@ -282,6 +318,11 @@ pub struct Signals {
     pub blocked: u64,
     /// Alternate signal stack as `(ss_sp, ss_size, ss_flags)`, if set.
     altstack: Option<(u64, u64, i32)>,
+    /// Mask to restore once the next handler returns, set by `sigsuspend`. While
+    /// a `sigsuspend` is in flight the live `blocked` is its temporary mask; the
+    /// signal frame must save this pre-suspend mask so the handler's
+    /// `rt_sigreturn` restores it rather than the temporary one.
+    saved_mask: Option<u64>,
 }
 
 impl Signals {
@@ -290,6 +331,7 @@ impl Signals {
             table: [GuestSigaction::default(); NSIG],
             blocked: 0,
             altstack: None,
+            saved_mask: None,
         }
     }
 
@@ -353,6 +395,29 @@ impl Signals {
             unsafe { (set as *mut u64).write_unaligned(pending_snapshot()) };
         }
         SyscallResult::Ok(0)
+    }
+
+    /// Service guest `rt_sigsuspend`: atomically install the temporary mask,
+    /// block the host thread until a signal deliverable under that mask is
+    /// pending, and return `EINTR`. The pre-suspend mask is stashed in
+    /// `saved_mask` so that when the dispatch loop delivers the waking signal,
+    /// the handler's frame saves the original mask and `rt_sigreturn` restores
+    /// it. `sigsuspend` never restarts.
+    pub fn sigsuspend(&mut self, mask: u64, sigsetsize: u64) -> SyscallResult {
+        if sigsetsize as usize != mem::size_of::<u64>() {
+            return SyscallResult::Error(libc::EINVAL);
+        }
+        let temp = if mask != 0 {
+            unsafe { (mask as *const u64).read_unaligned() }
+        } else {
+            0
+        };
+        // SIGKILL and SIGSTOP can never be blocked.
+        let temp = temp & !((1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1)));
+        self.saved_mask = Some(self.blocked);
+        self.blocked = temp;
+        wait_for_signal(temp);
+        SyscallResult::Error(libc::EINTR)
     }
 
     /// Service guest `sigaltstack`.
@@ -451,7 +516,9 @@ impl Signals {
         } else {
             builtin_restorer()
         };
-        f.uc.uc_sigmask[0] = self.blocked;
+        // After a `sigsuspend`, the frame must restore the pre-suspend mask, not
+        // the temporary one that is live while suspended.
+        f.uc.uc_sigmask[0] = self.saved_mask.take().unwrap_or(self.blocked);
         f.uc.uc_stack = match self.altstack {
             Some((base, size, fl)) => StackT {
                 ss_sp: base,
