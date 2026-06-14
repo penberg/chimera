@@ -177,16 +177,16 @@ pub fn pending_snapshot() -> u64 {
     PENDING.load(Ordering::Acquire)
 }
 
-/// Atomically remove and return the lowest-numbered deliverable (pending and not
-/// `blocked`) signal, or `None`. Blocked signals stay pending.
-pub fn pending_take_one(blocked: u64) -> Option<u32> {
+/// Atomically remove and return the lowest-numbered pending signal within the
+/// `allowed` set, or `None`.
+fn pending_take(allowed: u64) -> Option<u32> {
     loop {
         let cur = PENDING.load(Ordering::Acquire);
-        let deliverable = cur & !blocked;
-        if deliverable == 0 {
+        let avail = cur & allowed;
+        if avail == 0 {
             return None;
         }
-        let bit = deliverable & deliverable.wrapping_neg();
+        let bit = avail & avail.wrapping_neg();
         let new = cur & !bit;
         if PENDING
             .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
@@ -195,6 +195,12 @@ pub fn pending_take_one(blocked: u64) -> Option<u32> {
             return Some(bit.trailing_zeros() + 1);
         }
     }
+}
+
+/// Atomically remove and return the lowest-numbered deliverable (pending and not
+/// `blocked`) signal, or `None`. Blocked signals stay pending.
+pub fn pending_take_one(blocked: u64) -> Option<u32> {
+    pending_take(!blocked)
 }
 
 /// Build a host `sigset_t` holding the signals set in the `mask` bitmask.
@@ -230,6 +236,70 @@ fn wait_for_signal(blocked: u64) {
             libc::sigsuspend(&wait);
         }
         libc::pthread_sigmask(libc::SIG_SETMASK, &prev, ptr::null_mut());
+    }
+}
+
+/// The current `CLOCK_MONOTONIC` reading in nanoseconds.
+fn monotonic_ns() -> u128 {
+    unsafe {
+        let mut ts: libc::timespec = mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        ts.tv_sec as u128 * 1_000_000_000 + ts.tv_nsec as u128
+    }
+}
+
+/// Outcome of [`wait_for_set`].
+enum WaitResult {
+    /// A signal from the wait set was accepted (and removed from pending).
+    Got(u32),
+    /// The deadline elapsed first.
+    Timeout,
+    /// A deliverable signal outside the wait set arrived and must be handled.
+    Interrupted,
+}
+
+/// Synchronously accept a signal in `set`: block the host thread until one is
+/// pending (removing it), the optional `deadline` (in `CLOCK_MONOTONIC` ns)
+/// elapses, or a deliverable signal outside `set` arrives. Race-free in the same
+/// way as [`wait_for_signal`]; `ppoll` provides the timed wait that a signal
+/// interrupts.
+fn wait_for_set(set: u64, blocked: u64, deadline: Option<u128>) -> WaitResult {
+    unsafe {
+        let mut all: libc::sigset_t = mem::zeroed();
+        libc::sigfillset(&mut all);
+        let mut prev: libc::sigset_t = mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut prev);
+        let mut empty: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut empty);
+
+        let result = loop {
+            if let Some(signo) = pending_take(set) {
+                break WaitResult::Got(signo);
+            }
+            if pending_snapshot() & !blocked & !set != 0 {
+                break WaitResult::Interrupted;
+            }
+            let remaining = match deadline {
+                Some(d) => {
+                    let now = monotonic_ns();
+                    if now >= d {
+                        break WaitResult::Timeout;
+                    }
+                    let rem = d - now;
+                    Some(libc::timespec {
+                        tv_sec: (rem / 1_000_000_000) as libc::time_t,
+                        tv_nsec: (rem % 1_000_000_000) as i64,
+                    })
+                }
+                None => None,
+            };
+            let ts_ptr = remaining
+                .as_ref()
+                .map_or(ptr::null(), |ts| ts as *const libc::timespec);
+            libc::ppoll(ptr::null_mut(), 0, ts_ptr, &empty);
+        };
+        libc::pthread_sigmask(libc::SIG_SETMASK, &prev, ptr::null_mut());
+        result
     }
 }
 
@@ -418,6 +488,52 @@ impl Signals {
         self.blocked = temp;
         wait_for_signal(temp);
         SyscallResult::Error(libc::EINTR)
+    }
+
+    /// Service guest `rt_sigtimedwait`: synchronously accept one signal in `set`,
+    /// blocking up to `timeout`, and report it through `info` without running its
+    /// handler. Answered from the emulated pending set rather than the host,
+    /// which never sees the guest's pending signals.
+    pub fn sigtimedwait(
+        &mut self,
+        set: u64,
+        info: u64,
+        timeout: u64,
+        sigsetsize: u64,
+    ) -> SyscallResult {
+        if sigsetsize as usize != mem::size_of::<u64>() {
+            return SyscallResult::Error(libc::EINVAL);
+        }
+        let want = if set != 0 {
+            unsafe { (set as *const u64).read_unaligned() }
+        } else {
+            0
+        };
+        // SIGKILL and SIGSTOP cannot be waited for.
+        let want = want & !((1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1)));
+
+        let deadline = if timeout != 0 {
+            let ts = unsafe { (timeout as *const libc::timespec).read_unaligned() };
+            if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+                return SyscallResult::Error(libc::EINVAL);
+            }
+            Some(monotonic_ns() + ts.tv_sec as u128 * 1_000_000_000 + ts.tv_nsec as u128)
+        } else {
+            None
+        };
+
+        match wait_for_set(want, self.blocked, deadline) {
+            WaitResult::Got(signo) => {
+                if info != 0 {
+                    let mut si: SigInfo = unsafe { mem::zeroed() };
+                    si.si_signo = signo as i32;
+                    unsafe { (info as *mut SigInfo).write_unaligned(si) };
+                }
+                SyscallResult::Ok(signo as i64)
+            }
+            WaitResult::Timeout => SyscallResult::Error(libc::EAGAIN),
+            WaitResult::Interrupted => SyscallResult::Error(libc::EINTR),
+        }
     }
 
     /// Service guest `sigaltstack`.

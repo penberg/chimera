@@ -419,6 +419,15 @@ mod host {
                 let r = thread.signals_mut().sigsuspend(call.args[0], call.args[1]);
                 call.set_result(r);
             }
+            libc::SYS_rt_sigtimedwait => {
+                let r = thread.signals_mut().sigtimedwait(
+                    call.args[0],
+                    call.args[1],
+                    call.args[2],
+                    call.args[3],
+                );
+                call.set_result(r);
+            }
             libc::SYS_sigaltstack => {
                 let r = thread.signals_mut().sigaltstack(call.args[0], call.args[1]);
                 call.set_result(r);
