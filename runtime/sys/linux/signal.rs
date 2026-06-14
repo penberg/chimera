@@ -133,7 +133,9 @@ struct UContext {
     uc_sigmask: [u64; 16],
 }
 
-/// `siginfo_t` is 128 bytes; only `si_signo` is populated for now.
+/// `siginfo_t` (128 bytes). Captured wholesale from the kernel by the catcher, so
+/// the named fields plus the trailing union (si_pid/si_uid/si_value/…) carried in
+/// `_pad` reach the guest handler intact.
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -179,12 +181,13 @@ const SIGINFO_SIZE: usize = 128;
 
 const _: () = assert!(mem::size_of::<SigInfo>() == SIGINFO_SIZE);
 
-/// A captured `siginfo_t`, one slot per signal. Written by the catcher (a signal
-/// handler) and read by the dispatch loop, so access is unsynchronized; the
-/// `memcpy` is async-signal-safe and the dispatch loop only reads a slot after
-/// the catcher that filled it has run. For a real-time signal with several
-/// queued instances this keeps only the most recent `siginfo` (full per-instance
-/// queueing is a follow-up).
+/// A captured `siginfo_t`, used as a per-signal slot. For a standard signal the
+/// catcher writes it directly (coalesced, latest wins); for a real-time signal
+/// it is the staging slot that [`stage_rt_siginfo`] pops the next queued payload
+/// into just before delivery. Written by the catcher (a signal handler) or the
+/// drainer and read by the dispatch loop, so access is unsynchronized; the
+/// `memcpy` is async-signal-safe and a slot is only read after the write that
+/// filled it has completed.
 struct SigInfoSlot(UnsafeCell<[u8; SIGINFO_SIZE]>);
 
 // SAFETY: writes happen only in the async-signal-safe catcher; reads only at a
@@ -193,6 +196,20 @@ unsafe impl Sync for SigInfoSlot {}
 
 static SIGINFO: [SigInfoSlot; NSIG] =
     [const { SigInfoSlot(UnsafeCell::new([0u8; SIGINFO_SIZE])) }; NSIG];
+
+/// Capacity of each real-time signal's `siginfo` ring. Beyond this many queued
+/// instances the oldest `siginfo` payloads are overwritten (the host's
+/// `RLIMIT_SIGPENDING` bounds real queue depth well below this in practice).
+const RT_RING_CAP: usize = 32;
+
+/// Per-real-time-signal FIFO ring of captured `siginfo_t`, so each queued
+/// instance keeps its own payload (e.g. a `sigqueue` value). `RT_HEAD` is the
+/// push index (advanced by the catcher), `RT_TAIL` the pop index (advanced as
+/// each instance is delivered); their difference mirrors [`COUNTS`].
+static RT_RING: [[SigInfoSlot; RT_RING_CAP]; NSIG] =
+    [const { [const { SigInfoSlot(UnsafeCell::new([0u8; SIGINFO_SIZE])) }; RT_RING_CAP] }; NSIG];
+static RT_HEAD: [AtomicU32; NSIG] = [const { AtomicU32::new(0) }; NSIG];
+static RT_TAIL: [AtomicU32; NSIG] = [const { AtomicU32::new(0) }; NSIG];
 
 /// Host signal catcher. Runs asynchronously on whatever context the host thread
 /// happened to be in (translated guest code or Chimera Rust), so it must be
@@ -208,7 +225,21 @@ extern "C" fn chimera_sigcatch(
 ) {
     if signo >= 1 && signo as usize <= NSIG {
         let idx = signo as usize - 1;
-        if !info.is_null() {
+        if signo as u32 >= SIGRTMIN_KERNEL {
+            // Real-time: enqueue this instance's siginfo and bump the depth.
+            let slot = RT_HEAD[idx].fetch_add(1, Ordering::AcqRel) as usize % RT_RING_CAP;
+            if !info.is_null() {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        info as *const u8,
+                        RT_RING[idx][slot].0.get() as *mut u8,
+                        SIGINFO_SIZE,
+                    );
+                }
+            }
+            COUNTS[idx].fetch_add(1, Ordering::AcqRel);
+        } else if !info.is_null() {
+            // Standard: coalesced, a single slot holds the latest siginfo.
             unsafe {
                 ptr::copy_nonoverlapping(
                     info as *const u8,
@@ -217,10 +248,22 @@ extern "C" fn chimera_sigcatch(
                 );
             }
         }
-        if signo as u32 >= SIGRTMIN_KERNEL {
-            COUNTS[idx].fetch_add(1, Ordering::AcqRel);
-        }
         PENDING.fetch_or(1u64 << (signo as u64 - 1), Ordering::Release);
+    }
+}
+
+/// Pop the oldest queued `siginfo` for a real-time signal into its delivery
+/// staging slot, so [`captured_siginfo`] reads the right per-instance payload.
+/// Balanced with the `COUNTS` decrement in [`pending_take`], one pop per taken
+/// instance.
+fn stage_rt_siginfo(idx: usize) {
+    let slot = RT_TAIL[idx].fetch_add(1, Ordering::AcqRel) as usize % RT_RING_CAP;
+    unsafe {
+        ptr::copy_nonoverlapping(
+            RT_RING[idx][slot].0.get() as *const u8,
+            SIGINFO[idx].0.get() as *mut u8,
+            SIGINFO_SIZE,
+        );
     }
 }
 
@@ -274,6 +317,8 @@ fn pending_take(allowed: u64) -> Option<u32> {
             {
                 continue;
             }
+            // We own one instance; stage its queued siginfo for delivery.
+            stage_rt_siginfo(idx);
             if depth == 1 {
                 // Took the last queued instance; clear the bit, then re-arm it if
                 // the catcher enqueued another in the meantime.
