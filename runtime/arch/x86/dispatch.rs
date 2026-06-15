@@ -165,7 +165,7 @@ impl Thread {
     /// guest issues `exit`/`exit_group` (with the code) or an allowed
     /// `execve`/`execveat` (for the caller to act on); neither syscall is
     /// forwarded to the host kernel. The handler observes the call first.
-    pub fn run(&mut self, handler: &mut dyn SystemCalls) -> Result<ExitReason, Error> {
+    pub fn run(&mut self, handler: &dyn SystemCalls) -> Result<ExitReason, Error> {
         // GS is host-thread-local, so bind it on the OS thread that is
         // actually about to execute the translated guest.
         self.setup_gs()?;
@@ -208,7 +208,7 @@ impl Thread {
     /// Service the syscall that just exited the cache. Returns `Some` only when
     /// the guest issued an allowed `execve`/`execveat`, in which case the run
     /// loop hands the request back to its caller to re-enter on the new image.
-    fn handle_syscall(&mut self, handler: &mut dyn SystemCalls) -> Option<ExitReason> {
+    fn handle_syscall(&mut self, handler: &dyn SystemCalls) -> Option<ExitReason> {
         let number = self.state.regs[RAX];
         let args = [
             self.state.regs[RDI],

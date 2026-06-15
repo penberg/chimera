@@ -29,7 +29,7 @@ pub fn execv(
     program: &Path,
     args: &[OsString],
     envs: Option<&[(OsString, OsString)]>,
-    mut handler: Box<dyn SystemCalls>,
+    handler: Box<dyn SystemCalls>,
     code_cache_size: usize,
 ) -> Result<i32, Error> {
     // The first image's argv and envp come from the embedder: argv[0] is the
@@ -72,7 +72,7 @@ pub fn execv(
     );
 
     loop {
-        match thread.run(handler.as_mut())? {
+        match thread.run(handler.as_ref())? {
             ExitReason::Exited(code) => return Ok(code),
             ExitReason::Execve { number, args } => {
                 // Parse the replacement image while the old one is still live.

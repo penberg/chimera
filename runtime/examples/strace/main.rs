@@ -62,7 +62,7 @@ mod linux {
     struct Strace;
 
     impl SystemCalls for Strace {
-        fn post_syscall(&mut self, call: &SystemCall) {
+        fn post_syscall(&self, call: &SystemCall) {
             let name = syscall_name(call.number);
             match call.result() {
                 Some(result) => {

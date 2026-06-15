@@ -82,19 +82,26 @@ impl SystemCall {
 /// `pkey_mprotect` before servicing them, clearing `PROT_EXEC` (see
 /// [`crate::syscall::syscall`]). `pre_syscall` sees the guest's original
 /// request; every later stage, including `do_syscall`, sees the rewritten one.
-pub trait SystemCalls {
+///
+/// A single handler serves every guest thread, so the trait is `Send + Sync`
+/// and its methods take `&self`: each guest thread runs on its own host thread
+/// and may be inside the handler concurrently. A handler that needs mutable
+/// state of its own reaches for interior mutability (a `Mutex`, an atomic) —
+/// the `SystemCall` it is handed is exclusive to the calling thread, but `self`
+/// is shared.
+pub trait SystemCalls: Send + Sync {
     /// Observe a guest syscall before Chimera or the embedder services it.
-    fn pre_syscall(&mut self, _call: &SystemCall) {}
+    fn pre_syscall(&self, _call: &SystemCall) {}
 
     /// Service a guest syscall that Chimera delegated to the embedder.
     ///
     /// The default implementation forwards the call to the host kernel.
-    fn do_syscall(&mut self, call: &mut SystemCall) {
+    fn do_syscall(&self, call: &mut SystemCall) {
         call.set_result(host_syscall(call));
     }
 
     /// Observe a guest syscall after its final result is known, if any.
-    fn post_syscall(&mut self, _call: &SystemCall) {}
+    fn post_syscall(&self, _call: &SystemCall) {}
 }
 
 /// The default system-call handler: forwards every delegated guest syscall to
@@ -210,7 +217,7 @@ mod host {
     /// (`personality(0xffffffff)`, which returns the current persona without
     /// changing it) and benign personas such as `ADDR_NO_RANDOMIZE` carry no
     /// such risk and are forwarded.
-    pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
+    pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &dyn SystemCalls) {
         handler.pre_syscall(call);
 
         let nr = call.number as i64;
