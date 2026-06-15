@@ -124,6 +124,33 @@ impl Drop for AddressSpace {
     }
 }
 
+/// Copy `buf` into guest memory at `addr` without trusting the pointer — the
+/// write-side twin of [`copy_from_guest`], a self-targeted
+/// `process_vm_writev`. The kernel walks the page tables, so an unmapped or
+/// read-only range fails the copy exactly where a raw store would fault the
+/// runtime. Returns false on any failed or short copy; callers that mirror
+/// one of the kernel's unchecked `put_user` sites (the clone set-TID words,
+/// the exit-time `clear_child_tid` store) ignore the result, since the kernel
+/// skips those writes silently.
+pub fn copy_to_guest(addr: u64, buf: &[u8]) -> bool {
+    if buf.is_empty() {
+        return true;
+    }
+    if addr == 0 {
+        return false;
+    }
+    let local = libc::iovec {
+        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: addr as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let copied = unsafe { libc::process_vm_writev(libc::getpid(), &local, 1, &remote, 1, 0) };
+    copied == buf.len() as isize
+}
+
 fn round_mapping_len(len: usize) -> usize {
     if len == 0 {
         return 0;

@@ -23,7 +23,10 @@ use std::{
 use crate::{
     Error, SystemCall,
     process::Process,
-    sys::{linux::signal::Signals, mmap::AddressSpace},
+    sys::{
+        linux::signal::Signals,
+        mmap::{AddressSpace, copy_to_guest},
+    },
 };
 
 use super::trampoline::{dispatch, exit_block, exit_syscall};
@@ -78,6 +81,11 @@ pub struct Thread {
     /// Consumed at the next signal delivery to honor `SA_RESTART`. Cleared
     /// after every syscall, so it reflects only the immediately preceding one.
     restart: Option<(u64, u64)>,
+    /// Guest address of this thread's `clear_child_tid` word, set by
+    /// `set_tid_address` or a `clone` with `CLONE_CHILD_CLEARTID`. When the
+    /// thread exits, the runtime zeroes this word and futex-wakes it, exactly as
+    /// the kernel does — this is what a joiner (`pthread_join`) blocks on.
+    clear_child_tid: Option<u64>,
 }
 
 impl Thread {
@@ -112,6 +120,7 @@ impl Thread {
             running: false,
             exit_code: 0,
             restart: None,
+            clear_child_tid: None,
         };
         thread.reset(rip, rsp, guest_fs_base);
         Ok(thread)
@@ -121,7 +130,12 @@ impl Thread {
     /// given shared process. Used for `clone(CLONE_VM)` children: they inherit
     /// the parent's process (address space, code cache, handler) and a copy of
     /// its register file, and start with a fresh, default signal state.
-    fn from_state(process: Arc<Process>, state: Box<ThreadState>) -> Self {
+    /// `clear_child_tid` carries the `CLONE_CHILD_CLEARTID` word, if any.
+    fn from_state(
+        process: Arc<Process>,
+        state: Box<ThreadState>,
+        clear_child_tid: Option<u64>,
+    ) -> Self {
         Self {
             state,
             process,
@@ -129,6 +143,36 @@ impl Thread {
             running: false,
             exit_code: 0,
             restart: None,
+            clear_child_tid,
+        }
+    }
+
+    /// Record this thread's `clear_child_tid` word (from `set_tid_address`). A
+    /// null pointer clears it. Returns the caller's TID (its host `gettid`), the
+    /// way the kernel's `set_tid_address` does.
+    pub fn set_clear_child_tid(&mut self, addr: u64) -> i64 {
+        self.clear_child_tid = (addr != 0).then_some(addr);
+        unsafe { libc::syscall(libc::SYS_gettid) }
+    }
+
+    /// On thread exit, honor `CLONE_CHILD_CLEARTID`/`set_tid_address`: zero the
+    /// `clear_child_tid` word and wake one futex waiter on it, just as the kernel
+    /// does for a real task. A `pthread_join` blocked on that word (the joined
+    /// thread's TID slot) then returns. The wake is non-private, matching the
+    /// kernel's clear-child-tid wake and glibc's wait on it.
+    ///
+    /// The word is guest memory the guest may have unmapped by now, so the
+    /// store is a fault-safe best-effort write, exactly the kernel's exit
+    /// path: its `put_user(0, clear_child_tid)` is unchecked, the futex wake
+    /// is attempted regardless (`FUTEX_WAKE` on a bad address just returns
+    /// `EFAULT`), and the thread exits either way.
+    fn clear_tid_and_wake(&self) {
+        let Some(addr) = self.clear_child_tid else {
+            return;
+        };
+        copy_to_guest(addr, &0u32.to_ne_bytes());
+        unsafe {
+            libc::syscall(libc::SYS_futex, addr, libc::FUTEX_WAKE, 1, 0, 0, 0);
         }
     }
 
@@ -153,6 +197,13 @@ impl Thread {
         // (the `tls` register); without it the child inherits the parent's FS
         // base, as the kernel does. This is how each pthread gets private TLS.
         let tls = (flags & libc::CLONE_SETTLS as u64 != 0).then_some(args[4]);
+        // `CLONE_CHILD_CLEARTID` registers a word the runtime zeroes and wakes
+        // when the child exits (the basis of `pthread_join`); `args[3]` is its
+        // address.
+        let clear_child_tid =
+            (flags & libc::CLONE_CHILD_CLEARTID as u64 != 0 && args[3] != 0).then_some(args[3]);
+        let parent_tid = args[2];
+        let child_tid = args[3];
         let child_state = self.state.clone_for_child(child_stack, tls);
         let process = Arc::clone(&self.process);
 
@@ -164,13 +215,36 @@ impl Thread {
             .name("chimera-guest".to_string())
             .spawn(move || {
                 let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
+                // Replicate the kernel's set-TID writes *before* running any guest
+                // code. The kernel populates the TID word(s) at clone time, so the
+                // child observes its own TID from the first instruction. glibc
+                // points these at `&pd->tid` (the thread's TCB identity) and reads
+                // it during early thread setup; it is also the thread's identity
+                // for, e.g., `pthread_rwlock` writer ownership (`__cur_writer`).
+                // Writing from the parent after the child is already running would
+                // race those reads with a stale TID.
+                // Both words are guest-controlled addresses, so the stores are
+                // fault-safe best-effort writes, matching the kernel exactly:
+                // its `put_user` for the set-TID words is unchecked, and a
+                // clone whose TID pointers are bogus still succeeds with the
+                // writes silently skipped (verified natively).
+                if tid > 0 {
+                    if flags & libc::CLONE_PARENT_SETTID as u64 != 0 {
+                        copy_to_guest(parent_tid, &(tid as i32).to_ne_bytes());
+                    }
+                    if flags & libc::CLONE_CHILD_SETTID as u64 != 0 {
+                        copy_to_guest(child_tid, &(tid as i32).to_ne_bytes());
+                    }
+                }
                 // A failed send means the parent already gave up; nothing to do.
                 let _ = tx.send(tid);
-                let mut child = Thread::from_state(process, child_state);
+                let mut child = Thread::from_state(process, child_state, clear_child_tid);
                 // The child runs until its guest issues `exit`/`exit_group`,
                 // which returns the run loop and ends this host thread — the
                 // rest of the process keeps running.
                 let _ = child.run();
+                // Honor CLONE_CHILD_CLEARTID: clear the word and wake a joiner.
+                child.clear_tid_and_wake();
             });
 
         match spawned {

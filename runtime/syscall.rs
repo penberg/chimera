@@ -348,6 +348,16 @@ mod host {
                     crate::sys::linux::signal::reset_pending_after_fork();
                 }
             }
+            // `set_tid_address` records the calling thread's `clear_child_tid`
+            // word — the one the runtime zeroes and futex-wakes on exit so a
+            // joiner returns. It is virtualized, never forwarded: forwarding
+            // would point the host kernel at the guest's word and clobber the
+            // `clear_child_tid` the host thread runtime relies on. Returns the
+            // caller's TID, like the kernel.
+            libc::SYS_set_tid_address => {
+                let tid = thread.set_clear_child_tid(call.args[0]);
+                call.set_return(tid);
+            }
             // io_uring lets the guest queue system calls that the kernel then
             // executes asynchronously, on its own, without ever passing them
             // back through Chimera's syscall path — a direct way around every
