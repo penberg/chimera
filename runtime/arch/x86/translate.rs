@@ -36,8 +36,10 @@ const IB_BITS: u32 = IB_SLOTS.trailing_zeros();
 /// other on every branch, so the table would never hit. The multiply mixes the
 /// low bits into the index, so PCs a few bytes apart take different slots.
 const IB_HASH_MULT: u64 = 0x9e37_79b9_7f4a_7c15;
-/// Empty-slot marker for the `guest_pc` field: a non-canonical address that no
-/// real guest PC ever equals, so an unoccupied slot always fails the compare.
+/// Empty-slot fill byte. "Not a real guest PC" is not enough to make a slot
+/// unmatchable — a `ret` or indirect operand can present any 64-bit value,
+/// canonical or not — so [`CodeCache::clear_ib_table`] additionally repairs
+/// the one slot the all-`0xff` key hashes to (see [`ib_unmatchable`]).
 const IB_EMPTY: u8 = 0xff;
 
 /// `gs:[]` displacement of the guest's rbx slot (`regs[1]`). Terminators that
@@ -133,14 +135,35 @@ impl CodeCache {
     pub fn ib_insert(&mut self, guest_pc: u64, host_pc: u64) {
         let slot = ib_slot(guest_pc) * IB_SLOT_BYTES;
         unsafe {
-            let p = self.ib_table.add(slot) as *mut u64;
-            p.write(guest_pc);
-            p.add(1).write(host_pc);
+            let key = self.ib_table.add(slot) as *mut u64;
+            let host = key.add(1);
+            // Torn-read-safe publish for the lock-free inline lookup:
+            // invalidate the key, write the host PC, then write the real key
+            // last. A reader that matches the key — and re-checks it after
+            // loading the host (see `ensure_ib_lookup`) — therefore always pairs
+            // the key with its own host PC, never one from a different
+            // generation. Inserts are serialized under the address-space lock and
+            // x86 keeps stores ordered, so the three writes publish in order.
+            // `write_volatile` keeps the compiler from coalescing or reordering
+            // them. The transient key must be unmatchable by structure, not by
+            // value — a guest can synthesize any 64-bit branch target, so no
+            // reserved constant is safe (see `ib_unmatchable`).
+            key.write_volatile(ib_unmatchable(guest_pc));
+            host.write_volatile(host_pc);
+            key.write_volatile(guest_pc);
         }
     }
 
     fn clear_ib_table(&self) {
-        unsafe { ptr::write_bytes(self.ib_table, IB_EMPTY, IB_TABLE_BYTES) };
+        unsafe {
+            ptr::write_bytes(self.ib_table, IB_EMPTY, IB_TABLE_BYTES);
+            // The all-0xff key is matchable in the single slot that u64::MAX
+            // hashes to: a lookup for target 0xffff_ffff_ffff_ffff would "hit"
+            // there and jump to the all-0xff host word. Repair that slot's key
+            // so every empty slot fails the compare.
+            let slot = ib_slot(u64::MAX) * IB_SLOT_BYTES;
+            (self.ib_table.add(slot) as *mut u64).write(ib_unmatchable(u64::MAX));
+        }
     }
 
     /// Emit the shared inline indirect-branch lookup routine (once), returning
@@ -216,6 +239,14 @@ impl CodeCache {
         // jump into the successor block with the full guest register file live.
         out.extend_from_slice(&[0x48, 0x8b, 0x50, 0x08]); // mov rdx, [rax+8]
         gs_store(&mut out, MODRM_RDX, d_host); // mov gs:[host], rdx
+        // Re-check the key after reading the host: if the slot was
+        // republished out from under us (a colliding insert landing between the
+        // first key compare and the host load), the host could be from a
+        // different generation — treat it as a miss. rcx still holds the target
+        // and rax still points at the slot; rdx is already saved to gs:[host].
+        out.extend_from_slice(&[0x48, 0x3b, 0x08]); // cmp rcx, [rax]
+        out.extend_from_slice(&[0x0f, 0x85]); // jne miss
+        let jne2_rel = take_rel32(&mut out);
         emit_restore_flags(&mut out, d_flags);
         gs_load(&mut out, MODRM_RCX, d_rcx); // mov rcx, gs:[rcx]
         gs_load(&mut out, MODRM_RDX, d_rdx); // mov rdx, gs:[rdx]
@@ -224,10 +255,12 @@ impl CodeCache {
         emit_u32(&mut out, d_host as u32);
 
         // Miss: restore flags and registers, publish the target as the next
-        // guest PC, and exit to the dispatcher exactly as before.
+        // guest PC, and exit to the dispatcher exactly as before. Both the
+        // key-compare and the post-host recheck branch here.
         let miss = out.len();
         write_rel32(&mut out, jne_rel, miss);
         write_rel32(&mut out, poll_rel, miss);
+        write_rel32(&mut out, jne2_rel, miss);
         emit_restore_flags(&mut out, d_flags);
         gs_load(&mut out, MODRM_RCX, d_rcx); // mov rcx, gs:[rcx]
         gs_load(&mut out, MODRM_RDX, d_rdx); // mov rdx, gs:[rdx]
@@ -263,6 +296,19 @@ impl Drop for CodeCache {
 /// [`CodeCache::ensure_ib_lookup`].
 fn ib_slot(guest_pc: u64) -> usize {
     (guest_pc.wrapping_mul(IB_HASH_MULT) >> (64 - IB_BITS)) as usize
+}
+
+/// A key value the inline lookup can never match in `key`'s own slot. A reader
+/// only compares its target against the one slot the target hashes to, so a
+/// marker is unmatchable iff it does not hash to the slot it is stored in.
+/// Flipping bit 63 guarantees that: `x ^ 2^63 = x ± 2^63`, and since
+/// [`IB_HASH_MULT`] is odd, `±2^63 * IB_HASH_MULT ≡ 2^63 (mod 2^64)` — the
+/// hash product's top bit flips while the lower bits are untouched, and with
+/// it the top bit of the [`IB_BITS`]-bit slot index. This holds for every
+/// 64-bit value, unlike any reserved constant, which a guest could present as
+/// a branch target.
+fn ib_unmatchable(key: u64) -> u64 {
+    key ^ (1 << 63)
 }
 
 /// `gs:[disp]` with a 32-bit displacement, qword-sized.
@@ -334,7 +380,7 @@ pub fn translate(
     if let Some(link) = classify_terminator(&term) {
         emit_body(cache, &instrs, host_pc, guest_pc)?;
         let term_pc = cache.next_pc() as usize;
-        let (bytes, rel_edges) = build_linked_terminator(&link, exit_tramp, guest_pc);
+        let (bytes, rel_edges) = build_linked_terminator(&link, exit_tramp, guest_pc, term_pc);
         cache.emit(&bytes)?;
         let edges = rel_edges
             .into_iter()
@@ -508,10 +554,17 @@ fn emit_exit_poll(out: &mut Vec<u8>) -> usize {
 /// asynchronous signal is pending, so a fully linked loop returns to the run loop
 /// within one iteration. The stub already publishes the correct successor guest
 /// PC, so delivery lands at a clean boundary.
+///
+/// `term_pc` is the host address at which these bytes will be emitted. It is
+/// needed because every patchable `rel32` field is NOP-padded to a 4-byte
+/// boundary, so the dispatcher can back-patch it with one aligned atomic store
+/// (see [`super::cache::patch_site`]) — a sibling thread executing the branch
+/// then reads the old or new target, never a torn displacement.
 fn build_linked_terminator(
     link: &LinkTerm,
     exit_tramp: u64,
     block_start: u64,
+    term_pc: usize,
 ) -> (Vec<u8>, Vec<(usize, u64)>) {
     let mut out = Vec::new();
     let mut edges = Vec::new();
@@ -522,6 +575,7 @@ fn build_linked_terminator(
             // emit_exit_poll), so a loop carrying flags across this edge is safe.
             let poll = is_back_edge(target, block_start).then(|| emit_exit_poll(&mut out));
             // jmp rel32 -> stub (later: -> target's host code)
+            pad_rel32_alignment(&mut out, term_pc, 1);
             out.push(0xE9);
             let rel = take_rel32(&mut out);
             let stub = out.len();
@@ -540,17 +594,21 @@ fn build_linked_terminator(
             // The fall-through is `next_ip`, always forward, so only the taken edge
             // can close a loop. When it does, route the taken path through a
             // flag-preserving poll once the guest's `jcc` has read the live flags;
-            // the poll keeps them intact for the loop head on the fast path.
+            // the poll keeps them intact for the loop head on the fast path. Every
+            // patchable `rel32` (the ones pushed to `edges`) is NOP-padded to a
+            // 4-byte boundary so the dispatcher can back-patch it atomically.
             if is_back_edge(taken, block_start) {
                 // jcc rel32 -> taken_check ; jmp rel32 -> fall stub.
                 out.extend_from_slice(&[0x0F, opcode]);
-                let jcc_rel = take_rel32(&mut out);
+                let jcc_rel = take_rel32(&mut out); // internal, not patched
+                pad_rel32_alignment(&mut out, term_pc, 1);
                 out.push(0xE9);
                 let jmp_rel = take_rel32(&mut out);
                 // taken_check: poll, then the linkable fast-path branch to taken.
                 let taken_check = out.len();
                 write_rel32(&mut out, jcc_rel, taken_check);
                 let poll_rel = emit_exit_poll(&mut out);
+                pad_rel32_alignment(&mut out, term_pc, 1);
                 out.push(0xE9);
                 let taken_jmp_rel = take_rel32(&mut out);
                 let taken_stub = out.len();
@@ -564,9 +622,12 @@ fn build_linked_terminator(
                 edges.push((jmp_rel, fallthrough));
             } else {
                 // jcc rel32 -> taken stub ; jmp rel32 -> fall-through stub.
-                // The native jcc reads the block's live guest flags directly.
+                // The native jcc reads the block's live guest flags directly. Each
+                // branch is padded independently so both rel32 fields land aligned.
+                pad_rel32_alignment(&mut out, term_pc, 2);
                 out.extend_from_slice(&[0x0F, opcode]);
                 let jcc_rel = take_rel32(&mut out);
+                pad_rel32_alignment(&mut out, term_pc, 1);
                 out.push(0xE9);
                 let jmp_rel = take_rel32(&mut out);
                 let taken_stub = out.len();
@@ -603,6 +664,7 @@ fn build_linked_terminator(
             // call cycle contains an edge into its lowest-address member, so this
             // catches the cycle even when the individual calls run forward.
             let poll = is_back_edge(target, block_start).then(|| emit_exit_poll(&mut out));
+            pad_rel32_alignment(&mut out, term_pc, 1);
             out.push(0xE9);
             let rel = take_rel32(&mut out);
             let stub = out.len();
@@ -679,6 +741,17 @@ fn take_rel32(out: &mut Vec<u8>) -> usize {
     let at = out.len();
     out.extend_from_slice(&[0; 4]);
     at
+}
+
+/// Pad `out` with single-byte NOPs until the `rel32` field that will follow
+/// `opcode_len` opcode bytes lands on a 4-byte boundary in the cache, given the
+/// terminator will be emitted at `term_pc`. A naturally aligned `rel32` can be
+/// back-patched with a single atomic 32-bit store, so a sibling thread executing
+/// the branch sees the old displacement or the new one but never a torn mix.
+fn pad_rel32_alignment(out: &mut Vec<u8>, term_pc: usize, opcode_len: usize) {
+    while !(term_pc + out.len() + opcode_len).is_multiple_of(4) {
+        out.push(0x90); // nop
+    }
 }
 
 /// Write the `rel32` at `rel` so the branch reaches `target` (both byte
@@ -1030,4 +1103,101 @@ fn emit_exit_tail(instrs: &mut Vec<Instruction>, exit_tramp: u64) -> Result<(), 
 
 fn mkinstr(r: Result<Instruction, iced_x86::IcedError>) -> Result<Instruction, Error> {
     r.map_err(|e| Error::Translate(format!("build instruction: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every patchable `rel32` field of a linked terminator must land on a
+    /// 4-byte boundary, whatever address the terminator is emitted at, so the
+    /// dispatcher can back-patch it with one aligned atomic store. Check all
+    /// eight residues of `term_pc` mod 4 so the padding is exercised for every
+    /// starting alignment.
+    fn assert_edges_aligned(link: &LinkTerm) {
+        for term_pc in 0..8usize {
+            let (bytes, edges) = build_linked_terminator(link, 0xdead_beef, 0, term_pc);
+            assert!(!edges.is_empty(), "a linked terminator must expose an edge");
+            for (off, _target) in edges {
+                assert!(
+                    off + 4 <= bytes.len(),
+                    "rel32 field at off={off} runs past the {} terminator bytes",
+                    bytes.len(),
+                );
+                assert_eq!(
+                    (term_pc + off) % 4,
+                    0,
+                    "rel32 field at term_pc={term_pc}, off={off} is not 4-byte aligned",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uncond_edge_is_aligned() {
+        assert_edges_aligned(&LinkTerm::Uncond { target: 0x1000 });
+    }
+
+    #[test]
+    fn cond_edges_are_aligned() {
+        // 0x84 is `jz`; both the taken (jcc) and fall-through (jmp) rel32 fields
+        // must be aligned even though they sit five bytes apart.
+        assert_edges_aligned(&LinkTerm::Cond {
+            opcode: 0x84,
+            taken: 0x1000,
+            fallthrough: 0x2000,
+        });
+    }
+
+    #[test]
+    fn direct_call_edge_is_aligned() {
+        assert_edges_aligned(&LinkTerm::DirectCall {
+            target: 0x1000,
+            ret: 0x1005,
+        });
+    }
+
+    /// The transient key `ib_insert` publishes mid-update must hash to a
+    /// different slot than the entry it invalidates, for every possible key —
+    /// otherwise a concurrent lookup whose target equals the marker could
+    /// match the in-progress slot and misdispatch. Sweep structured values
+    /// (canonical and non-canonical PCs, bit patterns near the extremes) and a
+    /// deterministic pseudo-random set.
+    #[test]
+    fn transient_key_never_hashes_to_its_own_slot() {
+        let check = |x: u64| {
+            assert_ne!(
+                ib_slot(ib_unmatchable(x)),
+                ib_slot(x),
+                "marker for {x:#x} hashes to its own slot"
+            );
+        };
+        for i in 0..64 {
+            check(1u64 << i);
+            check((1u64 << i) - 1);
+            check(!(1u64 << i));
+        }
+        check(0);
+        check(u64::MAX);
+        let mut x = 0x1234_5678_9abc_def0u64;
+        for _ in 0..10_000 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            check(x);
+        }
+    }
+
+    /// A cleared table must contain no matchable slot: for every slot that any
+    /// target could probe, the key must not equal a target hashing there. The
+    /// only candidate is the slot `u64::MAX` hashes to (the fill pattern),
+    /// which `clear_ib_table` repairs.
+    #[test]
+    fn empty_table_never_matches() {
+        let cache = CodeCache::new(4096).unwrap();
+        let slot = ib_slot(u64::MAX) * IB_SLOT_BYTES;
+        let key = unsafe { (cache.ib_table.add(slot) as *const u64).read() };
+        assert_ne!(key, u64::MAX);
+        assert_ne!(ib_slot(key), ib_slot(u64::MAX));
+    }
 }
