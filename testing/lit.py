@@ -64,7 +64,7 @@ class Result:
     detail: str = ""
 
 
-def run_test(source: Path, *, cc: str, runner: str) -> Result:
+def run_test(source: Path, *, cc: str, runner: str, timeout: float) -> Result:
     runs = parse_runs(source)
     if not runs:
         return Result("skip", "no RUN directives")
@@ -72,12 +72,18 @@ def run_test(source: Path, *, cc: str, runner: str) -> Result:
         tmp = Path(td) / source.stem
         for cmd in runs:
             full = substitute(cmd, source=source, tmp=tmp, cc=cc, runner=runner)
-            proc = subprocess.run(
-                ["sh", "-c", full],
-                cwd=REPO_ROOT,
-                capture_output=True,
-                text=True,
-            )
+            try:
+                proc = subprocess.run(
+                    ["sh", "-c", full],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                # A test that never returns (e.g. a deadlock) is a failure, not
+                # an excuse to hang the whole suite forever.
+                return Result("fail", f"timed out after {timeout:g}s\n  cmd: {full}")
             if proc.returncode != 0:
                 detail = f"exit={proc.returncode}\n  cmd: {full}\n"
                 if proc.stdout.strip():
@@ -103,6 +109,12 @@ def main() -> int:
         "--runner",
         default=os.environ.get("RUNNER", ""),
         help="command prefix to substitute for %%runner (env: RUNNER, default: empty)",
+    )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=float(os.environ.get("LIT_TIMEOUT", "120")),
+        help="per-RUN-line timeout in seconds; a slower run fails (env: LIT_TIMEOUT, default: 120)",
     )
     p.add_argument(
         "paths",
@@ -132,7 +144,7 @@ def main() -> int:
     passed = failed = skipped = 0
     for t in tests:
         rel = t.relative_to(REPO_ROOT)
-        res = run_test(t, cc=args.cc, runner=args.runner)
+        res = run_test(t, cc=args.cc, runner=args.runner, timeout=args.timeout)
         if res.status == "pass":
             passed += 1
             print(f"{GREEN('PASS')}  {rel}")
