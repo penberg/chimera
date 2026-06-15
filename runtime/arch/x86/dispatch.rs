@@ -15,7 +15,9 @@ use std::{
     sync::{
         Arc, MutexGuard,
         atomic::{AtomicU32, Ordering},
+        mpsc,
     },
+    thread,
 };
 
 use crate::{
@@ -113,6 +115,67 @@ impl Thread {
         };
         thread.reset(rip, rsp, guest_fs_base);
         Ok(thread)
+    }
+
+    /// Assemble a thread from an already-built register state that runs in the
+    /// given shared process. Used for `clone(CLONE_VM)` children: they inherit
+    /// the parent's process (address space, code cache, handler) and a copy of
+    /// its register file, and start with a fresh, default signal state.
+    fn from_state(process: Arc<Process>, state: Box<ThreadState>) -> Self {
+        Self {
+            state,
+            process,
+            signals: Signals::new(),
+            running: false,
+            exit_code: 0,
+            restart: None,
+        }
+    }
+
+    /// Service a `clone` that creates a new thread of this process (the
+    /// `CLONE_THREAD` shape, which the kernel requires to include
+    /// `CLONE_SIGHAND` and `CLONE_VM`). Chimera cannot forward it: the host
+    /// kernel would run guest
+    /// code on the new task natively, outside the translator. Instead it spawns
+    /// a host thread that runs the child guest in the shared process, and returns
+    /// the child's kernel TID to the parent. The guest-visible TID is the host
+    /// TID, so the guest's later `futex`/`tgkill` on it reach this host thread.
+    /// On spawn failure it returns `-EAGAIN`.
+    ///
+    /// `args` are the raw `clone` syscall registers; `args[1]` is the child
+    /// stack pointer. The child resumes at the same post-syscall PC as the
+    /// parent, with `rax = 0` and its own stack (see
+    /// [`ThreadState::clone_for_child`]).
+    pub fn clone_vm(&self, args: &[u64; 6]) -> i64 {
+        let child_stack = args[1];
+        let child_state = self.state.clone_for_child(child_stack);
+        let process = Arc::clone(&self.process);
+
+        // The parent needs the child's kernel TID to return from `clone`, but
+        // only the child can read its own `gettid`, so hand it back over a
+        // one-shot channel and block until it arrives.
+        let (tx, rx) = mpsc::channel::<i64>();
+        let spawned = thread::Builder::new()
+            .name("chimera-guest".to_string())
+            .spawn(move || {
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
+                // A failed send means the parent already gave up; nothing to do.
+                let _ = tx.send(tid);
+                let mut child = Thread::from_state(process, child_state);
+                // The child runs until its guest issues `exit`/`exit_group`,
+                // which returns the run loop and ends this host thread — the
+                // rest of the process keeps running.
+                let _ = child.run();
+            });
+
+        match spawned {
+            // Drop the join handle: the host thread is detached and reclaims
+            // itself when its closure returns. The child is tracked by its
+            // kernel TID through the shared address space, never by a retained
+            // handle (an accumulating roster would leak under thread churn).
+            Ok(_handle) => rx.recv().unwrap_or(-(libc::EAGAIN as i64)),
+            Err(_) => -(libc::EAGAIN as i64),
+        }
     }
 
     /// Reset the thread to a new entry point and a stack.
@@ -419,6 +482,38 @@ impl ThreadState {
 
     fn capture_chimera_fs(&mut self) {
         self.chimera_fs_base = current_fs_base();
+    }
+
+    /// Build the register state for a `clone(CLONE_VM)` child. The guest-visible
+    /// registers, flags, FP/SIMD state, and TLS base are copied from the parent,
+    /// so the child resumes exactly where the parent's `clone` returns — except
+    /// `rax`, which is 0 (the child's `clone` return value), and `rsp`, which is
+    /// the child's own stack. The per-run bookkeeping slots (the Chimera/FS
+    /// scratch and the indirect-branch lookup fields) start cleared; `run`
+    /// repopulates them on the child's own host thread.
+    fn clone_for_child(&self, child_stack: u64) -> Box<ThreadState> {
+        let mut child = Box::new(ThreadState {
+            regs: self.regs,
+            rip: self.rip,
+            rflags: self.rflags,
+            chimera_rsp: 0,
+            host_pc_target: 0,
+            exit_kind: 0,
+            guest_fs_base: self.guest_fs_base,
+            chimera_fs_base: 0,
+            ib_lookup: 0,
+            ib_flags: 0,
+            ib_target: 0,
+            ib_rcx: 0,
+            ib_rdx: 0,
+            ib_host: 0,
+            exit_requested: AtomicU32::new(0),
+            _align_fpstate: [0; 5],
+            fpstate: self.fpstate,
+        });
+        child.regs[RAX] = 0;
+        child.regs[RSP] = child_stack;
+        child
     }
 }
 

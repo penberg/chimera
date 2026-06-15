@@ -176,14 +176,21 @@ mod host {
     /// runtime-owned: they still reach `do_syscall()`, only with `PROT_EXEC`
     /// already cleared from their argument.
     ///
-    /// `clone`/`clone3` are refused with `EPERM` when they request `CLONE_VM`, a
-    /// new thread sharing the address space: Chimera is single-threaded, and the
-    /// new host thread would execute guest code with no translator context,
-    /// natively. Without `CLONE_VM` the call is an ordinary `fork`, whose
-    /// copy-on-write child carries Chimera and resumes in translated code, so it
-    /// is forwarded. (`clone3` carries its flags in a `clone_args` struct rather
-    /// than a register; the rest is identical.) `vfork` always shares the
-    /// address space and has no `fork`-shaped variant, so it is refused outright.
+    /// A `clone` creating a new thread of this process (the `CLONE_THREAD`
+    /// shape) cannot be forwarded: the new host task would execute guest code
+    /// with no translator context, natively. Chimera instead spawns a host
+    /// thread that runs the child guest in the shared process and returns its
+    /// kernel TID to the parent (see `Thread::clone_vm`). `CLONE_VM` without
+    /// `CLONE_THREAD` — a separate process sharing this address space — is
+    /// refused with `EPERM`: Chimera can provide neither native forwarding
+    /// (unsandboxed) nor a faithful emulation. `clone3` requesting `CLONE_VM`
+    /// is the same case but carries its arguments in a `clone_args` struct;
+    /// spawning from it is not yet wired up, so it is still refused with
+    /// `EPERM`. Without `CLONE_VM` the call is an ordinary `fork`, whose
+    /// copy-on-write child carries Chimera and resumes in translated code, so
+    /// it is forwarded.
+    /// `vfork` always shares the address space and has no `fork`-shaped variant,
+    /// so it is refused outright.
     ///
     /// The io_uring interface (`io_uring_setup`/`io_uring_enter`/
     /// `io_uring_register`) is refused with `EPERM`: it would let the guest
@@ -282,21 +289,42 @@ mod host {
                 // see the allowed call.
                 call.set_result(SyscallResult::Ok(0));
             }
-            // A `clone` that creates a new thread sharing this address space
-            // (`CLONE_VM`) would have the host kernel run guest code on the new
-            // thread with no Chimera context — natively, never through the
-            // translator — a sandbox escape (and, today, a crash). Refuse it with
-            // `EPERM`. A `clone` without `CLONE_VM` is an ordinary `fork`: a
+            // A `clone` that creates a new thread of this process — the
+            // `CLONE_THREAD` shape, which the kernel requires to carry
+            // `CLONE_SIGHAND` and `CLONE_VM` — cannot be forwarded: the host
+            // kernel would run guest code on the new task natively, with no
+            // Chimera context — never through the translator. Instead Chimera
+            // spawns a host thread that runs the child guest in the shared
+            // process and returns the child's kernel TID to the parent (see
+            // `Thread::clone_vm`). A malformed `CLONE_THREAD` (missing one of
+            // the required flags) is forwarded for the kernel's authoritative
+            // `EINVAL`; a `clone` without `CLONE_VM` is an ordinary `fork` — a
             // copy-on-write duplicate of the whole process, Chimera included,
-            // that resumes in translated code, so it falls through to the default
-            // arm and is forwarded.
-            libc::SYS_clone if call.args[0] & libc::CLONE_VM as u64 != 0 => {
+            // that resumes in translated code — and falls through to the
+            // fork-shaped arm below.
+            libc::SYS_clone if is_thread_clone(call.args[0]) => {
+                let tid = thread.clone_vm(&call.args);
+                call.set_return(tid);
+            }
+            // `CLONE_VM` without `CLONE_THREAD` asks for a *separate process*
+            // that shares this address space. Chimera can honor neither half:
+            // forwarding would run the child natively outside the sandbox, and
+            // a host thread would give it this process's PID and no `waitpid`.
+            // Refuse it visibly, like `vfork` below, rather than mis-run it —
+            // no libc path reaches this shape (`pthread_create` is
+            // `CLONE_THREAD`, `fork` carries no `CLONE_VM`).
+            libc::SYS_clone
+                if call.args[0] & libc::CLONE_VM as u64 != 0
+                    && call.args[0] & libc::CLONE_THREAD as u64 == 0 =>
+            {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
-            // `clone3` is the same escape as `clone` above, but carries its
-            // flags in the `clone_args` struct `args[0]` points at rather than
-            // in a register. Refuse it when those flags request `CLONE_VM`; a
-            // `clone3` without it (the `fork`-shaped case) falls through to the
+            // `clone3` requesting `CLONE_VM` is the same thread-creation case as
+            // `clone` above, but carries its flags and child stack in the
+            // `clone_args` struct `args[0]` points at rather than in registers.
+            // Spawning a host thread from it is not yet wired up (it needs the
+            // struct reader), so refuse it with `EPERM` for now; a `clone3`
+            // without `CLONE_VM` (the `fork`-shaped case) falls through to the
             // default arm and is forwarded.
             libc::SYS_clone3 if clone3_requests_vm(call.args[0]) => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
@@ -308,10 +336,12 @@ mod host {
             libc::SYS_vfork => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
-            // The `fork`-shaped variants reached here (the `CLONE_VM` cases were
-            // refused above). Forward the duplication, then, in the child (the
-            // call returns 0), clear the pending-signal state the host `fork`
-            // copied from the parent: POSIX gives a child an empty pending set.
+            // The variants reached here: genuine `fork` shapes, and malformed
+            // thread shapes the kernel rejects with `EINVAL` (the `CLONE_VM`
+            // cases were serviced or refused above). Forward the call, then,
+            // in the child of a successful fork (the call returns 0), clear
+            // the pending-signal state the host `fork` copied from the parent:
+            // POSIX gives a child an empty pending set.
             libc::SYS_clone | libc::SYS_clone3 | libc::SYS_fork => {
                 handler.do_syscall(call);
                 if call.return_value() == 0 {
@@ -475,6 +505,17 @@ mod host {
         }
         let flags = unsafe { core::ptr::read(args_ptr as *const u64) };
         flags & libc::CLONE_VM as u64 != 0
+    }
+
+    /// Whether clone flags describe a new thread of the calling process. The
+    /// kernel demands the full shape — `CLONE_THREAD` requires `CLONE_SIGHAND`,
+    /// which requires `CLONE_VM` (anything less is `EINVAL`) — so gating the
+    /// host-thread intercept on all three bits means a malformed thread clone
+    /// falls through to forwarding and gets the kernel's authoritative error.
+    fn is_thread_clone(flags: u64) -> bool {
+        const THREAD_SHAPE: u64 =
+            libc::CLONE_THREAD as u64 | libc::CLONE_SIGHAND as u64 | libc::CLONE_VM as u64;
+        flags & THREAD_SHAPE == THREAD_SHAPE
     }
 }
 
