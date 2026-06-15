@@ -19,7 +19,7 @@ use std::{
 };
 
 use crate::{
-    Error, SystemCall, SystemCalls,
+    Error, SystemCall,
     process::Process,
     sys::{linux::signal::Signals, mmap::AddressSpace},
 };
@@ -79,9 +79,11 @@ pub struct Thread {
 }
 
 impl Thread {
-    /// Create a new guest thread whose address space carries a
-    /// `code_cache_size`-byte translated-code cache.
-    pub fn new(rip: u64, rsp: u64, code_cache_size: usize) -> Result<Self, Error> {
+    /// Create a new guest thread that runs in the given shared [`Process`]. The
+    /// process's first thread is created with a fresh `Process`; future
+    /// `clone(CLONE_VM)` siblings are created with a clone of this `Arc`, so
+    /// they share the address space, code cache, and syscall handler.
+    pub fn new(process: Arc<Process>, rip: u64, rsp: u64) -> Result<Self, Error> {
         let guest_fs_base = current_fs_base();
         let mut thread = Self {
             state: Box::new(ThreadState {
@@ -103,7 +105,7 @@ impl Thread {
                 _align_fpstate: [0; 5],
                 fpstate: [0; XSAVE_AREA_SIZE],
             }),
-            process: Arc::new(Process::new(code_cache_size)?),
+            process,
             signals: Signals::new(),
             running: false,
             exit_code: 0,
@@ -177,8 +179,9 @@ impl Thread {
     /// Run the guest using the thread's current entry state. Returns when the
     /// guest issues `exit`/`exit_group` (with the code) or an allowed
     /// `execve`/`execveat` (for the caller to act on); neither syscall is
-    /// forwarded to the host kernel. The handler observes the call first.
-    pub fn run(&mut self, handler: &dyn SystemCalls) -> Result<ExitReason, Error> {
+    /// forwarded to the host kernel. The handler observes the call first. The
+    /// embedder's handler is reached through the shared [`Process`].
+    pub fn run(&mut self) -> Result<ExitReason, Error> {
         // GS is host-thread-local, so bind it on the OS thread that is
         // actually about to execute the translated guest.
         self.setup_gs()?;
@@ -222,7 +225,7 @@ impl Thread {
                 dispatch(ts_ptr, host_pc);
             }
             if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL
-                && let Some(reason) = self.handle_syscall(handler)
+                && let Some(reason) = self.handle_syscall()
             {
                 return Ok(reason);
             }
@@ -233,7 +236,7 @@ impl Thread {
     /// Service the syscall that just exited the cache. Returns `Some` only when
     /// the guest issued an allowed `execve`/`execveat`, in which case the run
     /// loop hands the request back to its caller to re-enter on the new image.
-    fn handle_syscall(&mut self, handler: &dyn SystemCalls) -> Option<ExitReason> {
+    fn handle_syscall(&mut self) -> Option<ExitReason> {
         let number = self.state.regs[RAX];
         let args = [
             self.state.regs[RDI],
@@ -244,7 +247,11 @@ impl Thread {
             self.state.regs[R9],
         ];
         let mut call = SystemCall::new(number, args);
-        crate::syscall::syscall(self, &mut call, handler);
+        // Clone the `Arc` so the handler borrow comes from the local handle
+        // rather than `self`, leaving `self` free to be passed mutably to the
+        // syscall driver.
+        let process = self.process.clone();
+        crate::syscall::syscall(self, &mut call, process.handler.as_ref());
         let result = call.return_value();
         self.state.regs[RAX] = result as u64;
 

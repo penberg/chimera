@@ -6,11 +6,13 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr,
+    sync::Arc,
 };
 
 use crate::{
     Error, SystemCalls,
     arch::dispatch::{self, ExitReason},
+    process::Process,
     sys::mmap::AddressSpace,
 };
 
@@ -61,7 +63,11 @@ pub fn execv(
         interp_base,
     )?;
 
-    let mut thread = dispatch::Thread::new(rip, rsp, code_cache_size)?;
+    // The process's shared state: the address space, code cache, and the
+    // embedder's syscall handler. The first thread is created against it; future
+    // `clone(CLONE_VM)` siblings will share clones of this `Arc`.
+    let process = Arc::new(Process::new(handler, code_cache_size)?);
+    let mut thread = dispatch::Thread::new(process, rip, rsp)?;
     let _host_mask = HostMaskGuard::save();
     record_regions(
         &mut thread.addr_space(),
@@ -72,7 +78,7 @@ pub fn execv(
     );
 
     loop {
-        match thread.run(handler.as_ref())? {
+        match thread.run()? {
             ExitReason::Exited(code) => return Ok(code),
             ExitReason::Execve { number, args } => {
                 // Parse the replacement image while the old one is still live.

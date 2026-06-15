@@ -10,7 +10,7 @@
 
 use std::sync::Mutex;
 
-use crate::{Error, sys::mmap::AddressSpace};
+use crate::{Error, SystemCalls, sys::mmap::AddressSpace};
 
 /// The shared state of a guest process: one per process, referenced by every
 /// thread through an `Arc`.
@@ -22,24 +22,32 @@ pub struct Process {
     /// never across `dispatch()` or a blocking host syscall, so a thread
     /// running guest code or parked in the kernel never holds it.
     pub addr_space: Mutex<AddressSpace>,
+    /// The embedder's system-call handler, shared by every thread of the
+    /// process. `SystemCalls` is `Send + Sync` and dispatched by `&self`
+    /// (see [`crate::SystemCalls`]), so all threads — including the host threads
+    /// that will back `clone(CLONE_VM)` siblings — drive the one handler
+    /// instance concurrently, reaching it through this shared `Process`.
+    pub handler: Box<dyn SystemCalls>,
 }
 
 impl Process {
-    pub fn new(code_cache_size: usize) -> Result<Self, Error> {
+    pub fn new(handler: Box<dyn SystemCalls>, code_cache_size: usize) -> Result<Self, Error> {
         Ok(Self {
             addr_space: Mutex::new(AddressSpace::new(code_cache_size)?),
+            handler,
         })
     }
 }
 
-// SAFETY: `AddressSpace` is not auto-`Send`/`Sync` only because its code cache
-// holds raw pointers (`*mut u8`) into the translated-code and indirect-branch
-// mappings. Those mappings are ordinary process-wide `mmap` regions with no
-// thread affinity — any thread may read or write them — and the sole field of
-// `Process` guards the whole `AddressSpace` behind a `Mutex`, so all access is
-// serialized. Sharing one `Process` across the host threads that back the guest
-// threads is therefore sound. This is what makes `Arc<Process>` (rather than a
-// single-threaded `Rc`) the right handle: the address space is built to be
-// shared by `clone(CLONE_VM)` siblings.
+// SAFETY: the `handler` field is already `Send + Sync` (the `SystemCalls`
+// supertrait requires it). The only field that is not auto-`Send`/`Sync` is
+// `addr_space`, because its code cache holds raw pointers (`*mut u8`) into the
+// translated-code and indirect-branch mappings. Those mappings are ordinary
+// process-wide `mmap` regions with no thread affinity — any thread may read or
+// write them — and `addr_space` guards the whole `AddressSpace` behind a
+// `Mutex`, so all access is serialized. Sharing one `Process` across the host
+// threads that back the guest threads is therefore sound. This is what makes
+// `Arc<Process>` (rather than a single-threaded `Rc`) the right handle: the
+// address space is built to be shared by `clone(CLONE_VM)` siblings.
 unsafe impl Send for Process {}
 unsafe impl Sync for Process {}
