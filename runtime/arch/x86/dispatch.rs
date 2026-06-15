@@ -60,6 +60,11 @@ pub struct Thread {
     pub running: bool,
     /// The status code the run loop returns once `running` is cleared.
     pub exit_code: i32,
+    /// Set when the most recently forwarded syscall returned `EINTR` and is
+    /// restartable: `(resume rip after the syscall, original syscall number)`.
+    /// Consumed at the next signal delivery to honor `SA_RESTART`. Cleared
+    /// after every syscall, so it reflects only the immediately preceding one.
+    restart: Option<(u64, u64)>,
 }
 
 impl Thread {
@@ -89,6 +94,7 @@ impl Thread {
             signals: Signals::new(),
             running: false,
             exit_code: 0,
+            restart: None,
         };
         thread.reset(rip, rsp, guest_fs_base);
         Ok(thread)
@@ -121,8 +127,9 @@ impl Thread {
     /// Entry into the handler then happens through the normal `dispatch` path.
     fn deliver_pending_signals(&mut self) {
         if let Some(signo) = crate::sys::linux::signal::pending_take_one(self.signals.blocked) {
+            let restart = self.restart.take();
             let state = &mut *self.state;
-            self.signals.deliver(state, signo);
+            self.signals.deliver(state, signo, restart);
         }
     }
 
@@ -190,7 +197,20 @@ impl Thread {
         ];
         let mut call = SystemCall::new(number, args);
         crate::syscall::syscall(self, &mut call, handler);
-        self.state.regs[RAX] = call.return_value() as u64;
+        let result = call.return_value();
+        self.state.regs[RAX] = result as u64;
+
+        // Record a restart candidate for SA_RESTART: a forwarded slow syscall
+        // interrupted by a signal returns EINTR, and the dispatcher must be able
+        // to re-issue it if the delivered handler asked to restart. `state.rip`
+        // is the instruction after the `syscall` (the syscall is 2 bytes wide).
+        // The never-restart interfaces always surface EINTR, so they are
+        // excluded here. Cleared on any other syscall outcome.
+        self.restart = if result == -(libc::EINTR as i64) && !never_restart(number) {
+            Some((self.state.rip, number))
+        } else {
+            None
+        };
 
         if number == libc::SYS_execve as u64 || number == libc::SYS_execveat as u64 {
             return Some(ExitReason::Execve { number, args });
@@ -206,6 +226,33 @@ impl Thread {
         }
         Ok(())
     }
+}
+
+/// Whether a syscall interrupted by a signal must always fail with `EINTR`,
+/// never restarting even under `SA_RESTART`. These are the interfaces the kernel
+/// documents as non-restartable (`signal(7)`): the signal/event waits, the
+/// multiplexing calls, sleeps, and System V IPC. Any other interrupted slow
+/// syscall is a restart candidate.
+fn never_restart(number: u64) -> bool {
+    matches!(
+        number as i64,
+        libc::SYS_pause
+            | libc::SYS_rt_sigsuspend
+            | libc::SYS_rt_sigtimedwait
+            | libc::SYS_poll
+            | libc::SYS_ppoll
+            | libc::SYS_select
+            | libc::SYS_pselect6
+            | libc::SYS_epoll_wait
+            | libc::SYS_epoll_pwait
+            | libc::SYS_nanosleep
+            | libc::SYS_clock_nanosleep
+            | libc::SYS_msgrcv
+            | libc::SYS_msgsnd
+            | libc::SYS_semop
+            | libc::SYS_semtimedop
+            | libc::SYS_io_getevents
+    )
 }
 
 /// Guest register file plus a few bookkeeping slots. The exact byte layout is

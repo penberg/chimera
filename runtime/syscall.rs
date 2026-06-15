@@ -301,6 +301,16 @@ mod host {
             libc::SYS_vfork => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
+            // The `fork`-shaped variants reached here (the `CLONE_VM` cases were
+            // refused above). Forward the duplication, then, in the child (the
+            // call returns 0), clear the pending-signal state the host `fork`
+            // copied from the parent: POSIX gives a child an empty pending set.
+            libc::SYS_clone | libc::SYS_clone3 | libc::SYS_fork => {
+                handler.do_syscall(call);
+                if call.return_value() == 0 {
+                    crate::sys::linux::signal::reset_pending_after_fork();
+                }
+            }
             // io_uring lets the guest queue system calls that the kernel then
             // executes asynchronously, on its own, without ever passing them
             // back through Chimera's syscall path — a direct way around every
@@ -408,6 +418,23 @@ mod host {
                     call.args[0] as i32,
                     call.args[1],
                     call.args[2],
+                );
+                call.set_result(r);
+            }
+            libc::SYS_rt_sigpending => {
+                let r = thread.signals_mut().sigpending(call.args[0], call.args[1]);
+                call.set_result(r);
+            }
+            libc::SYS_rt_sigsuspend => {
+                let r = thread.signals_mut().sigsuspend(call.args[0], call.args[1]);
+                call.set_result(r);
+            }
+            libc::SYS_rt_sigtimedwait => {
+                let r = thread.signals_mut().sigtimedwait(
+                    call.args[0],
+                    call.args[1],
+                    call.args[2],
+                    call.args[3],
                 );
                 call.set_result(r);
             }
