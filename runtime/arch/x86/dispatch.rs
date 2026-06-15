@@ -147,8 +147,13 @@ impl Thread {
     /// parent, with `rax = 0` and its own stack (see
     /// [`ThreadState::clone_for_child`]).
     pub fn clone_vm(&self, args: &[u64; 6]) -> i64 {
+        let flags = args[0];
         let child_stack = args[1];
-        let child_state = self.state.clone_for_child(child_stack);
+        // `CLONE_SETTLS` gives the child its own thread pointer from `args[4]`
+        // (the `tls` register); without it the child inherits the parent's FS
+        // base, as the kernel does. This is how each pthread gets private TLS.
+        let tls = (flags & libc::CLONE_SETTLS as u64 != 0).then_some(args[4]);
+        let child_state = self.state.clone_for_child(child_stack, tls);
         let process = Arc::clone(&self.process);
 
         // The parent needs the child's kernel TID to return from `clone`, but
@@ -485,13 +490,15 @@ impl ThreadState {
     }
 
     /// Build the register state for a `clone(CLONE_VM)` child. The guest-visible
-    /// registers, flags, FP/SIMD state, and TLS base are copied from the parent,
-    /// so the child resumes exactly where the parent's `clone` returns — except
-    /// `rax`, which is 0 (the child's `clone` return value), and `rsp`, which is
-    /// the child's own stack. The per-run bookkeeping slots (the Chimera/FS
-    /// scratch and the indirect-branch lookup fields) start cleared; `run`
-    /// repopulates them on the child's own host thread.
-    fn clone_for_child(&self, child_stack: u64) -> Box<ThreadState> {
+    /// registers, flags, and FP/SIMD state are copied from the parent, so the
+    /// child resumes exactly where the parent's `clone` returns — except `rax`,
+    /// which is 0 (the child's `clone` return value), and `rsp`, which is the
+    /// child's own stack. `tls` is the child's thread pointer (FS base) when the
+    /// clone requested `CLONE_SETTLS`, else the child inherits the parent's. The
+    /// per-run bookkeeping slots (the Chimera/FS scratch and the indirect-branch
+    /// lookup fields) start cleared; `run` repopulates them on the child's own
+    /// host thread.
+    fn clone_for_child(&self, child_stack: u64, tls: Option<u64>) -> Box<ThreadState> {
         let mut child = Box::new(ThreadState {
             regs: self.regs,
             rip: self.rip,
@@ -499,7 +506,7 @@ impl ThreadState {
             chimera_rsp: 0,
             host_pc_target: 0,
             exit_kind: 0,
-            guest_fs_base: self.guest_fs_base,
+            guest_fs_base: tls.unwrap_or(self.guest_fs_base),
             chimera_fs_base: 0,
             ib_lookup: 0,
             ib_flags: 0,
