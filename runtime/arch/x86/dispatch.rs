@@ -10,11 +10,17 @@
 //! repeat until the guest issues `exit_group` or `exit`. The boundary-crossing
 //! assembly lives in [`super::trampoline`].
 
-use std::arch::asm;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    arch::asm,
+    sync::{
+        Arc, MutexGuard,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use crate::{
     Error, SystemCall, SystemCalls,
+    process::Process,
     sys::{linux::signal::Signals, mmap::AddressSpace},
 };
 
@@ -44,15 +50,19 @@ pub enum ExitReason {
 /// selects AMX, so the area size is bounded regardless of the host's XCR0.
 const XSAVE_AREA_SIZE: usize = 4096;
 
-/// The `Thread` struct represents a guest thread: the register state and the
-/// address space it runs in. The purpose of this struct is similar to the
+/// The `Thread` struct represents a guest thread: the per-thread register state
+/// and a handle to the process-wide [`Process`] (the shared address space and
+/// code cache) it runs in. The purpose of this struct is similar to the
 /// `task_struct` in the Linux kernel. `running` and `exit_code` mirror the
 /// kernel's task state: a syscall implementation can mark a thread done by
 /// clearing `running` and recording an `exit_code`, and the run loop
 /// terminates on its next iteration.
 pub struct Thread {
     pub state: Box<ThreadState>,
-    addr_space: AddressSpace,
+    /// The shared process state. Every thread of a guest process holds an `Arc`
+    /// to the same `Process`, so they translate into and map within one address
+    /// space.
+    process: Arc<Process>,
     /// Per-process guest signal state: handler table, blocked mask, alt stack.
     signals: Signals,
     /// Whether the run loop should keep iterating. Set true on entry to
@@ -93,7 +103,7 @@ impl Thread {
                 _align_fpstate: [0; 5],
                 fpstate: [0; XSAVE_AREA_SIZE],
             }),
-            addr_space: AddressSpace::new(code_cache_size)?,
+            process: Arc::new(Process::new(code_cache_size)?),
             signals: Signals::new(),
             running: false,
             exit_code: 0,
@@ -105,14 +115,17 @@ impl Thread {
 
     /// Reset the thread to a new entry point and a stack.
     pub fn reset(&mut self, rip: u64, rsp: u64, guest_fs_base: u64) {
-        self.addr_space.reset();
+        self.addr_space().reset();
         self.state.reset(rip, rsp, guest_fs_base);
         self.running = false;
         self.exit_code = 0;
     }
 
-    pub fn addr_space(&mut self) -> &mut AddressSpace {
-        &mut self.addr_space
+    /// Lock and return the shared guest address space. The guard must be dropped
+    /// before re-entering the cache or issuing a blocking syscall — never held
+    /// across `dispatch()`.
+    pub fn addr_space(&self) -> MutexGuard<'_, AddressSpace> {
+        self.process.addr_space.lock().unwrap()
     }
 
     pub fn signals_mut(&mut self) -> &mut Signals {
@@ -178,7 +191,13 @@ impl Thread {
 
         // Emit (once per cache) the shared inline indirect-branch lookup routine
         // and record its address so translated indirect branches can reach it.
-        self.state.ib_lookup = self.addr_space.code.ensure_ib_lookup(block_exit)?;
+        self.state.ib_lookup = self
+            .process
+            .addr_space
+            .lock()
+            .unwrap()
+            .code
+            .ensure_ib_lookup(block_exit)?;
 
         while self.running {
             self.deliver_pending_signals();
@@ -187,8 +206,14 @@ impl Thread {
             let ts_ptr: *mut ThreadState = &mut *self.state;
 
             let rip = unsafe { (*ts_ptr).rip };
+            // Hold the address-space lock only long enough to resolve (and, on a
+            // miss, translate) the next block; the guard drops at the end of this
+            // statement, before `dispatch()` runs the block.
             let host_pc = self
+                .process
                 .addr_space
+                .lock()
+                .unwrap()
                 .code
                 .resolve(rip, block_exit, syscall_exit)
                 .unwrap_or_else(|e| panic!("translate failed at {:#x}: {}", rip, e));

@@ -64,7 +64,7 @@ pub fn execv(
     let mut thread = dispatch::Thread::new(rip, rsp, code_cache_size)?;
     let _host_mask = HostMaskGuard::save();
     record_regions(
-        thread.addr_space(),
+        &mut thread.addr_space(),
         &main,
         interp.as_ref(),
         stack_start,
@@ -112,7 +112,7 @@ pub fn execv(
                     interp_base,
                 )?;
                 record_regions(
-                    thread.addr_space(),
+                    &mut thread.addr_space(),
                     &main,
                     interp.as_ref(),
                     stack_start,
