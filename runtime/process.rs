@@ -9,7 +9,7 @@
 //! address space.
 
 use std::sync::{
-    Mutex, Once,
+    Condvar, Mutex, Once,
     atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
 
@@ -79,8 +79,18 @@ pub struct Process {
     /// The threads currently running a guest. Each thread adds itself when its
     /// run loop starts and removes itself when it ends, so `exit_group` can
     /// reach every sibling — armed safepoint slot for one executing translated
-    /// code, interrupt signal for one parked in a host syscall.
+    /// code, interrupt signal for one parked in a host syscall — and the main
+    /// thread can wait for the others to finish.
     live_threads: Mutex<Vec<LiveThread>>,
+    /// Signalled whenever `live_threads` shrinks or a process-wide exit is
+    /// requested, so a main thread parked in [`Process::wait_for_others`] wakes.
+    exit_cv: Condvar,
+    /// The guest exit status of the most recent thread to finish its run.
+    /// Absent an `exit_group`, the kernel reports the status of the *last*
+    /// thread to exit as the process's `wait(2)` status — whichever thread that
+    /// is — so every run loop records its status here on the way out and a main
+    /// thread that outwaits its siblings adopts the final value.
+    last_exit_status: AtomicI32,
 }
 
 impl Process {
@@ -92,6 +102,8 @@ impl Process {
             exiting: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
             live_threads: Mutex::new(Vec::new()),
+            exit_cv: Condvar::new(),
+            last_exit_status: AtomicI32::new(0),
         })
     }
 
@@ -106,11 +118,43 @@ impl Process {
         });
     }
 
-    /// Remove a thread from the live set when its run loop ends.
+    /// Remove a thread from the live set when its run loop ends, and wake any
+    /// main thread waiting for the last sibling to finish.
     pub fn unregister_tid(&self, tid: i32) {
         let mut threads = self.live_threads.lock().unwrap();
         if let Some(pos) = threads.iter().position(|t| t.tid == tid) {
             threads.swap_remove(pos);
+        }
+        self.exit_cv.notify_all();
+    }
+
+    /// Record `status` as the calling thread's guest exit status. Every run
+    /// loop calls this on the way out, before it leaves the live set, so once
+    /// the group drains the slot holds the last exiter's status — the value
+    /// `wait(2)` reports absent an `exit_group`. The mutex inside
+    /// `unregister_tid`, taken after this store, orders it before any waiter
+    /// that observes the shrunken live set.
+    pub fn record_exit_status(&self, status: i32) {
+        self.last_exit_status.store(status, Ordering::Relaxed);
+    }
+
+    /// Block until every guest thread other than `self_tid` has finished, or a
+    /// process-wide `exit_group` is requested; returns the resulting process
+    /// status. Used when the main thread exits on its own (`pthread_exit` /
+    /// thread-local `exit` / raw `SYS_exit`): POSIX keeps the process alive
+    /// until the last thread terminates, and the status is that last thread's —
+    /// the caller's own, recorded before waiting, if no sibling outlives it —
+    /// unless an `exit_group` set the whole group's.
+    pub fn wait_for_others(&self, self_tid: i32) -> i32 {
+        let mut threads = self.live_threads.lock().unwrap();
+        loop {
+            if self.is_exiting() {
+                return self.exit_code.load(Ordering::Relaxed);
+            }
+            if threads.iter().all(|t| t.tid == self_tid) {
+                return self.last_exit_status.load(Ordering::Relaxed);
+            }
+            threads = self.exit_cv.wait(threads).unwrap();
         }
     }
 
@@ -136,6 +180,8 @@ impl Process {
                 unsafe { libc::syscall(libc::SYS_tgkill, pid, t.tid, sig) };
             }
         }
+        // Wake a main thread parked in `wait_for_others` so it observes the exit.
+        self.exit_cv.notify_all();
     }
 
     /// Whether a thread has requested a process-wide exit; paired with

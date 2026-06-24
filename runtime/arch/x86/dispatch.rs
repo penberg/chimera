@@ -99,6 +99,11 @@ pub struct Thread {
     /// thread exits, the runtime zeroes this word and futex-wakes it, exactly as
     /// the kernel does — this is what a joiner (`pthread_join`) blocks on.
     clear_child_tid: Option<u64>,
+    /// Whether this is the process's initial thread. The main thread's run
+    /// returning ends the process, so when it exits on its own (`pthread_exit`)
+    /// while siblings are still alive, it must wait for them rather than tear the
+    /// process down. A `clone(CLONE_VM)` child is never main.
+    is_main: bool,
 }
 
 impl Thread {
@@ -134,6 +139,7 @@ impl Thread {
             exit_code: 0,
             restart: None,
             clear_child_tid: None,
+            is_main: true,
         };
         thread.reset(rip, rsp, guest_fs_base);
         Ok(thread)
@@ -157,6 +163,7 @@ impl Thread {
             exit_code: 0,
             restart: None,
             clear_child_tid,
+            is_main: false,
         }
     }
 
@@ -444,6 +451,19 @@ impl Thread {
             {
                 return Ok(reason);
             }
+        }
+        // Absent an `exit_group`, the kernel reports the status of the last
+        // thread to exit as the process's `wait(2)` status, so every thread
+        // records its own on the way out — while it is still in the live set.
+        self.process.record_exit_status(self.exit_code);
+        // The main thread's run returning ends the process. If it exited on its
+        // own (`pthread_exit` / thread-local `exit` / raw `SYS_exit`) rather
+        // than via a process-wide `exit_group`, POSIX keeps the process alive
+        // until the last thread finishes — so wait for the siblings and adopt
+        // the final status: the last exiter's (this thread's own, just
+        // recorded, if no sibling outlives it), or an `exit_group`'s code.
+        if self.is_main && !self.process.is_exiting() {
+            self.exit_code = self.process.wait_for_others(my_tid);
         }
         Ok(ExitReason::Exited(self.exit_code))
     }
