@@ -291,7 +291,8 @@ mod host {
                 // process exits. Forwarding to the host instead would kill the
                 // embedder's process, which the runtime must not do.
                 let code = call.args[0] as i32;
-                thread.process().request_exit_group(code);
+                let self_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+                thread.process().request_exit_group(code, self_tid);
                 thread.exit_code = code;
                 thread.running = false;
             }

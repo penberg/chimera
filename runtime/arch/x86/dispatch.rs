@@ -55,6 +55,19 @@ pub enum ExitReason {
 /// selects AMX, so the area size is bounded regardless of the host's XCR0.
 const XSAVE_AREA_SIZE: usize = 4096;
 
+/// Removes a thread's kernel TID from the process's live set when its run loop
+/// ends, on every exit path. See [`Process::register_thread`].
+struct TidGuard {
+    process: Arc<Process>,
+    tid: i32,
+}
+
+impl Drop for TidGuard {
+    fn drop(&mut self) {
+        self.process.unregister_tid(self.tid);
+    }
+}
+
 /// The `Thread` struct represents a guest thread: the per-thread register state
 /// and a handle to the process-wide [`Process`] (the shared address space and
 /// code cache) it runs in. The purpose of this struct is similar to the
@@ -361,6 +374,19 @@ impl Thread {
         self.signals.mirror_host_mask();
         self.running = true;
 
+        // Join the live-thread set so a sibling's process-wide stop can reach
+        // this thread: the interrupt signal if it parks in a host syscall, the
+        // registered `exit_requested` safepoint slot if it is executing fully
+        // linked translated code. The guard removes it on every exit path
+        // (including the `execve` early return).
+        let my_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        self.process
+            .register_thread(my_tid, &self.state.exit_requested);
+        let _tid_guard = TidGuard {
+            process: Arc::clone(&self.process),
+            tid: my_tid,
+        };
+
         let block_exit = exit_block as *const () as usize as u64;
         let syscall_exit = exit_syscall as *const () as usize as u64;
 
@@ -375,17 +401,25 @@ impl Thread {
             .ensure_ib_lookup(block_exit)?;
 
         while self.running {
-            // Another thread may have issued `exit_group`, which ends the whole
-            // thread group. Observe it here, at a block/syscall boundary, and
-            // stop with the process-wide code so the main thread returns it from
-            // the run and the process exits.
+            self.deliver_pending_signals();
+            self.refresh_exit_requested();
+
+            // Observe a sibling's process-wide stop only after
+            // `refresh_exit_requested`: the refresh clears this thread's
+            // safepoint slot, so checking first would open a window where a
+            // stop armed between the check and the clear is wiped — the flag
+            // already checked, the slot no longer set — and a fully linked
+            // loop runs on unwatched. Checked in this order, a stop armed
+            // before the refresh is caught by these flags, and one armed
+            // after it leaves the slot set for the in-cache polls.
+            //
+            // Another thread may have issued `exit_group`, which ends the
+            // whole thread group: stop with the process-wide code so the main
+            // thread returns it from the run and the process exits.
             if self.process.is_exiting() {
                 self.exit_code = self.process.exit_code.load(Ordering::Relaxed);
                 break;
             }
-
-            self.deliver_pending_signals();
-            self.refresh_exit_requested();
 
             let ts_ptr: *mut ThreadState = &mut *self.state;
 
