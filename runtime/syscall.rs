@@ -275,8 +275,24 @@ mod host {
                 }
                 call.set_result(result);
             }
-            libc::SYS_exit | libc::SYS_exit_group => {
+            libc::SYS_exit => {
+                // Thread-local: end only this thread. The run loop stops on its
+                // next iteration; the main thread's stop ends the run (and the
+                // process), a worker's stop just ends that host thread. This is
+                // the `pthread_exit` / thread-return path.
                 thread.exit_code = call.args[0] as i32;
+                thread.running = false;
+            }
+            libc::SYS_exit_group => {
+                // Process-wide: terminate the whole thread group, from any
+                // thread. Publish the request on the shared process; every
+                // thread's run loop observes it at its next boundary and stops,
+                // so the main thread returns this code from the run and the
+                // process exits. Forwarding to the host instead would kill the
+                // embedder's process, which the runtime must not do.
+                let code = call.args[0] as i32;
+                thread.process().request_exit_group(code);
+                thread.exit_code = code;
                 thread.running = false;
             }
             libc::SYS_execve | libc::SYS_execveat => {

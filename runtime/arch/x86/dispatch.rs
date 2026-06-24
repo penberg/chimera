@@ -296,6 +296,12 @@ impl Thread {
         self.process.addr_space.lock().unwrap()
     }
 
+    /// The shared process [`Process`] this thread runs in. Used by the syscall
+    /// layer to publish a process-wide `exit_group` request.
+    pub fn process(&self) -> &Process {
+        &self.process
+    }
+
     pub fn signals_mut(&mut self) -> &mut Signals {
         &mut self.signals
     }
@@ -369,6 +375,15 @@ impl Thread {
             .ensure_ib_lookup(block_exit)?;
 
         while self.running {
+            // Another thread may have issued `exit_group`, which ends the whole
+            // thread group. Observe it here, at a block/syscall boundary, and
+            // stop with the process-wide code so the main thread returns it from
+            // the run and the process exits.
+            if self.process.is_exiting() {
+                self.exit_code = self.process.exit_code.load(Ordering::Relaxed);
+                break;
+            }
+
             self.deliver_pending_signals();
             self.refresh_exit_requested();
 

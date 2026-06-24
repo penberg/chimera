@@ -8,7 +8,10 @@
 //! child the same `Arc` and the two threads translate into and map within one
 //! address space.
 
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, AtomicI32},
+};
 
 use crate::{Error, SystemCalls, sys::mmap::AddressSpace};
 
@@ -28,6 +31,16 @@ pub struct Process {
     /// that will back `clone(CLONE_VM)` siblings — drive the one handler
     /// instance concurrently, reaching it through this shared `Process`.
     pub handler: Box<dyn SystemCalls>,
+    /// Set when any thread issues `exit_group`: that call terminates the whole
+    /// thread group, not just the caller. Every thread's run loop observes this
+    /// at its next iteration (a block/syscall boundary) and stops, so the main
+    /// thread returns `exit_code` from the run and the process ends. A plain
+    /// `exit` (thread-local) does not set it. See [`Process::request_exit_group`].
+    pub exiting: AtomicBool,
+    /// The status the process exits with once `exiting` is set. Written before
+    /// `exiting` is published, so a thread that observes `exiting` reads the
+    /// final code.
+    pub exit_code: AtomicI32,
 }
 
 impl Process {
@@ -35,7 +48,24 @@ impl Process {
         Ok(Self {
             addr_space: Mutex::new(AddressSpace::new(code_cache_size)?),
             handler,
+            exiting: AtomicBool::new(false),
+            exit_code: AtomicI32::new(0),
         })
+    }
+
+    /// Record a process-wide exit (`exit_group`). The code is published before
+    /// the flag, with release/acquire ordering, so any thread that later sees
+    /// `is_exiting()` reads this exact code.
+    pub fn request_exit_group(&self, code: i32) {
+        use std::sync::atomic::Ordering;
+        self.exit_code.store(code, Ordering::Relaxed);
+        self.exiting.store(true, Ordering::Release);
+    }
+
+    /// Whether a thread has requested a process-wide exit; paired with
+    /// [`Process::exit_code`] (read after a true result).
+    pub fn is_exiting(&self) -> bool {
+        self.exiting.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
