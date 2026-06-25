@@ -584,11 +584,23 @@ fn build_linked_terminator(
             movabs_rax(&mut out, ret); // movabs rax, ret
             out.push(0x50); // push rax
             gs_load(&mut out, MODRM_RAX, RAX_SLOT); // mov rax, gs:[rax_slot]
+            // A direct call whose target is at or before this block can close a
+            // loop with no back-branch and no `ret`: direct or mutual recursion
+            // through fixed call targets, which otherwise stays entirely inside
+            // linked call edges until the stack overflows. Poll after the return
+            // address is pushed (so the call's effect is complete) but before the
+            // branch, so a pending signal is delivered at the callee entry. Every
+            // call cycle contains an edge into its lowest-address member, so this
+            // catches the cycle even when the individual calls run forward.
+            let poll = is_back_edge(target, block_start).then(|| emit_exit_poll(&mut out));
             out.push(0xE9);
             let rel = take_rel32(&mut out);
             let stub = out.len();
             emit_stub(&mut out, target, exit_tramp);
             write_rel32(&mut out, rel, stub);
+            if let Some(poll_rel) = poll {
+                write_rel32(&mut out, poll_rel, stub);
+            }
             edges.push((rel, target));
         }
     }
