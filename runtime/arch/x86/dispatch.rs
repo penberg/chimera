@@ -11,6 +11,7 @@
 //! assembly lives in [`super::trampoline`].
 
 use std::arch::asm;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{
     Error, SystemCall, SystemCalls,
@@ -87,7 +88,7 @@ impl Thread {
                 ib_rcx: 0,
                 ib_rdx: 0,
                 ib_host: 0,
-                exit_requested: 0,
+                exit_requested: AtomicU32::new(0),
                 _align_fpstate: [0; 5],
                 fpstate: [0; XSAVE_AREA_SIZE],
             }),
@@ -144,11 +145,11 @@ impl Thread {
     /// keeps the clear ordered before the recheck (signal delivery on this thread
     /// is itself a serialization point, so no CPU fence is needed).
     fn refresh_exit_requested(&mut self) {
-        self.state.exit_requested = 0;
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        self.state.exit_requested.store(0, Ordering::Relaxed);
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
         let deliverable = crate::sys::linux::signal::pending_snapshot() & !self.signals.blocked;
         if deliverable != 0 {
-            self.state.exit_requested = 1;
+            self.state.exit_requested.store(1, Ordering::Relaxed);
         }
     }
 
@@ -325,7 +326,14 @@ pub struct ThreadState {
     /// linked, syscall-free guest loop is dragged back to the run loop within one
     /// iteration, where a pending signal is delivered at a real block boundary.
     /// Reached from translated code as `gs:[]`.
-    pub exit_requested: u32,
+    ///
+    /// `AtomicU32` because the signal catcher writes it asynchronously (from the
+    /// handler, via `gs:[]`) while the run loop reads and writes it; plain accesses
+    /// would be a data race the compiler could miscompile (e.g. drop the clear in
+    /// [`Thread::refresh_exit_requested`] as a dead store). The in-memory layout is
+    /// an identical 32-bit word at the same offset, so the `gs:[]` poll is
+    /// unaffected.
+    pub exit_requested: AtomicU32,
     /// Padding so `fpstate` lands at offset 256 (a 64-byte boundary).
     _align_fpstate: [u32; 5],
     /// XSAVE area for the guest's extended FP/SIMD state (x87, SSE, AVX,
@@ -358,7 +366,7 @@ impl ThreadState {
         self.ib_rcx = 0;
         self.ib_rdx = 0;
         self.ib_host = 0;
-        self.exit_requested = 0;
+        self.exit_requested.store(0, Ordering::Relaxed);
         self._align_fpstate = [0; 5];
         self.fpstate.fill(0);
 
