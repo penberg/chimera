@@ -308,7 +308,7 @@ pub fn translate(
     if let Some(link) = classify_terminator(&term) {
         emit_body(cache, &instrs, host_pc, guest_pc)?;
         let term_pc = cache.next_pc() as usize;
-        let (bytes, rel_edges) = build_linked_terminator(&link, exit_tramp);
+        let (bytes, rel_edges) = build_linked_terminator(&link, exit_tramp, guest_pc);
         cache.emit(&bytes)?;
         let edges = rel_edges
             .into_iter()
@@ -418,23 +418,68 @@ fn classify_terminator(t: &Instruction) -> Option<LinkTerm> {
     }
 }
 
+/// Whether an edge to `target` from a block starting at `block_start` closes a
+/// loop: its successor lies at or before the block's own start, so it is a
+/// backward edge. Only such edges carry the asynchronous-signal safepoint poll;
+/// forward (straight-line) edges stay poll-free so non-looping code is
+/// unaffected. Every guest loop closes via a direct back-branch (handled here)
+/// or an indirect branch (handled in the shared inline lookup routine).
+fn is_back_edge(target: u64, block_start: u64) -> bool {
+    target <= block_start
+}
+
+/// Emit the asynchronous-signal safepoint poll for a loop-closing edge:
+/// `cmp dword ptr gs:[exit_requested], 0` then `jne rel32`. Returns the offset of
+/// the reserved `rel32`, which the caller patches to the edge's cold-exit stub.
+/// When the flag is set the branch is taken and the stub publishes the successor
+/// guest PC and exits to the dispatcher, where the pending signal is delivered;
+/// when clear the loop continues on the fast path. (The `cmp` clobbers the host
+/// flags; a later change makes this flag-preserving.)
+fn emit_exit_poll(out: &mut Vec<u8>) -> usize {
+    let disp = offset_of!(ThreadState, exit_requested) as i32;
+    // cmp dword ptr gs:[disp32], 0 — 65 83 3C 25 <disp32> 00
+    out.extend_from_slice(&[0x65, 0x83, 0x3C, 0x25]);
+    emit_u32(out, disp as u32);
+    out.push(0x00);
+    // jne rel32 — 0F 85 <rel32>
+    out.extend_from_slice(&[0x0F, 0x85]);
+    take_rel32(out)
+}
+
 /// Build the raw machine code for a linkable terminator: a fast-path direct
 /// branch followed by one cold exit stub per successor. Returns the encoded
 /// bytes and, for each edge, the byte offset of its fast-path `rel32`
 /// displacement paired with the successor's guest PC. The displacements are
 /// initialized to target the stubs; the dispatcher rewrites them to the
 /// successor blocks as those are translated.
-fn build_linked_terminator(link: &LinkTerm, exit_tramp: u64) -> (Vec<u8>, Vec<(usize, u64)>) {
+///
+/// A back-edge ([`is_back_edge`]) is preceded by a safepoint poll
+/// ([`emit_exit_poll`]) that diverts to the edge's own cold-exit stub when an
+/// asynchronous signal is pending, so a fully linked loop returns to the run loop
+/// within one iteration. The stub already publishes the correct successor guest
+/// PC, so delivery lands at a clean boundary.
+fn build_linked_terminator(
+    link: &LinkTerm,
+    exit_tramp: u64,
+    block_start: u64,
+) -> (Vec<u8>, Vec<(usize, u64)>) {
     let mut out = Vec::new();
     let mut edges = Vec::new();
     match *link {
         LinkTerm::Uncond { target } => {
+            // An unconditional back-branch is the whole loop: poll before taking
+            // it. The poll's `cmp` clobbers flags, but an unconditional jmp has no
+            // flag-dependent terminator (a later change makes the poll flag-safe).
+            let poll = is_back_edge(target, block_start).then(|| emit_exit_poll(&mut out));
             // jmp rel32 -> stub (later: -> target's host code)
             out.push(0xE9);
             let rel = take_rel32(&mut out);
             let stub = out.len();
             emit_stub(&mut out, target, exit_tramp);
             write_rel32(&mut out, rel, stub);
+            if let Some(poll_rel) = poll {
+                write_rel32(&mut out, poll_rel, stub);
+            }
             edges.push((rel, target));
         }
         LinkTerm::Cond {
@@ -442,20 +487,46 @@ fn build_linked_terminator(link: &LinkTerm, exit_tramp: u64) -> (Vec<u8>, Vec<(u
             taken,
             fallthrough,
         } => {
-            // jcc rel32 -> taken stub ; jmp rel32 -> fall-through stub.
-            // The native jcc reads the block's live guest flags directly.
-            out.extend_from_slice(&[0x0F, opcode]);
-            let jcc_rel = take_rel32(&mut out);
-            out.push(0xE9);
-            let jmp_rel = take_rel32(&mut out);
-            let taken_stub = out.len();
-            emit_stub(&mut out, taken, exit_tramp);
-            let fall_stub = out.len();
-            emit_stub(&mut out, fallthrough, exit_tramp);
-            write_rel32(&mut out, jcc_rel, taken_stub);
-            write_rel32(&mut out, jmp_rel, fall_stub);
-            edges.push((jcc_rel, taken));
-            edges.push((jmp_rel, fallthrough));
+            // The fall-through is `next_ip`, always forward, so only the taken edge
+            // can close a loop. When it does, route the taken path through a poll
+            // after the guest's `jcc` has consumed the live flags.
+            if is_back_edge(taken, block_start) {
+                // jcc rel32 -> taken_check ; jmp rel32 -> fall stub.
+                out.extend_from_slice(&[0x0F, opcode]);
+                let jcc_rel = take_rel32(&mut out);
+                out.push(0xE9);
+                let jmp_rel = take_rel32(&mut out);
+                // taken_check: poll, then the linkable fast-path branch to taken.
+                let taken_check = out.len();
+                write_rel32(&mut out, jcc_rel, taken_check);
+                let poll_rel = emit_exit_poll(&mut out);
+                out.push(0xE9);
+                let taken_jmp_rel = take_rel32(&mut out);
+                let taken_stub = out.len();
+                emit_stub(&mut out, taken, exit_tramp);
+                let fall_stub = out.len();
+                emit_stub(&mut out, fallthrough, exit_tramp);
+                write_rel32(&mut out, jmp_rel, fall_stub);
+                write_rel32(&mut out, taken_jmp_rel, taken_stub);
+                write_rel32(&mut out, poll_rel, taken_stub);
+                edges.push((taken_jmp_rel, taken));
+                edges.push((jmp_rel, fallthrough));
+            } else {
+                // jcc rel32 -> taken stub ; jmp rel32 -> fall-through stub.
+                // The native jcc reads the block's live guest flags directly.
+                out.extend_from_slice(&[0x0F, opcode]);
+                let jcc_rel = take_rel32(&mut out);
+                out.push(0xE9);
+                let jmp_rel = take_rel32(&mut out);
+                let taken_stub = out.len();
+                emit_stub(&mut out, taken, exit_tramp);
+                let fall_stub = out.len();
+                emit_stub(&mut out, fallthrough, exit_tramp);
+                write_rel32(&mut out, jcc_rel, taken_stub);
+                write_rel32(&mut out, jmp_rel, fall_stub);
+                edges.push((jcc_rel, taken));
+                edges.push((jmp_rel, fallthrough));
+            }
         }
         LinkTerm::DirectCall { target, ret } => {
             // Push the 64-bit return address with a single 8-byte store so the

@@ -249,6 +249,27 @@ extern "C" fn chimera_sigcatch(
             }
         }
         PENDING.fetch_or(1u64 << (signo as u64 - 1), Ordering::Release);
+
+        // Drag the interrupted guest thread back to its run loop. Translated code
+        // keeps the guest registers live across linked block chains and only
+        // returns to the dispatcher at a block exit, so a tight syscall-free loop
+        // would never observe the bit set above. Set the per-context exit flag the
+        // loop-closing polls in translated code read, so the next such poll falls
+        // back to the dispatcher, where delivery happens at a real block boundary.
+        // GS is this thread's `ThreadState` throughout guest execution (bound once
+        // via `ARCH_SET_GS`, never changed — only FS is swapped), so a single
+        // `gs:[]` store reaches the right context with no TLS, allocation, or
+        // locking, keeping the catcher async-signal-safe. This sets the flag on the
+        // interrupted thread's own context; cross-thread fan-out (signal caught on
+        // a thread other than the one that should deliver) is out of scope and
+        // needs per-context pending state. TODO: route by owning context.
+        unsafe {
+            core::arch::asm!(
+                "mov dword ptr gs:[{off}], 1",
+                off = const core::mem::offset_of!(ThreadState, exit_requested),
+                options(nostack, preserves_flags),
+            );
+        }
     }
 }
 

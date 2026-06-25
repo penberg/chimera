@@ -87,7 +87,8 @@ impl Thread {
                 ib_rcx: 0,
                 ib_rdx: 0,
                 ib_host: 0,
-                _align_fpstate: [0; 3],
+                exit_requested: 0,
+                _align_fpstate: [0; 5],
                 fpstate: [0; XSAVE_AREA_SIZE],
             }),
             addr_space: AddressSpace::new()?,
@@ -133,6 +134,24 @@ impl Thread {
         }
     }
 
+    /// Recompute the safepoint exit flag the translated loop-closing polls read.
+    /// It is set exactly when a signal is pending and not blocked, so a fully
+    /// linked guest loop is forced back into this run loop within one iteration to
+    /// deliver it; once nothing is deliverable it clears, leaving warm loops
+    /// poll-free at runtime. Clear first, then re-arm only if deliverable — never
+    /// re-clearing — so a same-thread catcher that sets the flag from a signal
+    /// handler between the clear and the recheck is not lost. The `compiler_fence`
+    /// keeps the clear ordered before the recheck (signal delivery on this thread
+    /// is itself a serialization point, so no CPU fence is needed).
+    fn refresh_exit_requested(&mut self) {
+        self.state.exit_requested = 0;
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        let deliverable = crate::sys::linux::signal::pending_snapshot() & !self.signals.blocked;
+        if deliverable != 0 {
+            self.state.exit_requested = 1;
+        }
+    }
+
     /// Set the thread's entry registers for a freshly mapped image, without
     /// touching its address space. Used to re-enter after an `execve` once the
     /// caller has torn down the old image and mapped the new one.
@@ -160,6 +179,7 @@ impl Thread {
 
         while self.running {
             self.deliver_pending_signals();
+            self.refresh_exit_requested();
 
             let ts_ptr: *mut ThreadState = &mut *self.state;
 
@@ -299,8 +319,15 @@ pub struct ThreadState {
     pub ib_rcx: u64,
     pub ib_rdx: u64,
     pub ib_host: u64,
+    /// Asynchronous-exit flag polled by translated code at loop-closing edges.
+    /// The host signal catcher sets it; the run loop recomputes it each iteration
+    /// as "a deliverable signal is pending" so it self-clears. When set, a fully
+    /// linked, syscall-free guest loop is dragged back to the run loop within one
+    /// iteration, where a pending signal is delivered at a real block boundary.
+    /// Reached from translated code as `gs:[]`.
+    pub exit_requested: u32,
     /// Padding so `fpstate` lands at offset 256 (a 64-byte boundary).
-    _align_fpstate: [u64; 3],
+    _align_fpstate: [u32; 5],
     /// XSAVE area for the guest's extended FP/SIMD state (x87, SSE, AVX,
     /// AVX-512). Saved on every exit, restored on every entry. Must be
     /// 64-byte aligned; the field layout above guarantees offset 256.
@@ -331,7 +358,8 @@ impl ThreadState {
         self.ib_rcx = 0;
         self.ib_rdx = 0;
         self.ib_host = 0;
-        self._align_fpstate = [0; 3];
+        self.exit_requested = 0;
+        self._align_fpstate = [0; 5];
         self.fpstate.fill(0);
 
         // XRSTOR loads MXCSR from the legacy region (bytes 24..28) of the save
