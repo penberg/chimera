@@ -296,6 +296,8 @@ pub fn translate(
         break instr;
     };
 
+    rewrite_rip_relative_leas(&mut instrs)?;
+
     // A terminator with statically known target(s) — a direct jmp, a direct
     // call, or a supported conditional branch — gets the linkable layout: the
     // straight-line body, then a fast-path direct branch (initially aimed at a
@@ -321,6 +323,34 @@ pub fn translate(
         emit_body(cache, &instrs, host_pc, guest_pc)?;
         Ok((host_pc, Vec::new()))
     }
+}
+
+/// Rewrite each `lea reg, [rip + disp]` in the block body into a `movabs reg,
+/// <absolute guest target>` that materializes the same guest address.
+///
+/// `BlockEncoder` fixes up a RIP-relative operand by preserving its *effective
+/// address* — except when that address falls inside the very block being encoded,
+/// in which case it relocates the operand to the target's NEW location in the code
+/// cache. A computed `goto` compiles to `lea &&label(%rip)` with the label in the
+/// same basic block, so the encoder would hand back a code-cache address. Chimera
+/// needs the guest address instead: the value flows into an indirect branch that
+/// the dispatcher resolves as a guest PC. Materializing the absolute guest target
+/// up front sidesteps the relocation entirely (and produces the identical result
+/// for an ordinary out-of-block `lea`, so there is no behavior change there).
+///
+/// Only `lea r64, [rip+...]` is rewritten — the form compilers emit to take the
+/// address of code or data (computed gotos, function pointers, PIC). Other
+/// instructions reading RIP-relative *data* address memory outside the block, so
+/// the encoder preserves their target correctly and they are left untouched.
+fn rewrite_rip_relative_leas(instrs: &mut [Instruction]) -> Result<(), Error> {
+    for instr in instrs.iter_mut() {
+        if instr.code() == Code::Lea_r64_m && instr.is_ip_rel_memory_operand() {
+            let dest = instr.op0_register();
+            let target = instr.ip_rel_memory_address();
+            *instr = mkinstr(Instruction::with2(Code::Mov_r64_imm64, dest, target))?;
+        }
+    }
+    Ok(())
 }
 
 /// Encode the straight-line instruction list at `host_pc` (with RIP-relative
