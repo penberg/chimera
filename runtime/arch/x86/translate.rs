@@ -187,6 +187,21 @@ impl CodeCache {
         out.extend_from_slice(&[0x0f, 0x85]); // jne miss
         let jne_rel = take_rel32(&mut out);
 
+        // Asynchronous-signal safepoint poll. Every guest loop that stays in the
+        // cache via an indirect branch (a computed-goto or function-pointer
+        // dispatch loop hitting this table) closes here, so without a poll a
+        // pending signal would never reach a block boundary. If the exit flag is
+        // set, divert to the miss path, which already publishes the resolved target
+        // (gs:[target]) as the next guest PC and returns to the dispatcher —
+        // delivering at a clean boundary with the right guest PC. The guest's flags
+        // are saved in gs:[ib_flags] here (restored on both the hit and miss
+        // paths), so this `cmp`'s flag clobber is harmless.
+        out.extend_from_slice(&[0x65, 0x83, 0x3c, 0x25]); // cmp dword ptr gs:[exit_requested], 0
+        emit_u32(&mut out, offset_of!(ThreadState, exit_requested) as u32);
+        out.push(0x00);
+        out.extend_from_slice(&[0x0f, 0x85]); // jne miss
+        let poll_rel = take_rel32(&mut out);
+
         // Hit: load the host PC, restore flags and the borrowed registers, and
         // jump into the successor block with the full guest register file live.
         out.extend_from_slice(&[0x48, 0x8b, 0x50, 0x08]); // mov rdx, [rax+8]
@@ -202,6 +217,7 @@ impl CodeCache {
         // guest PC, and exit to the dispatcher exactly as before.
         let miss = out.len();
         write_rel32(&mut out, jne_rel, miss);
+        write_rel32(&mut out, poll_rel, miss);
         emit_restore_flags(&mut out, d_flags);
         gs_load(&mut out, MODRM_RCX, d_rcx); // mov rcx, gs:[rcx]
         gs_load(&mut out, MODRM_RDX, d_rdx); // mov rdx, gs:[rdx]
