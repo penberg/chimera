@@ -428,22 +428,46 @@ fn is_back_edge(target: u64, block_start: u64) -> bool {
     target <= block_start
 }
 
-/// Emit the asynchronous-signal safepoint poll for a loop-closing edge:
-/// `cmp dword ptr gs:[exit_requested], 0` then `jne rel32`. Returns the offset of
-/// the reserved `rel32`, which the caller patches to the edge's cold-exit stub.
-/// When the flag is set the branch is taken and the stub publishes the successor
-/// guest PC and exits to the dispatcher, where the pending signal is delivered;
-/// when clear the loop continues on the fast path. (The `cmp` clobbers the host
-/// flags; a later change makes this flag-preserving.)
+/// Emit the asynchronous-signal safepoint poll for a loop-closing edge. Returns
+/// the offset of a reserved `rel32` the caller patches to the edge's cold-exit
+/// stub: when `exit_requested` is set the poll branches there (the stub publishes
+/// the successor guest PC and exits to the dispatcher, where the pending signal is
+/// delivered); when clear it falls through to the caller's fast-path branch. On
+/// both paths the borrowed register is restored, so the full guest register file
+/// stays live across the edge.
+///
+/// The poll must not perturb the guest's arithmetic flags: a valid loop can carry
+/// a flag across its back-edge — an `adc`/`sbb` reduction closed by `dec`/`jnz`
+/// relies on `dec` preserving CF for the next iteration's `adc` — so a
+/// flag-clobbering `cmp` would make such a loop misexecute the moment it is
+/// linked. It therefore tests the flag with `jrcxz`, which neither reads nor
+/// writes the arithmetic flags, borrowing rcx through the `ib_rcx` scratch slot.
+/// That slot is otherwise owned only by the inline indirect-branch lookup routine,
+/// which a linked terminator never runs, and a thread executes these strictly
+/// sequentially, so the borrow cannot collide. The 32-bit load zero-extends the
+/// `u32` flag into rcx, so `jrcxz` sees zero exactly when no signal is pending.
 fn emit_exit_poll(out: &mut Vec<u8>) -> usize {
-    let disp = offset_of!(ThreadState, exit_requested) as i32;
-    // cmp dword ptr gs:[disp32], 0 — 65 83 3C 25 <disp32> 00
-    out.extend_from_slice(&[0x65, 0x83, 0x3C, 0x25]);
-    emit_u32(out, disp as u32);
-    out.push(0x00);
-    // jne rel32 — 0F 85 <rel32>
-    out.extend_from_slice(&[0x0F, 0x85]);
-    take_rel32(out)
+    let d_exit = offset_of!(ThreadState, exit_requested) as i32;
+    let d_rcx = offset_of!(ThreadState, ib_rcx) as i32;
+    // mov gs:[ib_rcx], rcx — stash guest rcx (no flags touched).
+    gs_store(out, MODRM_RCX, d_rcx);
+    // mov ecx, gs:[exit_requested] — rcx = flag, zero-extended (no flags touched).
+    out.extend_from_slice(&[0x65, 0x8b, 0x0c, 0x25]);
+    emit_u32(out, d_exit as u32);
+    // jrcxz .cont — take the fast path if the flag is clear; preserves flags.
+    out.push(0xe3);
+    let jrcxz_at = out.len();
+    out.push(0x00); // rel8, patched to .cont below
+    // Flag set: restore guest rcx, then jump to the edge's cold-exit stub.
+    gs_load(out, MODRM_RCX, d_rcx);
+    out.push(0xe9);
+    let stub_rel = take_rel32(out);
+    // .cont: flag clear — restore guest rcx and continue on the fast path.
+    let cont = out.len();
+    let disp = cont as i64 - (jrcxz_at as i64 + 1);
+    out[jrcxz_at] = i8::try_from(disp).expect("jrcxz poll displacement out of range") as u8;
+    gs_load(out, MODRM_RCX, d_rcx);
+    stub_rel
 }
 
 /// Build the raw machine code for a linkable terminator: a fast-path direct
@@ -468,8 +492,8 @@ fn build_linked_terminator(
     match *link {
         LinkTerm::Uncond { target } => {
             // An unconditional back-branch is the whole loop: poll before taking
-            // it. The poll's `cmp` clobbers flags, but an unconditional jmp has no
-            // flag-dependent terminator (a later change makes the poll flag-safe).
+            // it. The poll preserves the guest's flags and registers (see
+            // emit_exit_poll), so a loop carrying flags across this edge is safe.
             let poll = is_back_edge(target, block_start).then(|| emit_exit_poll(&mut out));
             // jmp rel32 -> stub (later: -> target's host code)
             out.push(0xE9);
@@ -488,8 +512,9 @@ fn build_linked_terminator(
             fallthrough,
         } => {
             // The fall-through is `next_ip`, always forward, so only the taken edge
-            // can close a loop. When it does, route the taken path through a poll
-            // after the guest's `jcc` has consumed the live flags.
+            // can close a loop. When it does, route the taken path through a
+            // flag-preserving poll once the guest's `jcc` has read the live flags;
+            // the poll keeps them intact for the loop head on the fast path.
             if is_back_edge(taken, block_start) {
                 // jcc rel32 -> taken_check ; jmp rel32 -> fall stub.
                 out.extend_from_slice(&[0x0F, opcode]);
