@@ -51,8 +51,16 @@ impl AddressSpace {
     /// Translate (or look up) the block at guest `rip` and return its host PC.
     /// A freshly translated block's guest page(s) are armed for SMC so a later
     /// in-place rewrite of that code traps.
-    pub fn resolve(&mut self, rip: u64, block_exit: u64, syscall_exit: u64) -> Result<u64, Error> {
-        let (host_pc, span) = self.code.resolve(rip, block_exit, syscall_exit)?;
+    pub fn resolve(
+        &mut self,
+        rip: u64,
+        block_exit: u64,
+        syscall_exit: u64,
+        trap_exit: u64,
+    ) -> Result<u64, Error> {
+        let (host_pc, span) = self
+            .code
+            .resolve(rip, block_exit, syscall_exit, trap_exit)?;
         if let Some((start, end)) = span {
             self.arm_span(start, end);
         }

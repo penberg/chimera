@@ -463,6 +463,7 @@ pub fn translate(
     guest_pc: u64,
     exit_tramp: u64,
     syscall_tramp: u64,
+    trap_tramp: u64,
 ) -> Result<Translation, Error> {
     let host_pc = cache.next_pc();
     let guest_bytes =
@@ -528,7 +529,7 @@ pub fn translate(
             })
             .collect()
     } else {
-        emit_terminator(&mut instrs, &term, syscall_tramp)?;
+        emit_terminator(&mut instrs, &term, syscall_tramp, trap_tramp)?;
         emit_body(cache, &instrs, host_pc, guest_pc)?;
         Vec::new()
     };
@@ -1038,6 +1039,7 @@ fn emit_terminator(
     instrs: &mut Vec<Instruction>,
     t: &Instruction,
     syscall_tramp: u64,
+    trap_tramp: u64,
 ) -> Result<(), Error> {
     let next_ip = t.next_ip();
     // `syscall` is special: the instruction itself does *not* run. We save
@@ -1111,6 +1113,16 @@ fn emit_terminator(
         // guest rip in `gs:[128]`.
         emit_load_rax_imm(instrs, next_ip)?;
         return emit_exit_tail(instrs, syscall_tramp);
+    }
+    // `int3` (and `int1`): a software breakpoint. The instruction does not run
+    // in the cache; it exits through `exit_trap`, which sets `exit_kind = TRAP`
+    // so the run loop raises SIGTRAP. As a trap (not a fault), the resumed rip is
+    // the instruction *after* the breakpoint, exactly where a real `int3` leaves
+    // it, so the saved next guest PC is `next_ip`.
+    if matches!(t.code(), Code::Int3 | Code::Int1) {
+        emit_save_rax(instrs)?;
+        emit_load_rax_imm(instrs, next_ip)?;
+        return emit_exit_tail(instrs, trap_tramp);
     }
     match t.flow_control() {
         FlowControl::UnconditionalBranch => {

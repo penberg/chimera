@@ -78,6 +78,7 @@ impl BlockCache {
         guest_pc: u64,
         block_exit: u64,
         syscall_exit: u64,
+        trap_exit: u64,
     ) -> Result<(u64, Option<(u64, u64)>), Error> {
         if let Some(&block) = self.map.get(&guest_pc) {
             // Refresh the in-cache lookup entry: reaching here means an indirect
@@ -91,7 +92,13 @@ impl BlockCache {
             guest_end,
             deopt_pc,
             edges,
-        } = translate(&mut self.cache, guest_pc, block_exit, syscall_exit)?;
+        } = translate(
+            &mut self.cache,
+            guest_pc,
+            block_exit,
+            syscall_exit,
+            trap_exit,
+        )?;
         self.map.insert(
             guest_pc,
             Block {

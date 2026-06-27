@@ -29,13 +29,18 @@ use crate::{
     },
 };
 
-use super::trampoline::{dispatch, exit_block, exit_syscall};
+use super::trampoline::{dispatch, exit_block, exit_syscall, exit_trap};
 
 /// Linux x86-64 `arch_prctl` subfunction code: set the GS base.
 const ARCH_SET_GS: libc::c_int = 0x1001;
 
 const EXIT_KIND_BLOCK: u64 = 0;
 pub const EXIT_KIND_SYSCALL: u64 = 1;
+/// A guest breakpoint (`int3`) exited the cache: the run loop raises `SIGTRAP`.
+pub const EXIT_KIND_TRAP: u64 = 2;
+
+/// `SIGTRAP`, raised on a guest `int3`.
+const SIGTRAP: u32 = 5;
 
 /// Why [`Thread::run`] returned: the guest terminated, or it `execve`d and the
 /// caller must load the new image and re-enter the thread on it.
@@ -484,6 +489,7 @@ impl Thread {
 
         let block_exit = exit_block as *const () as usize as u64;
         let syscall_exit = exit_syscall as *const () as usize as u64;
+        let trap_exit = exit_trap as *const () as usize as u64;
 
         // Emit (once per cache) the shared inline indirect-branch lookup routine
         // and record its address so translated indirect branches can reach it.
@@ -535,16 +541,28 @@ impl Thread {
                 .addr_space
                 .lock()
                 .unwrap()
-                .resolve(rip, block_exit, syscall_exit)
+                .resolve(rip, block_exit, syscall_exit, trap_exit)
                 .unwrap_or_else(|e| panic!("translate failed at {:#x}: {}", rip, e));
             unsafe {
                 (*ts_ptr).exit_kind = EXIT_KIND_BLOCK;
                 dispatch(ts_ptr, host_pc);
             }
-            if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL
-                && let Some(reason) = self.handle_syscall()
-            {
-                return Ok(reason);
+            match unsafe { (*ts_ptr).exit_kind } {
+                EXIT_KIND_SYSCALL => {
+                    if let Some(reason) = self.handle_syscall() {
+                        return Ok(reason);
+                    }
+                }
+                EXIT_KIND_TRAP => {
+                    // A guest `int3` exited here with `rip` already at the
+                    // instruction after the breakpoint. Raise SIGTRAP: it enters
+                    // the guest's handler, or (default action) terminates the
+                    // process with a faithful SIGTRAP status.
+                    let restart = self.restart.take();
+                    let state = &mut *self.state;
+                    self.signals.deliver(state, SIGTRAP, restart);
+                }
+                _ => {}
             }
         }
         // Absent an `exit_group`, the kernel reports the status of the last
