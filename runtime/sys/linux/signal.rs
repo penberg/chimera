@@ -34,7 +34,7 @@ use std::{
     cell::UnsafeCell,
     mem, ptr,
     sync::{
-        Once,
+        Arc, Mutex, Once,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
@@ -68,9 +68,11 @@ const RDI: usize = 5;
 const RBP: usize = 6;
 const RSP: usize = 7;
 
-/// One guest signal disposition, in the raw `rt_sigaction` ABI shape.
+/// One guest signal disposition, in the raw `rt_sigaction` ABI shape. Public
+/// only because it appears in [`SharedSigTable`], which the engine stores; the
+/// fields stay an implementation detail of this module.
 #[derive(Clone, Copy, Default)]
-struct GuestSigaction {
+pub struct GuestSigaction {
     handler: u64,
     flags: u64,
     restorer: u64,
@@ -687,10 +689,26 @@ fn builtin_restorer() -> u64 {
     RESTORER_ADDR.load(Ordering::Acquire)
 }
 
-/// Per-process guest signal state: the disposition table, the blocked mask, and
-/// the alternate signal stack.
+/// The guest's signal-disposition table, shared by every thread of the process.
+/// POSIX (and a `clone(CLONE_SIGHAND)` thread) keeps signal dispositions
+/// process-wide: `rt_sigaction` on one thread is visible to all, and a
+/// thread-directed signal (e.g. JSC's `SIGPWR` stop-the-world) is delivered
+/// against the disposition the installing thread set, not a per-thread default.
+/// The host disposition is already process-wide (one `chimera_sigcatch`), so the
+/// guest table must match; a per-thread table would have a freshly cloned thread
+/// run the fatal default action for a signal the process actually handles.
+pub type SharedSigTable = Arc<Mutex<[GuestSigaction; NSIG]>>;
+
+/// Create a process's shared disposition table, all signals at their default.
+pub fn new_shared_table() -> SharedSigTable {
+    Arc::new(Mutex::new([GuestSigaction::default(); NSIG]))
+}
+
+/// Per-thread guest signal state. The disposition `table` is shared across the
+/// thread group ([`SharedSigTable`]); the blocked mask, the alternate signal
+/// stack, and the suspend-saved mask are per-thread, as POSIX requires.
 pub struct Signals {
-    table: [GuestSigaction; NSIG],
+    table: SharedSigTable,
     /// Currently blocked signal mask (emulated in software).
     pub blocked: u64,
     /// Alternate signal stack as `(ss_sp, ss_size, ss_flags)`, if set.
@@ -703,9 +721,12 @@ pub struct Signals {
 }
 
 impl Signals {
-    pub fn new() -> Self {
+    /// Build a thread's signal state over the process's shared disposition table.
+    /// A `clone(CLONE_VM)` child passes the same [`SharedSigTable`] so the two
+    /// threads see one disposition table; the per-thread fields start cleared.
+    pub fn new(table: SharedSigTable) -> Self {
         Self {
-            table: [GuestSigaction::default(); NSIG],
+            table,
             blocked: 0,
             altstack: None,
             saved_mask: None,
@@ -726,9 +747,10 @@ impl Signals {
     /// at generation (see [`default_action_ignores`]). The arrival of such a
     /// signal never interrupts a wait.
     fn discarded_mask(&self) -> u64 {
+        let table = self.table.lock().unwrap();
         let mut mask = 0u64;
         for i in 0..NSIG {
-            let h = self.table[i].handler;
+            let h = table[i].handler;
             if h == SIG_IGN || (h == SIG_DFL && default_action_ignores(i as u32 + 1)) {
                 mask |= 1u64 << i;
             }
@@ -740,10 +762,11 @@ impl Signals {
     /// generation stops the process: SIGSTOP (whose disposition can never
     /// change), plus SIGTSTP/SIGTTIN/SIGTTOU while at `SIG_DFL`.
     fn dfl_stop_mask(&self) -> u64 {
+        let table = self.table.lock().unwrap();
         let mut mask = 1u64 << (SIGSTOP - 1);
         for signo in [20u32, 21, 22] {
             // SIGTSTP, SIGTTIN, SIGTTOU
-            if self.table[signo as usize - 1].handler == SIG_DFL {
+            if table[signo as usize - 1].handler == SIG_DFL {
                 mask |= 1u64 << (signo - 1);
             }
         }
@@ -762,7 +785,8 @@ impl Signals {
             return SyscallResult::Error(libc::EINVAL);
         }
         let idx = signo as usize - 1;
-        let prev = self.table[idx];
+        let mut table = self.table.lock().unwrap();
+        let prev = table[idx];
         if oldact != 0 {
             let ka = KernelSigaction {
                 handler: prev.handler,
@@ -774,7 +798,7 @@ impl Signals {
         }
         if act != 0 {
             let a = unsafe { (act as *const KernelSigaction).read_unaligned() };
-            self.table[idx] = GuestSigaction {
+            table[idx] = GuestSigaction {
                 handler: a.handler,
                 flags: a.flags,
                 restorer: a.restorer,
@@ -923,13 +947,15 @@ impl Signals {
     /// their default, ignored ones stay ignored, the blocked mask is preserved,
     /// and the alternate stack is dropped.
     pub fn on_execve(&mut self) {
+        let mut table = self.table.lock().unwrap();
         for i in 0..NSIG {
-            let h = self.table[i].handler;
+            let h = table[i].handler;
             if h != SIG_DFL && h != SIG_IGN {
-                self.table[i] = GuestSigaction::default();
+                table[i] = GuestSigaction::default();
                 install_host(i + 1, SIG_DFL);
             }
         }
+        drop(table);
         self.altstack = None;
     }
 
@@ -943,7 +969,9 @@ impl Signals {
     /// syscall rather than seeing `EINTR` — mirroring the kernel, which rewinds
     /// the saved `rip` by the 2-byte `syscall` and restores the original `rax`.
     pub fn deliver(&mut self, state: &mut ThreadState, signo: u32, restart: Option<(u64, u64)>) {
-        let act = self.table[signo as usize - 1];
+        // Copy the disposition out of the shared table and release the lock; the
+        // rest of delivery touches only this thread's own state.
+        let act = self.table.lock().unwrap()[signo as usize - 1];
         // The disposition may have changed since the host caught the signal.
         // SIG_IGN discards it; SIG_DFL means we must carry out the kernel's
         // default action rather than jump to 0/1.
@@ -1061,7 +1089,7 @@ impl Signals {
         state.rflags &= !((1u64 << 10) | (1u64 << 8)); // clear DF, TF
 
         if act.flags & libc::SA_RESETHAND as u64 != 0 {
-            self.table[signo as usize - 1].handler = SIG_DFL;
+            self.table.lock().unwrap()[signo as usize - 1].handler = SIG_DFL;
             install_host(signo as usize, SIG_DFL);
         }
     }
@@ -1139,7 +1167,7 @@ mod tests {
     fn set_blocked_mirrors_guest_mask_onto_host() {
         let guest = 1u64 << (libc::SIGUSR1 - 1);
         let _guard = HostMaskGuard::save();
-        let mut signals = Signals::new();
+        let mut signals = Signals::new(new_shared_table());
         signals.set_blocked(guest | (1u64 << (SIGKILL - 1)));
         assert_eq!(current_host_mask(), guest);
         signals.set_blocked(0);

@@ -117,6 +117,7 @@ impl Thread {
     /// they share the address space, code cache, and syscall handler.
     pub fn new(process: Arc<Process>, rip: u64, rsp: u64) -> Result<Self, Error> {
         let guest_fs_base = current_fs_base();
+        let signals = Signals::new(Arc::clone(&process.sig_table));
         let mut thread = Self {
             state: Box::new(ThreadState {
                 regs: [0; 16],
@@ -138,7 +139,7 @@ impl Thread {
                 fpstate: [0; XSAVE_AREA_SIZE],
             }),
             process,
-            signals: Signals::new(),
+            signals,
             running: false,
             exit_code: 0,
             restart: None,
@@ -152,17 +153,20 @@ impl Thread {
     /// Assemble a thread from an already-built register state that runs in the
     /// given shared process. Used for `clone(CLONE_VM)` children: they inherit
     /// the parent's process (address space, code cache, handler) and a copy of
-    /// its register file, and start with a fresh, default signal state.
+    /// its register file. The signal-disposition table is shared with the rest
+    /// of the thread group (via the process), as POSIX requires; the per-thread
+    /// blocked mask and alternate stack start cleared.
     /// `clear_child_tid` carries the `CLONE_CHILD_CLEARTID` word, if any.
     fn from_state(
         process: Arc<Process>,
         state: Box<ThreadState>,
         clear_child_tid: Option<u64>,
     ) -> Self {
+        let signals = Signals::new(Arc::clone(&process.sig_table));
         Self {
             state,
             process,
-            signals: Signals::new(),
+            signals,
             running: false,
             exit_code: 0,
             restart: None,

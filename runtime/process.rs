@@ -15,7 +15,10 @@ use std::sync::{
 
 use crate::{
     Error, SystemCalls,
-    sys::{linux::exec::PreparedExec, mmap::AddressSpace},
+    sys::{
+        linux::{exec::PreparedExec, signal},
+        mmap::AddressSpace,
+    },
 };
 
 /// Host signal Chimera reserves to interrupt a guest thread parked in a
@@ -72,6 +75,13 @@ pub struct Process {
     /// that will back `clone(CLONE_VM)` siblings — drive the one handler
     /// instance concurrently, reaching it through this shared `Process`.
     pub handler: Box<dyn SystemCalls>,
+    /// The guest's signal-disposition table, shared by every thread of the
+    /// process. POSIX keeps dispositions process-wide, so `clone(CLONE_VM)`
+    /// siblings hand their per-thread [`signal::Signals`] a clone of this `Arc`
+    /// rather than a fresh table — otherwise a thread-directed signal would be
+    /// delivered against a stale default on a thread that did not install the
+    /// handler. See [`signal::SharedSigTable`].
+    pub sig_table: signal::SharedSigTable,
     /// Set when any thread issues `exit_group`: that call terminates the whole
     /// thread group, not just the caller. Every thread's run loop observes this
     /// at its next iteration (a block/syscall boundary) and stops, so the main
@@ -116,6 +126,7 @@ impl Process {
         Ok(Self {
             addr_space: Mutex::new(AddressSpace::new(code_cache_size)?),
             handler,
+            sig_table: signal::new_shared_table(),
             exiting: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
             live_threads: Mutex::new(Vec::new()),
