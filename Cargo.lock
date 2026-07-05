@@ -59,6 +59,7 @@ dependencies = [
  "argh",
  "chimera-runtime",
  "mimalloc",
+ "shlex",
 ]
 
 [[package]]
