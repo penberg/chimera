@@ -29,9 +29,9 @@ pub struct BlockCache {
 }
 
 impl BlockCache {
-    pub fn new() -> Result<Self, Error> {
+    pub fn new(cache_size: usize) -> Result<Self, Error> {
         Ok(Self {
-            cache: CodeCache::new()?,
+            cache: CodeCache::new(cache_size)?,
             map: HashMap::new(),
             pending: HashMap::new(),
         })
@@ -94,7 +94,7 @@ impl BlockCache {
 
 /// Rewrite the `rel32` displacement at `site` (an address inside the RWX code
 /// cache) so its branch lands at `host_pc`. The displacement is measured from
-/// the end of its own four bytes. The cache is at most a few megabytes, so the
+/// the end of its own four bytes. The cache stays well under 2 GiB, so the
 /// signed distance always fits in an `i32`. Safe to do unsynchronized: patching
 /// only happens in the dispatcher, between cache entries, while no translated
 /// code is executing; x86 keeps instruction and data caches coherent.

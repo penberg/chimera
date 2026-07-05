@@ -19,9 +19,9 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
-    pub fn new() -> Result<Self, Error> {
+    pub fn new(code_cache_size: usize) -> Result<Self, Error> {
         Ok(Self {
-            code: BlockCache::new()?,
+            code: BlockCache::new(code_cache_size)?,
             regions: Vec::new(),
         })
     }
@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn add_region_coalesces_adjacent_ranges() {
-        let mut addr_space = AddressSpace::new().unwrap();
+        let mut addr_space = AddressSpace::new(crate::DEFAULT_CODE_CACHE_SIZE).unwrap();
         let base = mmap_anon(PAGE_SIZE * 2);
 
         addr_space.add_region(base, PAGE_SIZE);
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn remove_region_splits_partial_unmap() {
-        let mut addr_space = AddressSpace::new().unwrap();
+        let mut addr_space = AddressSpace::new(crate::DEFAULT_CODE_CACHE_SIZE).unwrap();
         let base = mmap_anon(PAGE_SIZE * 3);
         addr_space.add_region(base, PAGE_SIZE * 3);
 
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn remap_region_moves_mapping() {
-        let mut addr_space = AddressSpace::new().unwrap();
+        let mut addr_space = AddressSpace::new(crate::DEFAULT_CODE_CACHE_SIZE).unwrap();
         let old = mmap_anon(PAGE_SIZE);
         let new = mmap_anon(PAGE_SIZE);
 

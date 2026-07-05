@@ -3,6 +3,7 @@
 
 use std::{
     ffi::{OsStr, OsString},
+    io,
     path::{Path, PathBuf},
 };
 
@@ -14,12 +15,27 @@ pub use syscall::{Passthrough, SyscallResult, SystemCall, SystemCalls};
 
 pub use sys::linux::syscall::host_syscall;
 
+/// Default capacity of the translated-code cache, in bytes. One cache is
+/// shared by every guest thread, so a multithreaded guest translates more
+/// blocks into it than a single-threaded one and runs a higher risk of
+/// exhausting it. Size it generously: the region is `mmap`'d lazily, so unused
+/// capacity costs virtual address space, not resident memory. It stays well
+/// under 2 GiB, so every intra-cache `rel32` displacement still fits in an
+/// `i32`.
+pub const DEFAULT_CODE_CACHE_SIZE: usize = 256 * 1024 * 1024;
+
+/// Upper bound on the translated-code cache capacity, in bytes. Every
+/// intra-cache `rel32` branch displacement is measured within the cache, so
+/// the cache must stay under 2 GiB for the displacement to fit in an `i32`.
+pub const MAX_CODE_CACHE_SIZE: usize = i32::MAX as usize;
+
 /// A sandboxed guest program, configured but not yet running.
 pub struct Sandbox {
     program: PathBuf,
     args: Vec<OsString>,
     envs: Option<Vec<(OsString, OsString)>>,
     handler: Box<dyn SystemCalls>,
+    code_cache_size: usize,
 }
 
 impl Sandbox {
@@ -31,6 +47,7 @@ impl Sandbox {
             args: Vec::new(),
             envs: None,
             handler: Box::new(Passthrough),
+            code_cache_size: DEFAULT_CODE_CACHE_SIZE,
         })
     }
 
@@ -62,6 +79,15 @@ impl Sandbox {
         self
     }
 
+    /// Set the translated-code cache capacity in bytes. Replaces the default
+    /// [`DEFAULT_CODE_CACHE_SIZE`]. Must be nonzero and at most
+    /// [`MAX_CODE_CACHE_SIZE`]; an out-of-range size is reported by
+    /// [`Sandbox::run`].
+    pub fn code_cache_size(&mut self, bytes: usize) -> &mut Self {
+        self.code_cache_size = bytes;
+        self
+    }
+
     /// Install a system-call handler. Replaces the default [`Passthrough`].
     pub fn system_calls<H: SystemCalls + 'static>(&mut self, handler: H) -> &mut Self {
         self.handler = Box::new(handler);
@@ -71,8 +97,27 @@ impl Sandbox {
     /// Run the guest. Returns when the guest issues `exit_group` (or `exit`),
     /// with the requested exit code; returns an error on setup failure.
     pub fn run(&mut self) -> Result<ExitStatus, Error> {
+        // Reject a bad cache size before anything is mapped: the guest image
+        // and stack go up before the thread (and its cache) exists and are
+        // recorded for cleanup only afterwards, so a late rejection would
+        // leak them in a long-lived embedder.
+        if self.code_cache_size == 0 || self.code_cache_size > MAX_CODE_CACHE_SIZE {
+            return Err(Error::io(
+                "code cache size",
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "must be nonzero and under 2 GiB",
+                ),
+            ));
+        }
         let handler = std::mem::replace(&mut self.handler, Box::new(Passthrough));
-        let code = sys::exec::execv(&self.program, &self.args, self.envs.as_deref(), handler)?;
+        let code = sys::exec::execv(
+            &self.program,
+            &self.args,
+            self.envs.as_deref(),
+            handler,
+            self.code_cache_size,
+        )?;
         Ok(ExitStatus { code })
     }
 }
