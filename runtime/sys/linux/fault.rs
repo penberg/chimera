@@ -67,6 +67,24 @@ extern "C" fn chimera_fault(
     let si_code = unsafe { (*info).si_code };
     let rip = fault_rip(ucontext);
 
+    // A `kill()`/`tgkill()`-raised SIGSEGV or SIGBUS (`si_code <= 0`) is not a
+    // memory fault: `si_addr` is meaningless there (it aliases the sender's
+    // pid/uid). The common source is the guest's own crash path — node resets
+    // the disposition to SIG_DFL and `raise()`s after its handler declines a
+    // fault — which expects the default action. Skip the crash report and
+    // terminate faithfully.
+    if si_code <= 0 {
+        unsafe {
+            let mut sa: libc::sigaction = mem::zeroed();
+            sa.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = 0;
+            libc::sigaction(signo, &sa, ptr::null_mut());
+            libc::raise(signo);
+        }
+        return;
+    }
+
     // Only a fault taken while executing translated guest code can be an SMC
     // write, and only then is the address-space lock guaranteed free on this
     // thread — it is never held across dispatch — so the handler can take it
