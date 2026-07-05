@@ -124,6 +124,32 @@ impl Drop for AddressSpace {
     }
 }
 
+/// Copy `buf.len()` bytes out of guest memory at `addr` without trusting the
+/// pointer. Chimera and the guest share one address space, so the copy is a
+/// self-targeted `process_vm_readv`: the kernel walks the page tables and an
+/// unmapped or partially mapped range fails the copy — exactly where a raw
+/// dereference would fault the runtime. Returns false on any failed or short
+/// copy, so a caller reports `EFAULT` (or forwards for the kernel to) the way
+/// a native `copy_from_user` failure would.
+pub fn copy_from_guest(addr: u64, buf: &mut [u8]) -> bool {
+    if buf.is_empty() {
+        return true;
+    }
+    if addr == 0 {
+        return false;
+    }
+    let local = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: addr as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let copied = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+    copied == buf.len() as isize
+}
+
 /// Copy `buf` into guest memory at `addr` without trusting the pointer — the
 /// write-side twin of [`copy_from_guest`], a self-targeted
 /// `process_vm_writev`. The kernel walks the page tables, so an unmapped or

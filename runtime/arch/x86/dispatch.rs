@@ -25,7 +25,7 @@ use crate::{
     process::Process,
     sys::{
         linux::signal::Signals,
-        mmap::{AddressSpace, copy_to_guest},
+        mmap::{AddressSpace, copy_from_guest, copy_to_guest},
     },
 };
 
@@ -559,27 +559,24 @@ const CLONE_ARGS_SIZE_VER0: u64 = 64;
 const CLONE_ARGS_SIZE_MAX: u64 = 4096;
 
 /// Copy the base `clone_args` struct a `clone3` points at out of guest
-/// memory, without trusting the pointer. The copy goes through the kernel
-/// (`process_vm_readv` on the calling process), so an invalid pointer fails
-/// the copy instead of faulting the runtime. `None` — also returned for a
-/// guest-declared `size` outside the kernel's accepted range — tells the
-/// caller to forward the call, so the kernel reports the authoritative error
-/// (`EFAULT`, `EINVAL`, `E2BIG`) exactly as it would natively.
+/// memory, fault-safely (see [`copy_from_guest`]). `None` — returned for an
+/// unreadable struct and for a guest-declared `size` outside the kernel's
+/// accepted range — tells the caller to forward the call, so the kernel
+/// reports the authoritative error (`EFAULT`, `EINVAL`, `E2BIG`) exactly as
+/// it would natively.
 pub fn read_clone3_args(args_ptr: u64, size: u64) -> Option<[u64; 8]> {
-    if args_ptr == 0 || !(CLONE_ARGS_SIZE_VER0..=CLONE_ARGS_SIZE_MAX).contains(&size) {
+    if !(CLONE_ARGS_SIZE_VER0..=CLONE_ARGS_SIZE_MAX).contains(&size) {
+        return None;
+    }
+    let mut raw = [0u8; CLONE_ARGS_SIZE_VER0 as usize];
+    if !copy_from_guest(args_ptr, &mut raw) {
         return None;
     }
     let mut args = [0u64; 8];
-    let local = libc::iovec {
-        iov_base: args.as_mut_ptr().cast(),
-        iov_len: CLONE_ARGS_SIZE_VER0 as usize,
-    };
-    let remote = libc::iovec {
-        iov_base: args_ptr as *mut libc::c_void,
-        iov_len: CLONE_ARGS_SIZE_VER0 as usize,
-    };
-    let copied = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
-    (copied == CLONE_ARGS_SIZE_VER0 as isize).then_some(args)
+    for (slot, chunk) in args.iter_mut().zip(raw.chunks_exact(8)) {
+        *slot = u64::from_ne_bytes(chunk.try_into().unwrap());
+    }
+    Some(args)
 }
 
 /// Whether a syscall interrupted by a signal must always fail with `EINTR`,

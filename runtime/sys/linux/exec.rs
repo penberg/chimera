@@ -13,7 +13,7 @@ use crate::{
     Error, SystemCalls,
     arch::dispatch::{self, ExitReason},
     process::Process,
-    sys::mmap::AddressSpace,
+    sys::mmap::{AddressSpace, copy_from_guest},
 };
 
 use super::{
@@ -150,7 +150,7 @@ pub struct PreparedExec {
 /// the caller takes `-errno` (see [`exec_errno`]) and resumes, with no other
 /// thread disturbed.
 pub fn prepare_exec(number: u64, args: &[u64; 6]) -> Result<PreparedExec, Error> {
-    let req = read_request(number, args);
+    let req = read_request(number, args)?;
     let parsed = parse_elf(&req.path)?;
     let parsed_interp = match &parsed.interp {
         Some(interp_path) => Some(parse_elf(interp_path)?),
@@ -210,22 +210,96 @@ struct ExecRequest {
 }
 
 /// Read an `execve`/`execveat` request out of guest memory. Chimera and the
-/// guest share an address space, so the pathname, argv, and envp pointers are
-/// plain dereferences.
-fn read_request(number: u64, args: &[u64; 6]) -> ExecRequest {
+/// guest share an address space, but none of the guest's pointers are
+/// trusted: every read is a fault-safe kernel copy, bounded the way the
+/// kernel bounds it, so a bad pathname, argv, or envp pointer reports
+/// `EFAULT` to the caller — and an oversized string `ENAMETOOLONG`/`E2BIG` —
+/// instead of crashing the runtime.
+fn read_request(number: u64, args: &[u64; 6]) -> Result<ExecRequest, Error> {
     let (path, argv_ptr, envp_ptr) = if number == libc::SYS_execveat as u64 {
         let dirfd = args[0] as i32;
-        let raw = unsafe { read_cstr(args[1]) };
+        let raw = read_guest_cstr(args[1], libc::PATH_MAX as usize, libc::ENAMETOOLONG)?;
         let flags = args[4] as i32;
         (resolve_at(dirfd, &raw, flags), args[2], args[3])
     } else {
-        let raw = unsafe { read_cstr(args[0]) };
+        let raw = read_guest_cstr(args[0], libc::PATH_MAX as usize, libc::ENAMETOOLONG)?;
         (PathBuf::from(OsStr::from_bytes(&raw)), args[1], args[2])
     };
-    ExecRequest {
+    Ok(ExecRequest {
         path,
-        argv: unsafe { read_ptr_array(argv_ptr) },
-        envp: unsafe { read_ptr_array(envp_ptr) },
+        argv: read_guest_ptr_array(argv_ptr)?,
+        envp: read_guest_ptr_array(envp_ptr)?,
+    })
+}
+
+/// The kernel's limit for a single argv/envp string (`MAX_ARG_STRLEN`,
+/// 32 pages); a longer one fails the exec with `E2BIG`.
+const MAX_ARG_STRLEN: usize = 32 * PAGE_SIZE as usize;
+
+/// Cap on argv/envp entry counts. The kernel bounds the whole argument block
+/// by the stack limit (`ARG_MAX` = stack rlimit / 4), and every entry costs
+/// at least a stack pointer, so more entries than `ARG_MAX / 8` could never
+/// fit on the guest stack anyway; reject them with `E2BIG` up front.
+const MAX_ARG_COUNT: usize = STACK_SIZE / 4 / 8;
+
+/// A guest-memory read failed or overran its bound while decoding an exec
+/// request. Carried as an [`Error::Io`] so [`exec_errno`] hands the errno to
+/// the caller exactly as the kernel's user-copy path would.
+fn arg_error(errno: i32, what: &str) -> Error {
+    Error::io(
+        format!("execve: {what}"),
+        std::io::Error::from_raw_os_error(errno),
+    )
+}
+
+/// Copy a NUL-terminated string out of guest memory without trusting the
+/// pointer (see `copy_from_guest`), in chunks that stop at page boundaries so
+/// a string ending just before an unmapped page is not failed by over-reading
+/// past it. `cap` is the kernel's limit for this kind of string: filling it
+/// without a NUL fails with `toolong` (`ENAMETOOLONG` for a pathname, `E2BIG`
+/// for an argv/envp entry), and an unreadable byte fails with `EFAULT`, the
+/// way the kernel's user-copy would.
+fn read_guest_cstr(ptr: u64, cap: usize, toolong: i32) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    let mut addr = ptr;
+    while out.len() < cap {
+        let page_left = (PAGE_SIZE - (addr % PAGE_SIZE)) as usize;
+        let mut chunk = vec![0u8; page_left.min(cap - out.len())];
+        if !copy_from_guest(addr, &mut chunk) {
+            return Err(arg_error(libc::EFAULT, "unreadable string"));
+        }
+        if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+            chunk.truncate(nul);
+            out.extend_from_slice(&chunk);
+            return Ok(out);
+        }
+        addr += chunk.len() as u64;
+        out.extend_from_slice(&chunk);
+    }
+    Err(arg_error(toolong, "string exceeds its limit"))
+}
+
+/// Copy a NULL-terminated array of C-string pointers (an argv or envp) and
+/// its strings out of guest memory, trusting none of the pointers. A null
+/// array pointer is Linux's "no arguments" degenerate case, not a fault.
+fn read_guest_ptr_array(ptr: u64) -> Result<Vec<Vec<u8>>, Error> {
+    if ptr == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    loop {
+        if out.len() >= MAX_ARG_COUNT {
+            return Err(arg_error(libc::E2BIG, "argument list too long"));
+        }
+        let mut raw = [0u8; 8];
+        if !copy_from_guest(ptr + (out.len() as u64) * 8, &mut raw) {
+            return Err(arg_error(libc::EFAULT, "unreadable argument pointer"));
+        }
+        let entry = u64::from_ne_bytes(raw);
+        if entry == 0 {
+            return Ok(out);
+        }
+        out.push(read_guest_cstr(entry, MAX_ARG_STRLEN, libc::E2BIG)?);
     }
 }
 
@@ -242,43 +316,6 @@ fn resolve_at(dirfd: i32, raw: &[u8], flags: i32) -> PathBuf {
         return path.to_path_buf();
     }
     PathBuf::from(format!("/proc/self/fd/{dirfd}")).join(path)
-}
-
-/// Read a NUL-terminated C string from guest memory, without the terminator.
-unsafe fn read_cstr(ptr: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    if ptr == 0 {
-        return out;
-    }
-    let mut i = 0usize;
-    loop {
-        let b = unsafe { ptr::read((ptr as *const u8).add(i)) };
-        if b == 0 {
-            break;
-        }
-        out.push(b);
-        i += 1;
-    }
-    out
-}
-
-/// Read a NULL-terminated array of C-string pointers (an argv or envp) from
-/// guest memory, returning each string's bytes (no terminator).
-unsafe fn read_ptr_array(ptr: u64) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    if ptr == 0 {
-        return out;
-    }
-    let mut i = 0usize;
-    loop {
-        let entry = unsafe { ptr::read((ptr as *const u64).add(i)) };
-        if entry == 0 {
-            break;
-        }
-        out.push(unsafe { read_cstr(entry) });
-        i += 1;
-    }
-    out
 }
 
 unsafe fn push_bytes(p: &mut u64, b: &[u8]) -> u64 {
