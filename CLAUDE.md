@@ -1,22 +1,29 @@
-# CLAUDE.md
-
-Notes for Claude when working on this repository.
-
-## What this is
-
-Chimera is a light-weight sandboxing runtime that runs unmodified Linux x86-64 binaries through same-ISA dynamic binary translation. It is a sandbox: not a fault-injection tool, not a deterministic-execution harness, not a cross-ISA translator. The system-call layer is an embedder-supplied handler with a `Passthrough` default; Chimera itself bakes no policy in.
+This is the Chimera repository — a light-weight sandboxing runtime that runs unmodified Linux x86-64 binaries through same-ISA dynamic binary translation. It is a sandbox: not a fault-injection tool, not a deterministic-execution harness, not a cross-ISA translator. The system-call layer is an embedder-supplied handler with a `Passthrough` default; Chimera itself bakes no policy in.
 
 The full design lives in `ARCHITECTURE.md`. Read it before making architectural decisions.
 
-## Project layout
+## Project Layout
 
-The repository is a Cargo virtual workspace with two member crates. `runtime/` is the `chimera-runtime` package — Chimera's same-ISA DBT runtime, with `lib.rs` and its submodules (`dispatch.rs`, `elf.rs`, `exec.rs`, `syscall.rs`, `trampoline.rs`, `trampoline.S`, `translate.rs`) and the example embedders under `runtime/examples/` (`sandbox/`, `strace/`). The lib name is `chimera`, so consumers write `use chimera::Sandbox` regardless of the package name. `cli/` is the `chimera-cli` package — a thin front end (`main.rs`, `opts.rs`) that depends on `chimera-runtime` and produces the `chimera` binary. The binary is intentionally thin: its main job is to be a stable harness for the conformance suite and performance work, not a product surface. Conformance tests live under `testing/` and are driven by `testing/lit.py`, which invokes `target/debug/chimera run`. Reference papers are in `research/`. The workspace is shaped to accept a future `chimera-linux` crate alongside `chimera-runtime` — the natural home for userspace Linux semantics (`Vfs`, `Net`, …) layered on top of the DBT runtime.
+Cargo virtual workspace with two member crates:
 
-## Coding style
+- `runtime/` — the `chimera-runtime` package: the DBT runtime. `lib.rs` plus `dispatch.rs`, `elf.rs`, `exec.rs`, `syscall.rs`, `trampoline.rs`, `trampoline.S`, `translate.rs`. Example embedders in `runtime/examples/` (`sandbox/`, `strace/`). The lib name is `chimera`, so consumers write `use chimera::Sandbox` regardless of the package name.
+- `cli/` — the `chimera-cli` package: thin front end (`main.rs`, `opts.rs`) producing the `chimera` binary. Intentionally thin — a stable harness for the conformance suite and performance work, not a product surface.
+- `testing/` — conformance tests, driven by `testing/lit.py` (invokes `target/debug/chimera run`).
+- `research/` — reference papers.
+
+The workspace is shaped to accept a future `chimera-linux` crate alongside `chimera-runtime` — the natural home for userspace Linux semantics (`Vfs`, `Net`, …) layered on top of the DBT runtime.
+
+## Tests
+
+- **Conformance**: `make conformance` builds Chimera and runs each test under it; `make conformance-native` runs the same tests directly without Chimera.
+- The runner is `testing/lit.py`, modeled after LLVM's LIT: each test source carries `// RUN:` directives the runner expands and executes. Tests live under `testing/conformance/`, organized by topic.
+- **CI locally**: `make ci` runs the GitHub Actions workflow (`.github/workflows/ci.yml` — rustfmt, clippy, build, test, conformance) with [Agent CI](https://agent-ci.dev/). It uses a custom runner image, `.github/agent-ci.Dockerfile`; keep its pinned toolchain in sync with `rust-toolchain.toml`.
+
+## Coding Style
 
 ### Imports
 
-Group `use` statements by crate. Within a group, collapse paths sharing a prefix into a single `use crate::{a, b, c}` line. Separate groups with a blank line:
+Group `use` statements by crate — `std`/`core` first, external crates next, local modules last — separated by blank lines. Collapse shared prefixes into a single `use crate::{a, b, c}` line:
 
 ```rust
 use std::{ffi::OsString, path::PathBuf, process::ExitCode};
@@ -26,31 +33,22 @@ use chimera::Sandbox;
 use opts::{Command, Opts};
 ```
 
-`std` and `core` first, external crates next, local modules last.
-
 ### Comments
 
-A comment must say something the code cannot: a kernel contract, an invariant, a non-obvious why. Say it once, on the item that owns it, and let every other site stand bare — never restate a rat
-ionale at call sites, narrate what the next line does, or argue that the code is correct. That last kind is a review comment, and it goes stale the moment the review ends.
+A comment must say something the code cannot: a kernel contract, an invariant, a non-obvious why. Say it once, on the item that owns it, and let every other site stand bare. Never restate a rationale at call sites, narrate what the next line does, or argue that the code is correct — that last kind is a review comment, and it goes stale the moment the review ends.
 
 ### Visibility
 
-Don't use `pub(crate)`. Most internal items live in private modules — declared `mod foo;`, not `pub mod foo;` — so a plain `pub` inside one of those modules is already unreachable from outside the crate. The `(crate)` is noise. If plain `pub` would genuinely widen the public API surface, move the item into a private module rather than reach for `pub(crate)`.
+Don't use `pub(crate)`. Internal items live in private modules — `mod foo;`, not `pub mod foo;` — so plain `pub` there is already unreachable from outside the crate. If plain `pub` would genuinely widen the public API surface, move the item into a private module instead.
 
 ### Naming
 
-The project name is **Chimera** in prose, comments, and doc comments. Lowercase `chimera` is correct only inside backticks for code identifiers — the binary name, the crate path, `libchimera`, `chimera.h`, and C-API symbols like `chimera_sandbox_t`.
+The project name is **Chimera** in prose, comments, and doc comments. Lowercase `chimera` only inside backticks for code identifiers — the binary name, the crate path, `libchimera`, `chimera.h`, C-API symbols like `chimera_sandbox_t`.
 
-### CLI option parsing
+### CLI Option Parsing
 
-CLI options live in `opts.rs` and are derived with [`argh`](https://github.com/google/argh). The top-level `Opts` carries a `Command` subcommand enum so new tools (`translate`, …) can slot in alongside `run` without reshaping the top level. Do not switch to `clap` or another arg-parsing crate; the surface is small and `argh` is the chosen tool. Note that this version of `argh` accepts options only as `--name value`, not `--name=value`.
+Options live in `opts.rs`, derived with [`argh`](https://github.com/google/argh). `Opts` carries a `Command` subcommand enum so new tools (`translate`, …) slot in alongside `run` without reshaping the top level. Do not switch to `clap` or another arg-parsing crate. Note: this version of `argh` accepts options only as `--name value`, not `--name=value`.
 
 ## Writing for ARCHITECTURE.md
 
-`ARCHITECTURE.md` is written as flowing Sun/DEC-style prose paragraphs. Bullets are reserved for genuine enumerations — auxv field names, named lifecycle stages, layout entries — never as a substitute for explanatory sentences. Use numerals for technical quantities (`64-byte`, `16 bytes`), not spelled-out forms. Citations are short: full first names, italicized venue abbreviation (e.g., *VEE '12*), DOI on its own at the end.
-
-## Tests
-
-`make conformance` builds Chimera and runs each test under it; `make conformance-native` runs the same tests directly without Chimera. The runner is `testing/lit.py`, modeled after LLVM's LIT: each test source carries one or more `// RUN:` directives that the runner expands and executes. Tests live under `testing/conformance/` and are organized by topic.
-
-`make ci` runs the GitHub Actions workflow (`.github/workflows/ci.yml` — rustfmt, clippy, build, test, conformance) locally with [Agent CI](https://agent-ci.dev/), reproducing what GitHub runs on push. It uses a custom runner image, `.github/agent-ci.Dockerfile`, that adds the build toolchain and rustup the default minimal runner lacks; keep its pinned toolchain in sync with `rust-toolchain.toml`.
+Flowing Sun/DEC-style prose paragraphs. Bullets are reserved for genuine enumerations — auxv field names, lifecycle stages, layout entries — never as a substitute for explanatory sentences. Use numerals for technical quantities (`64-byte`, `16 bytes`). Citations are short: full first names, italicized venue abbreviation (e.g., *VEE '12*), DOI on its own at the end.
