@@ -1,4 +1,4 @@
-This is the Chimera repository — a light-weight sandboxing runtime that runs unmodified Linux x86-64 binaries through same-ISA dynamic binary translation. It is a sandbox: not a fault-injection tool, not a deterministic-execution harness, not a cross-ISA translator. The system-call layer is an embedder-supplied handler with a `Passthrough` default; Chimera itself bakes no policy in.
+This is the Chimera repository — a light-weight sandboxing runtime that runs unmodified Linux x86-64 binaries through same-ISA dynamic binary translation. Every system call the guest makes is routed to an embedder-supplied handler (default `Passthrough`), so sandboxing policy lives in the embedder, not the runtime.
 
 The full design lives in `ARCHITECTURE.md`. Read it before making architectural decisions.
 
