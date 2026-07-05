@@ -170,6 +170,7 @@ impl Thread {
         // actually about to execute the translated guest.
         self.setup_gs()?;
         self.state.capture_chimera_fs();
+        self.signals.mirror_host_mask();
         self.running = true;
 
         let block_exit = exit_block as *const () as usize as u64;

@@ -16,6 +16,19 @@
 //! A blocking host syscall forwarded on the guest's behalf is interrupted
 //! (the catcher is installed without `SA_RESTART`), so the loop regains control
 //! and delivers at its next iteration.
+//!
+//! The guest's blocked mask is emulated in [`Signals`] and mirrored onto the
+//! host thread's mask ([`mirror_host_blocked`]) for the guest's whole lifetime,
+//! intercepted-`execve` windows included; [`HostMaskGuard`] restores the
+//! caller's own mask once the guest is done.
+//!
+//! The mirror claims no isolation between the guest's signals and the
+//! embedder's: signal-pending state is process-scoped and the guest runs inside
+//! the embedder's process, so a blocked process-directed signal is visible to
+//! the guest's `rt_sigpending` and can be dequeued by its `rt_sigtimedwait`
+//! whoever it was meant for. An embedder that concurrently relies on its own
+//! process-directed signal handling (a dedicated `sigwait` thread, say) is not
+//! supported while a guest is running.
 
 use std::{
     cell::UnsafeCell,
@@ -211,44 +224,52 @@ static RT_RING: [[SigInfoSlot; RT_RING_CAP]; NSIG] =
 static RT_HEAD: [AtomicU32; NSIG] = [const { AtomicU32::new(0) }; NSIG];
 static RT_TAIL: [AtomicU32; NSIG] = [const { AtomicU32::new(0) }; NSIG];
 
+/// Record one instance of `signo` (with its captured `siginfo_t`) in the
+/// pending bookkeeping. Called from the host catcher, so it must stay
+/// async-signal-safe: only plain global atomics and a fixed-size `memcpy` — no
+/// TLS, no allocation, no locks, no panics. For a real-time signal the queue
+/// depth is bumped before the bit is marked, so a drainer that observes the
+/// bit set always sees a positive count.
+fn record_pending(signo: u32, info: *const libc::siginfo_t) {
+    let idx = signo as usize - 1;
+    if signo >= SIGRTMIN_KERNEL {
+        // Real-time: enqueue this instance's siginfo and bump the depth.
+        let slot = RT_HEAD[idx].fetch_add(1, Ordering::AcqRel) as usize % RT_RING_CAP;
+        if !info.is_null() {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    info as *const u8,
+                    RT_RING[idx][slot].0.get() as *mut u8,
+                    SIGINFO_SIZE,
+                );
+            }
+        }
+        COUNTS[idx].fetch_add(1, Ordering::AcqRel);
+    } else if !info.is_null() {
+        // Standard: coalesced, a single slot holds the latest siginfo.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                info as *const u8,
+                SIGINFO[idx].0.get() as *mut u8,
+                SIGINFO_SIZE,
+            );
+        }
+    }
+    PENDING.fetch_or(1u64 << (signo as u64 - 1), Ordering::Release);
+}
+
 /// Host signal catcher. Runs asynchronously on whatever context the host thread
 /// happened to be in (translated guest code or Chimera Rust), so it must be
-/// async-signal-safe: it only touches plain global atomics and does a fixed-size
-/// `memcpy` — no TLS, no allocation, no locks, no panics. Installed with
-/// `SA_SIGINFO`, so it captures the kernel's `siginfo_t` for the guest handler.
-/// For a real-time signal it bumps the queue depth before marking the bit, so a
-/// drainer that observes the bit set always sees a positive count.
+/// async-signal-safe: [`record_pending`] plus one `gs`-relative store. Installed
+/// with `SA_SIGINFO`, so it captures the kernel's `siginfo_t` for the guest
+/// handler.
 extern "C" fn chimera_sigcatch(
     signo: libc::c_int,
     info: *const libc::siginfo_t,
     _uc: *mut libc::c_void,
 ) {
     if signo >= 1 && signo as usize <= NSIG {
-        let idx = signo as usize - 1;
-        if signo as u32 >= SIGRTMIN_KERNEL {
-            // Real-time: enqueue this instance's siginfo and bump the depth.
-            let slot = RT_HEAD[idx].fetch_add(1, Ordering::AcqRel) as usize % RT_RING_CAP;
-            if !info.is_null() {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        info as *const u8,
-                        RT_RING[idx][slot].0.get() as *mut u8,
-                        SIGINFO_SIZE,
-                    );
-                }
-            }
-            COUNTS[idx].fetch_add(1, Ordering::AcqRel);
-        } else if !info.is_null() {
-            // Standard: coalesced, a single slot holds the latest siginfo.
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    info as *const u8,
-                    SIGINFO[idx].0.get() as *mut u8,
-                    SIGINFO_SIZE,
-                );
-            }
-        }
-        PENDING.fetch_or(1u64 << (signo as u64 - 1), Ordering::Release);
+        record_pending(signo as u32, info);
 
         // Drag the interrupted guest thread back to its run loop. Translated code
         // keeps the guest registers live across linked block chains and only
@@ -396,6 +417,70 @@ fn host_sigset(mask: u64) -> libc::sigset_t {
     }
 }
 
+/// Mirror the guest's blocked mask onto the host thread's signal mask. The
+/// kernel consults the caller's real mask whenever it generates a signal
+/// itself — `tcsetpgrp` from a background process group stops the caller with
+/// SIGTTOU unless SIGTTOU is blocked or ignored, and a blocked fatal signal
+/// must be held pending rather than acted on — so a mask emulated only in
+/// software gets those cases wrong.
+fn mirror_host_blocked(mask: u64) {
+    let set = host_sigset(mask);
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, &set, ptr::null_mut());
+    }
+}
+
+/// The bitmask of the signals set in a host `sigset_t`.
+fn sigset_mask(s: &libc::sigset_t) -> u64 {
+    let mut mask = 0u64;
+    for i in 0..NSIG {
+        if unsafe { libc::sigismember(s, i as i32 + 1) } == 1 {
+            mask |= 1u64 << i;
+        }
+    }
+    mask
+}
+
+/// Saves the host thread's signal mask on construction and restores it on
+/// drop, so the mask the guest leaves behind does not leak onto the embedder's
+/// thread. Held around the guest's whole lifetime — the run/execve loop, not a
+/// single `run()` call — because POSIX preserves the mask across `execve`,
+/// loader window included.
+pub struct HostMaskGuard {
+    saved: libc::sigset_t,
+}
+
+impl HostMaskGuard {
+    pub fn save() -> Self {
+        unsafe {
+            let mut saved: libc::sigset_t = mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_SETMASK, ptr::null(), &mut saved);
+            Self { saved }
+        }
+    }
+}
+
+impl Drop for HostMaskGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.saved, ptr::null_mut());
+        }
+    }
+}
+
+/// Snapshot the host kernel's pending set for this thread as a sigset bitmask.
+/// With the guest's blocked mask mirrored onto the host, a signal that arrives
+/// while blocked is held pending by the kernel and never reaches the catcher,
+/// so the guest-visible pending set is the union of this and [`PENDING`].
+fn host_pending_snapshot() -> u64 {
+    unsafe {
+        let mut s: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut s);
+        libc::sigpending(&mut s);
+        sigset_mask(&s)
+    }
+}
+
 /// Block the calling host thread until a signal deliverable under `blocked`
 /// (pending and not blocked) has been recorded by the host catcher. Race-free:
 /// all host signals are blocked first, the already-pending set is checked, then
@@ -439,43 +524,71 @@ enum WaitResult {
 
 /// Synchronously accept a signal in `set`: block the host thread until one is
 /// pending (removing it), the optional `deadline` (in `CLOCK_MONOTONIC` ns)
-/// elapses, or a deliverable signal outside `set` arrives. Race-free in the same
-/// way as [`wait_for_signal`]; `ppoll` provides the timed wait that a signal
-/// interrupts.
-fn wait_for_set(set: u64, blocked: u64, deadline: Option<u128>) -> WaitResult {
+/// elapses, or a deliverable signal outside `set` arrives. All host signals
+/// are blocked around the wait so the pending checks cannot race a late
+/// arrival; the wait itself is the host's own `sigtimedwait`, which dequeues a
+/// signal without running its disposition. A deliverable signal outside `set`
+/// is dequeued too and recorded for dispatch-loop delivery — except the
+/// `ignored` ones, which the kernel would discard at generation and so must
+/// not surface as an `EINTR`, and the default-`stops`, which are left
+/// unblocked for the host kernel to act on: the process stops, and once
+/// continued the wait reports `EINTR`. Inside `set` both are still accepted;
+/// Linux holds a blocked ignored signal pending precisely so a waiter can
+/// dequeue it.
+fn wait_for_set(
+    set: u64,
+    blocked: u64,
+    ignored: u64,
+    stops: u64,
+    deadline: Option<u128>,
+) -> WaitResult {
     unsafe {
         let mut all: libc::sigset_t = mem::zeroed();
         libc::sigfillset(&mut all);
         let mut prev: libc::sigset_t = mem::zeroed();
         libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut prev);
-        let mut empty: libc::sigset_t = mem::zeroed();
-        libc::sigemptyset(&mut empty);
+        let want = host_sigset(set | (!blocked & !ignored & !stops));
+        let unblock_stops = stops & !blocked & !set;
+        let unblock = host_sigset(unblock_stops);
 
         let result = loop {
             if let Some(signo) = pending_take(set) {
                 break WaitResult::Got(signo);
             }
-            if pending_snapshot() & !blocked & !set != 0 {
+            if pending_snapshot() & !blocked & !set & !ignored != 0 {
                 break WaitResult::Interrupted;
             }
-            let remaining = match deadline {
-                Some(d) => {
-                    let now = monotonic_ns();
-                    if now >= d {
-                        break WaitResult::Timeout;
-                    }
-                    let rem = d - now;
-                    Some(libc::timespec {
-                        tv_sec: (rem / 1_000_000_000) as libc::time_t,
-                        tv_nsec: (rem % 1_000_000_000) as i64,
-                    })
+            let remaining = deadline.map(|d| {
+                let rem = d.saturating_sub(monotonic_ns());
+                libc::timespec {
+                    tv_sec: (rem / 1_000_000_000) as libc::time_t,
+                    tv_nsec: (rem % 1_000_000_000) as i64,
                 }
-                None => None,
-            };
+            });
             let ts_ptr = remaining
                 .as_ref()
                 .map_or(ptr::null(), |ts| ts as *const libc::timespec);
-            libc::ppoll(ptr::null_mut(), 0, ts_ptr, &empty);
+            let mut si: libc::siginfo_t = mem::zeroed();
+            if unblock_stops != 0 {
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, ptr::null_mut());
+            }
+            let r = libc::sigtimedwait(&want, &mut si, ts_ptr);
+            let interrupted =
+                r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
+            if unblock_stops != 0 {
+                libc::pthread_sigmask(libc::SIG_BLOCK, &unblock, ptr::null_mut());
+            }
+            if r > 0 {
+                record_pending(r as u32, &si);
+            } else if interrupted {
+                // Everything but the unblocked stop signals is blocked, so an
+                // EINTR means the process was stopped and continued.
+                if unblock_stops != 0 {
+                    break WaitResult::Interrupted;
+                }
+            } else {
+                break WaitResult::Timeout; // EAGAIN
+            }
         };
         libc::pthread_sigmask(libc::SIG_SETMASK, &prev, ptr::null_mut());
         result
@@ -504,6 +617,23 @@ fn install_host(signo: usize, handler: u64) {
     }
 }
 
+/// Whether `signo`'s default action does not terminate the process: Ign
+/// (SIGCHLD/SIGURG/SIGWINCH), Cont (SIGCONT), or Stop (SIGSTOP/SIGTSTP/
+/// SIGTTIN/SIGTTOU). Chimera does not yet model job control, so delivering
+/// such a signal with a SIG_DFL disposition is a no-op.
+fn default_action_discards(signo: u32) -> bool {
+    matches!(signo, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 28)
+}
+
+/// Whether the kernel discards `signo` at generation when its disposition is
+/// `SIG_DFL`: the kernel's ignore set — SIGCHLD, SIGCONT (to a process that is
+/// not stopped), SIGURG, SIGWINCH. Narrower than [`default_action_discards`]:
+/// generating a default-Stop signal is not a no-op, it wakes the task to stop
+/// it.
+fn default_action_ignores(signo: u32) -> bool {
+    matches!(signo, 17 | 18 | 23 | 28)
+}
+
 /// Carry out a signal's default action when it reaches delivery with a SIG_DFL
 /// disposition (the disposition reverted to default while the signal was already
 /// pending). The fatal signals — those whose default action is Term or Core —
@@ -512,9 +642,7 @@ fn install_host(signo: usize, handler: u64) {
 /// termination status (and core dump). The signals whose default action is Ign,
 /// Cont, or Stop are dropped, since Chimera does not yet model job control.
 fn default_action(signo: u32) {
-    // SIGCHLD/SIGURG/SIGWINCH (Ign), SIGCONT (Cont), and SIGSTOP/SIGTSTP/
-    // SIGTTIN/SIGTTOU (Stop) do not terminate; drop them.
-    if matches!(signo, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 28) {
+    if default_action_discards(signo) {
         return;
     }
     unsafe {
@@ -584,6 +712,49 @@ impl Signals {
         }
     }
 
+    /// Set the guest's blocked mask, stripping the unblockable signals. Every
+    /// write to `blocked` funnels through here so the host mask never drifts
+    /// from the emulated one.
+    fn set_blocked(&mut self, mask: u64) {
+        // SIGKILL and SIGSTOP can never be blocked.
+        self.blocked = mask & !((1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1)));
+        mirror_host_blocked(self.blocked);
+    }
+
+    /// The signals whose generation right now would be discarded outright:
+    /// disposition `SIG_IGN`, or `SIG_DFL` where the kernel ignores the signal
+    /// at generation (see [`default_action_ignores`]). The arrival of such a
+    /// signal never interrupts a wait.
+    fn discarded_mask(&self) -> u64 {
+        let mut mask = 0u64;
+        for i in 0..NSIG {
+            let h = self.table[i].handler;
+            if h == SIG_IGN || (h == SIG_DFL && default_action_ignores(i as u32 + 1)) {
+                mask |= 1u64 << i;
+            }
+        }
+        mask
+    }
+
+    /// The stop signals whose disposition is currently the default, so their
+    /// generation stops the process: SIGSTOP (whose disposition can never
+    /// change), plus SIGTSTP/SIGTTIN/SIGTTOU while at `SIG_DFL`.
+    fn dfl_stop_mask(&self) -> u64 {
+        let mut mask = 1u64 << (SIGSTOP - 1);
+        for signo in [20u32, 21, 22] {
+            // SIGTSTP, SIGTTIN, SIGTTOU
+            if self.table[signo as usize - 1].handler == SIG_DFL {
+                mask |= 1u64 << (signo - 1);
+            }
+        }
+        mask
+    }
+
+    /// Push the guest's blocked mask onto the host thread, for run-loop entry.
+    pub fn mirror_host_mask(&self) {
+        mirror_host_blocked(self.blocked);
+    }
+
     /// Service guest `rt_sigaction`. Records the new disposition, returns the old
     /// one through `oldact`, and mirrors the host disposition.
     pub fn sigaction(&mut self, signo: u64, act: u64, oldact: u64) -> SyscallResult {
@@ -621,27 +792,26 @@ impl Signals {
         }
         if set != 0 {
             let s = unsafe { (set as *const u64).read_unaligned() };
-            match how {
-                libc::SIG_BLOCK => self.blocked |= s,
-                libc::SIG_UNBLOCK => self.blocked &= !s,
-                libc::SIG_SETMASK => self.blocked = s,
+            let new = match how {
+                libc::SIG_BLOCK => self.blocked | s,
+                libc::SIG_UNBLOCK => self.blocked & !s,
+                libc::SIG_SETMASK => s,
                 _ => return SyscallResult::Error(libc::EINVAL),
-            }
-            // SIGKILL and SIGSTOP can never be blocked.
-            self.blocked &= !((1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1)));
+            };
+            self.set_blocked(new);
         }
         SyscallResult::Ok(0)
     }
 
-    /// Service guest `rt_sigpending`: report the emulated pending set. The host
-    /// kernel never sees the guest's pending signals (the catcher clears them
-    /// into `PENDING`), so this must be answered from Chimera's own state.
+    /// Service guest `rt_sigpending`: the union of Chimera's recorded pending
+    /// set and the host's (see [`host_pending_snapshot`]).
     pub fn sigpending(&self, set: u64, sigsetsize: u64) -> SyscallResult {
         if sigsetsize as usize != mem::size_of::<u64>() {
             return SyscallResult::Error(libc::EINVAL);
         }
         if set != 0 {
-            unsafe { (set as *mut u64).write_unaligned(pending_snapshot()) };
+            let pending = pending_snapshot() | host_pending_snapshot();
+            unsafe { (set as *mut u64).write_unaligned(pending) };
         }
         SyscallResult::Ok(0)
     }
@@ -661,11 +831,9 @@ impl Signals {
         } else {
             0
         };
-        // SIGKILL and SIGSTOP can never be blocked.
-        let temp = temp & !((1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1)));
         self.saved_mask = Some(self.blocked);
-        self.blocked = temp;
-        wait_for_signal(temp);
+        self.set_blocked(temp);
+        wait_for_signal(self.blocked);
         SyscallResult::Error(libc::EINTR)
     }
 
@@ -701,7 +869,13 @@ impl Signals {
             None
         };
 
-        match wait_for_set(want, self.blocked, deadline) {
+        match wait_for_set(
+            want,
+            self.blocked,
+            self.discarded_mask(),
+            self.dfl_stop_mask(),
+            deadline,
+        ) {
             WaitResult::Got(signo) => {
                 if info != 0 {
                     let mut si: SigInfo = unsafe { mem::zeroed() };
@@ -871,10 +1045,11 @@ impl Signals {
         let uc_ptr = unsafe { ptr::addr_of!((*frame).uc) } as u64;
 
         // Block sa_mask (and this signal, unless SA_NODEFER) for the handler.
-        self.blocked |= act.mask;
+        let mut handler_mask = self.blocked | act.mask;
         if act.flags & libc::SA_NODEFER as u64 == 0 {
-            self.blocked |= 1u64 << (signo - 1);
+            handler_mask |= 1u64 << (signo - 1);
         }
+        self.set_blocked(handler_mask);
 
         // Enter the handler: rdi=signo, rsi=&siginfo, rdx=&ucontext.
         state.regs[RDI] = signo as u64;
@@ -925,6 +1100,49 @@ impl Signals {
                 );
             }
         }
-        self.blocked = f.uc.uc_sigmask[0];
+        self.set_blocked(f.uc.uc_sigmask[0]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The current host thread mask as a sigset bitmask.
+    fn current_host_mask() -> u64 {
+        unsafe {
+            let mut s: libc::sigset_t = mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_SETMASK, ptr::null(), &mut s);
+            sigset_mask(&s)
+        }
+    }
+
+    #[test]
+    fn sigset_mask_roundtrips_host_sigset() {
+        let mask = (1u64 << (libc::SIGUSR1 - 1)) | (1u64 << (42 - 1)) | (1u64 << (NSIG - 1));
+        assert_eq!(sigset_mask(&host_sigset(mask)), mask);
+    }
+
+    #[test]
+    fn host_mask_guard_restores_caller_mask() {
+        let caller = 1u64 << (libc::SIGUSR2 - 1);
+        mirror_host_blocked(caller);
+        {
+            let _guard = HostMaskGuard::save();
+            mirror_host_blocked(1u64 << (libc::SIGHUP - 1));
+        }
+        assert_eq!(current_host_mask(), caller);
+        mirror_host_blocked(0);
+    }
+
+    #[test]
+    fn set_blocked_mirrors_guest_mask_onto_host() {
+        let guest = 1u64 << (libc::SIGUSR1 - 1);
+        let _guard = HostMaskGuard::save();
+        let mut signals = Signals::new();
+        signals.set_blocked(guest | (1u64 << (SIGKILL - 1)));
+        assert_eq!(current_host_mask(), guest);
+        signals.set_blocked(0);
+        assert_eq!(current_host_mask(), 0);
     }
 }

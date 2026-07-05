@@ -14,7 +14,10 @@ use crate::{
     sys::mmap::AddressSpace,
 };
 
-use super::elf::{LoadedElf, PAGE_SIZE, ParsedElf, load_elf, map_elf, parse_elf};
+use super::{
+    elf::{LoadedElf, PAGE_SIZE, ParsedElf, load_elf, map_elf, parse_elf},
+    signal::HostMaskGuard,
+};
 
 const STACK_SIZE: usize = 8 * 1024 * 1024;
 
@@ -59,6 +62,7 @@ pub fn execv(
     )?;
 
     let mut thread = dispatch::Thread::new(rip, rsp, code_cache_size)?;
+    let _host_mask = HostMaskGuard::save();
     record_regions(
         thread.addr_space(),
         &main,
