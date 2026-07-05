@@ -22,6 +22,10 @@ pub enum Command {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "run")]
 pub struct RunCmd {
+    /// translated-code cache capacity in MiB (default 256)
+    #[argh(option)]
+    pub code_cache_size: Option<usize>,
+
     /// path to the program
     #[argh(positional)]
     pub program: PathBuf,

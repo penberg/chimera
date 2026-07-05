@@ -27,6 +27,7 @@ pub fn execv(
     args: &[OsString],
     envs: Option<&[(OsString, OsString)]>,
     mut handler: Box<dyn SystemCalls>,
+    code_cache_size: usize,
 ) -> Result<i32, Error> {
     // The first image's argv and envp come from the embedder: argv[0] is the
     // program path, then the supplied args; the environment is the explicit set
@@ -57,7 +58,7 @@ pub fn execv(
         interp_base,
     )?;
 
-    let mut thread = dispatch::Thread::new(rip, rsp)?;
+    let mut thread = dispatch::Thread::new(rip, rsp, code_cache_size)?;
     record_regions(
         thread.addr_space(),
         &main,

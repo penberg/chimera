@@ -40,6 +40,9 @@ fn run(cmd: RunCmd) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(mib) = cmd.code_cache_size {
+        sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
+    }
     match sandbox.args(cmd.args).run() {
         Ok(status) => ExitCode::from(status.code() as u8),
         Err(err) => {

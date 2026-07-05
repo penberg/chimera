@@ -69,8 +69,9 @@ pub struct Thread {
 }
 
 impl Thread {
-    /// Create a new guest thread.
-    pub fn new(rip: u64, rsp: u64) -> Result<Self, Error> {
+    /// Create a new guest thread whose address space carries a
+    /// `code_cache_size`-byte translated-code cache.
+    pub fn new(rip: u64, rsp: u64, code_cache_size: usize) -> Result<Self, Error> {
         let guest_fs_base = current_fs_base();
         let mut thread = Self {
             state: Box::new(ThreadState {
@@ -92,7 +93,7 @@ impl Thread {
                 _align_fpstate: [0; 5],
                 fpstate: [0; XSAVE_AREA_SIZE],
             }),
-            addr_space: AddressSpace::new()?,
+            addr_space: AddressSpace::new(code_cache_size)?,
             signals: Signals::new(),
             running: false,
             exit_code: 0,

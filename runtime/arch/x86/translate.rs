@@ -14,7 +14,6 @@ use crate::Error;
 
 use super::dispatch::ThreadState;
 
-const CACHE_SIZE: usize = 16 * 1024 * 1024;
 const MAX_BLOCK_GUEST_BYTES: usize = 4096;
 
 /// Inline indirect-branch lookup table: a direct-mapped, guest-readable mirror
@@ -62,11 +61,22 @@ pub struct CodeCache {
 }
 
 impl CodeCache {
-    pub fn new() -> Result<Self, Error> {
+    /// Create a code cache backed by a `size`-byte RWX region. The region is
+    /// `mmap`'d lazily, so unused capacity costs virtual address space, not
+    /// resident memory. `size` must stay under 2 GiB so every intra-cache
+    /// `rel32` branch displacement fits in an `i32` (see `patch_site` in the
+    /// block cache); [`Sandbox::run`](crate::Sandbox::run) rejects an
+    /// out-of-range size before any guest state exists, so by the time a
+    /// cache is built the bound is an invariant.
+    pub fn new(size: usize) -> Result<Self, Error> {
+        assert!(
+            size > 0 && size <= crate::MAX_CODE_CACHE_SIZE,
+            "code cache size {size} out of range"
+        );
         let p = unsafe {
             libc::mmap(
                 ptr::null_mut(),
-                CACHE_SIZE,
+                size,
                 libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -88,12 +98,12 @@ impl CodeCache {
         };
         if t == libc::MAP_FAILED {
             let err = Error::last_os_error("ib table mmap");
-            unsafe { libc::munmap(p, CACHE_SIZE) };
+            unsafe { libc::munmap(p, size) };
             return Err(err);
         }
         let cache = Self {
             base: p as *mut u8,
-            size: CACHE_SIZE,
+            size,
             used: 0,
             ib_table: t as *mut u8,
             ib_lookup: None,
