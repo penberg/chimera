@@ -133,7 +133,10 @@ pub enum SyscallResult {
 
 mod host {
     use super::{SyscallResult, SystemCall, SystemCalls, host_syscall};
-    use crate::arch::dispatch::{Thread, read_clone3_args};
+    use crate::{
+        arch::dispatch::{Thread, read_clone3_args},
+        sys::linux::exec::{exec_errno, prepare_exec},
+    };
 
     /// Drive one guest syscall. Runtime-owned syscalls are serviced inline
     /// here, the way a kernel's syscall table services its own; delegated
@@ -300,11 +303,39 @@ mod host {
                 // Intercepted, never forwarded to the host kernel: forwarding would
                 // have the host replace Chimera's whole process image — runtime,
                 // code cache, and translation map included — with an untranslated
-                // program running natively, outside the sandbox. The dispatch loop
-                // tears down the old image and re-enters the translator on the new
-                // one (see `crate::sys::linux::exec`); report success so observers
-                // see the allowed call.
-                call.set_result(SyscallResult::Ok(0));
+                // program running natively, outside the sandbox.
+                //
+                // The replacement image is validated here, in the calling thread,
+                // the way the kernel sequences an exec: a failure reports `-errno`
+                // to the caller and disturbs no sibling. Only a loadable image
+                // commits the exec — publishing it on the shared process stops
+                // every thread (Linux's `de_thread` kills the siblings before a
+                // new image is installed, whichever thread called exec), and the
+                // main host thread waits out the stragglers, tears down the old
+                // image, and enters the new one (see `crate::sys::linux::exec`).
+                match prepare_exec(call.number, &call.args) {
+                    Ok(prepared) => {
+                        let self_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+                        // First committer wins. A refused commit means a
+                        // sibling's exec (or an exit_group) is already
+                        // dissolving this group, this thread with it — the
+                        // kernel's loser is killed by the winner's de_thread
+                        // and never observes a return value, and neither does
+                        // this one: the pending stop takes the thread at its
+                        // next boundary, before the guest could read rax.
+                        thread.process().request_exec(prepared, self_tid);
+                        // Report success so observers see the allowed call; the
+                        // guest never reads it — a successful execve does not
+                        // return.
+                        call.set_result(SyscallResult::Ok(0));
+                    }
+                    // `prepare_exec` only parses, so every failure carries an
+                    // errno (`EIO` is an unreachable fallback).
+                    Err(err) => {
+                        let errno = exec_errno(&err).unwrap_or(libc::EIO);
+                        call.set_result(SyscallResult::Error(errno));
+                    }
+                }
             }
             // A `clone` that creates a new thread of this process — the
             // `CLONE_THREAD` shape, which the kernel requires to carry

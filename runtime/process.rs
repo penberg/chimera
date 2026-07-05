@@ -13,7 +13,10 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
 
-use crate::{Error, SystemCalls, sys::mmap::AddressSpace};
+use crate::{
+    Error, SystemCalls,
+    sys::{linux::exec::PreparedExec, mmap::AddressSpace},
+};
 
 /// Host signal Chimera reserves to interrupt a guest thread parked in a
 /// forwarded syscall (so it returns `EINTR` and re-checks the exit flag). The
@@ -77,10 +80,11 @@ pub struct Process {
     /// final code.
     pub exit_code: AtomicI32,
     /// The threads currently running a guest. Each thread adds itself when its
-    /// run loop starts and removes itself when it ends, so `exit_group` can
-    /// reach every sibling — armed safepoint slot for one executing translated
-    /// code, interrupt signal for one parked in a host syscall — and the main
-    /// thread can wait for the others to finish.
+    /// run loop starts and removes itself when it ends, so a process-wide stop
+    /// (`exit_group`, a committed `execve`) can reach every sibling — armed
+    /// safepoint slot for one executing translated code, interrupt signal for
+    /// one parked in a host syscall — and the main thread can wait for the
+    /// others to finish.
     live_threads: Mutex<Vec<LiveThread>>,
     /// Signalled whenever `live_threads` shrinks or a process-wide exit is
     /// requested, so a main thread parked in [`Process::wait_for_others`] wakes.
@@ -91,6 +95,16 @@ pub struct Process {
     /// is — so every run loop records its status here on the way out and a main
     /// thread that outwaits its siblings adopts the final value.
     last_exit_status: AtomicI32,
+    /// Set when a thread commits an `execve`: the parsed replacement image is
+    /// waiting in `exec_request` and the thread group is dissolving. Every run
+    /// loop observes this at its next boundary and stops, mirroring Linux's
+    /// `de_thread`, which kills every other thread before installing a new
+    /// image. See [`Process::request_exec`].
+    execing: AtomicBool,
+    /// The committed replacement image, published by whichever thread's
+    /// `execve` validated it and consumed by the exec driver on the main host
+    /// thread once the group has drained. Written before `execing` is set.
+    exec_request: Mutex<Option<PreparedExec>>,
 }
 
 impl Process {
@@ -104,6 +118,8 @@ impl Process {
             live_threads: Mutex::new(Vec::new()),
             exit_cv: Condvar::new(),
             last_exit_status: AtomicI32::new(0),
+            execing: AtomicBool::new(false),
+            exec_request: Mutex::new(None),
         })
     }
 
@@ -151,6 +167,12 @@ impl Process {
             if self.is_exiting() {
                 return self.exit_code.load(Ordering::Relaxed);
             }
+            // A sibling committed an execve while this thread waited: the
+            // returned status is moot — the caller re-checks `exec_pending`
+            // and hands the run over to the exec driver instead of exiting.
+            if self.exec_pending() {
+                return self.last_exit_status.load(Ordering::Relaxed);
+            }
             if threads.iter().all(|t| t.tid == self_tid) {
                 return self.last_exit_status.load(Ordering::Relaxed);
             }
@@ -168,6 +190,72 @@ impl Process {
     pub fn request_exit_group(&self, code: i32, self_tid: i32) {
         self.exit_code.store(code, Ordering::Relaxed);
         self.exiting.store(true, Ordering::Release);
+        self.interrupt_others(self_tid);
+    }
+
+    /// Publish a committed `execve`: the calling thread validated and parsed
+    /// the replacement image (a failed one never gets here — the caller took
+    /// `-errno` and no sibling was disturbed), so the thread group now
+    /// dissolves, the way Linux's `de_thread` kills every sibling before a new
+    /// image is installed. Every run loop observes the pending exec at its
+    /// next boundary and stops; the main host thread then waits out the
+    /// stragglers and installs the image (see `crate::sys::linux::exec`).
+    ///
+    /// First committer wins: returns false — publishing nothing — when the
+    /// group is already dissolving, under an earlier committed exec or an
+    /// `exit_group`. Concurrent execs race natively too, but only one
+    /// survives; the loser is killed by the winner's `de_thread` and never
+    /// observes a return value. A refused caller needs to do nothing: the
+    /// stop already pending takes its thread at the next boundary, exactly
+    /// like any other sibling.
+    pub fn request_exec(&self, prepared: PreparedExec, self_tid: i32) -> bool {
+        let mut request = self.exec_request.lock().unwrap();
+        if request.is_some() || self.exec_pending() || self.is_exiting() {
+            return false;
+        }
+        *request = Some(prepared);
+        self.execing.store(true, Ordering::Release);
+        drop(request);
+        self.interrupt_others(self_tid);
+        true
+    }
+
+    /// Whether a committed `execve` is waiting to be installed; every run loop
+    /// treats it as a stop request, like [`Process::is_exiting`].
+    pub fn exec_pending(&self) -> bool {
+        self.execing.load(Ordering::Acquire)
+    }
+
+    /// Take the pending replacement image for installation and clear the
+    /// request, so the new image starts with no exec state. Called by the exec
+    /// driver once the group has drained.
+    pub fn take_exec_request(&self) -> Option<PreparedExec> {
+        let prepared = self.exec_request.lock().unwrap().take();
+        self.execing.store(false, Ordering::Release);
+        prepared
+    }
+
+    /// Block until every guest thread has left the live set, so tearing down
+    /// the old image cannot pull mappings out from under a straggler still
+    /// translating or executing old blocks. The caller runs outside any run
+    /// loop (the main host thread, after its own run returned), so "empty"
+    /// means the whole group is gone.
+    pub fn wait_exec_quiesce(&self) {
+        let mut threads = self.live_threads.lock().unwrap();
+        while !threads.is_empty() {
+            threads = self.exit_cv.wait(threads).unwrap();
+        }
+    }
+
+    /// Force every live thread except `self_tid` to its run-loop boundary,
+    /// where the pending process-wide stop (an `exit_group`, a committed
+    /// `execve`) is observed. Two mechanisms, one per way a sibling can be
+    /// away from its boundary: arming the thread's `exit_requested` safepoint
+    /// slot pops one executing fully linked translated code out of the cache
+    /// (the back-edge and IB-hit polls read it), and [`interrupt_signal`]
+    /// makes one parked in a blocking host syscall return `EINTR`. Also wakes
+    /// a main thread parked in [`Process::wait_for_others`].
+    fn interrupt_others(&self, self_tid: i32) {
         let pid = unsafe { libc::getpid() };
         let sig = interrupt_signal();
         let threads = self.live_threads.lock().unwrap();
@@ -180,7 +268,6 @@ impl Process {
                 unsafe { libc::syscall(libc::SYS_tgkill, pid, t.tid, sig) };
             }
         }
-        // Wake a main thread parked in `wait_for_others` so it observes the exit.
         self.exit_cv.notify_all();
     }
 

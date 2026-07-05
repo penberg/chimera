@@ -80,24 +80,25 @@ pub fn execv(
     loop {
         match thread.run()? {
             ExitReason::Exited(code) => return Ok(code),
-            ExitReason::Execve { number, args } => {
-                // Parse the replacement image while the old one is still live.
-                // Failures here must report `-errno` to the guest and resume
-                // the original image, just like Linux `execve`.
+            ExitReason::Execve => {
+                // A committed execve: the calling thread — main or a clone
+                // sibling — already validated and parsed the image and
+                // published it on the shared process (a failed one took
+                // `-errno` in place and never left the run). Linux's
+                // `de_thread` kills every other thread before installing a
+                // new image; the commit requested that stop, so wait until
+                // the last sibling has drained out of the live set before
+                // tearing down mappings a straggler could still be
+                // translating or executing.
+                thread.process().wait_exec_quiesce();
                 let PreparedExec {
                     req,
                     parsed,
                     parsed_interp,
-                } = match prepare_exec(number, &args) {
-                    Ok(prepared) => prepared,
-                    Err(err) => {
-                        if let Some(errno) = exec_errno(&err) {
-                            thread.state.regs[dispatch::RAX] = (-(errno as i64)) as u64;
-                            continue;
-                        }
-                        return Err(err);
-                    }
-                };
+                } = thread
+                    .process()
+                    .take_exec_request()
+                    .expect("an Execve exit reason always has a published image");
 
                 // Tear down the old image (unmapping its regions, so a fixed
                 // ET_EXEC can reuse its addresses), then map the new one.
@@ -133,13 +134,22 @@ pub fn execv(
     }
 }
 
-struct PreparedExec {
+/// A validated, parsed `execve` replacement image: everything needed to
+/// install it without touching the requesting thread again. Owned data
+/// throughout, so it can be published on the shared `Process` by whichever
+/// thread's `execve` committed and consumed later on the main host thread.
+pub struct PreparedExec {
     req: ExecRequest,
     parsed: ParsedElf,
     parsed_interp: Option<ParsedElf>,
 }
 
-fn prepare_exec(number: u64, args: &[u64; 6]) -> Result<PreparedExec, Error> {
+/// Read an `execve`/`execveat` request out of guest memory and parse the
+/// named image and its interpreter, without mapping anything. Runs in the
+/// calling thread, the way the kernel sequences an exec: an error here means
+/// the caller takes `-errno` (see [`exec_errno`]) and resumes, with no other
+/// thread disturbed.
+pub fn prepare_exec(number: u64, args: &[u64; 6]) -> Result<PreparedExec, Error> {
     let req = read_request(number, args);
     let parsed = parse_elf(&req.path)?;
     let parsed_interp = match &parsed.interp {
@@ -153,7 +163,9 @@ fn prepare_exec(number: u64, args: &[u64; 6]) -> Result<PreparedExec, Error> {
     })
 }
 
-fn exec_errno(err: &Error) -> Option<i32> {
+/// The errno a failed [`prepare_exec`] reports to the guest. `None` for
+/// runtime-fatal errors that are not a guest-visible exec failure.
+pub fn exec_errno(err: &Error) -> Option<i32> {
     match err {
         Error::Io { source, .. } => Some(source.raw_os_error().unwrap_or(libc::EIO)),
         Error::BadBinary(_) | Error::Link(_) | Error::Unsupported(_) => Some(libc::ENOEXEC),

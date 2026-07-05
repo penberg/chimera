@@ -42,10 +42,11 @@ pub const EXIT_KIND_SYSCALL: u64 = 1;
 pub enum ExitReason {
     /// The guest issued `exit`/`exit_group`. Carries the exit code.
     Exited(i32),
-    /// The guest issued an `execve`/`execveat` the handler allowed. `number`
-    /// distinguishes the two; `args` are the raw guest syscall arguments
-    /// (pathname, argv, and envp pointers among them).
-    Execve { number: u64, args: [u64; 6] },
+    /// A guest thread committed an `execve`/`execveat`: the validated, parsed
+    /// replacement image is published on the shared [`Process`], and the
+    /// caller must wait out the dissolving thread group, then install the
+    /// image and re-enter the run (see `crate::sys::linux::exec`).
+    Execve,
 }
 
 /// Size of the XSAVE area in [`ThreadState::fpstate`]. The standard (non-
@@ -427,6 +428,14 @@ impl Thread {
                 self.exit_code = self.process.exit_code.load(Ordering::Relaxed);
                 break;
             }
+            // A sibling committed an `execve`: the thread group is dissolving,
+            // the way Linux's `de_thread` kills every other thread before a
+            // new image is installed. Stop at this boundary — a worker's stop
+            // ends its host thread; the main thread hands the run over to the
+            // exec driver below.
+            if self.process.exec_pending() {
+                break;
+            }
 
             let ts_ptr: *mut ThreadState = &mut *self.state;
 
@@ -456,14 +465,28 @@ impl Thread {
         // thread to exit as the process's `wait(2)` status, so every thread
         // records its own on the way out — while it is still in the live set.
         self.process.record_exit_status(self.exit_code);
-        // The main thread's run returning ends the process. If it exited on its
-        // own (`pthread_exit` / thread-local `exit` / raw `SYS_exit`) rather
-        // than via a process-wide `exit_group`, POSIX keeps the process alive
-        // until the last thread finishes — so wait for the siblings and adopt
-        // the final status: the last exiter's (this thread's own, just
-        // recorded, if no sibling outlives it), or an `exit_group`'s code.
-        if self.is_main && !self.process.is_exiting() {
-            self.exit_code = self.process.wait_for_others(my_tid);
+        if self.is_main {
+            // A committed execve dissolves the group instead of ending the
+            // process: hand the run to the exec driver, which waits out the
+            // last sibling and installs the published image.
+            if self.process.exec_pending() {
+                return Ok(ExitReason::Execve);
+            }
+            // The main thread's run returning ends the process. If it exited
+            // on its own (`pthread_exit` / thread-local `exit` / raw
+            // `SYS_exit`) rather than via a process-wide `exit_group`, POSIX
+            // keeps the process alive until the last thread finishes — so wait
+            // for the siblings and adopt the final status: the last exiter's
+            // (this thread's own, just recorded, if no sibling outlives it),
+            // or an `exit_group`'s code. A sibling may also commit an execve
+            // while this thread waits; the group then dissolves into the new
+            // image rather than exiting.
+            if !self.process.is_exiting() {
+                self.exit_code = self.process.wait_for_others(my_tid);
+                if self.process.exec_pending() {
+                    return Ok(ExitReason::Execve);
+                }
+            }
         }
         Ok(ExitReason::Exited(self.exit_code))
     }
@@ -502,8 +525,19 @@ impl Thread {
             None
         };
 
-        if number == libc::SYS_execve as u64 || number == libc::SYS_execveat as u64 {
-            return Some(ExitReason::Execve { number, args });
+        if (number == libc::SYS_execve as u64 || number == libc::SYS_execveat as u64)
+            && self.process.exec_pending()
+        {
+            // Only a committed exec leaves the run — a failed one already
+            // wrote `-errno` into rax above and the guest just resumes. The
+            // calling thread's own stop mirrors `de_thread`: a worker
+            // dissolves (its image request is already published, and the main
+            // thread picks it up at its next boundary), while the main thread
+            // returns to the exec driver to install the new image itself.
+            if self.is_main {
+                return Some(ExitReason::Execve);
+            }
+            self.running = false;
         }
         None
     }
