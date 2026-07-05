@@ -227,6 +227,7 @@ pub fn exec_errno(err: &Error) -> Option<i32> {
     match err {
         Error::Io { source, .. } => Some(source.raw_os_error().unwrap_or(libc::EIO)),
         Error::BadBinary(_) | Error::Link(_) | Error::Unsupported(_) => Some(libc::ENOEXEC),
+        Error::BadAccess(_) => Some(libc::EFAULT),
         Error::CodeCacheExhausted | Error::Translate(_) => None,
     }
 }

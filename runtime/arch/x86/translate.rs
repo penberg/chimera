@@ -10,11 +10,11 @@ use std::{
 };
 
 use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, FlowControl, Instruction,
-    InstructionBlock, MemoryOperand, OpKind, Register,
+    BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderError, DecoderOptions, FlowControl,
+    Instruction, InstructionBlock, MemoryOperand, OpKind, Register,
 };
 
-use crate::Error;
+use crate::{Error, sys::mmap::copy_from_guest};
 
 use super::dispatch::ThreadState;
 
@@ -454,6 +454,22 @@ pub struct Translation {
     pub edges: Vec<OutEdge>,
 }
 
+/// Copy up to one decode window of guest bytes at `guest_pc` into `buf`,
+/// without trusting the address ([`copy_from_guest`]). Returns how many bytes
+/// are readable: the whole window, its prefix up to the page boundary when the
+/// window straddles into an unmapped page, or 0 when `guest_pc` itself is
+/// unreadable. The window is one page long, so it crosses at most one boundary.
+fn read_guest_window(guest_pc: u64, buf: &mut [u8]) -> usize {
+    if copy_from_guest(guest_pc, buf) {
+        return buf.len();
+    }
+    let prefix = (buf.len() - (guest_pc as usize & (buf.len() - 1))) % buf.len();
+    if prefix != 0 && copy_from_guest(guest_pc, &mut buf[..prefix]) {
+        return prefix;
+    }
+    0
+}
+
 /// Translate one basic block starting at `guest_pc`. Returns the host PC at
 /// which the translated block begins, together with the block's statically
 /// known outgoing edges (empty for blocks ending in an indirect branch,
@@ -466,12 +482,22 @@ pub fn translate(
     trap_tramp: u64,
 ) -> Result<Translation, Error> {
     let host_pc = cache.next_pc();
-    let guest_bytes =
-        unsafe { std::slice::from_raw_parts(guest_pc as *const u8, MAX_BLOCK_GUEST_BYTES) };
+    // Read the decode window through a guarded copy rather than dereferencing
+    // the guest PC: a wild guest jump (through a corrupted function pointer,
+    // say) lands here with an arbitrary address, and a raw read would take the
+    // fault in Chimera. An unreadable PC is the guest's fault to receive — the
+    // run loop raises SIGSEGV at it — and a window cut short by the end of a
+    // mapping decodes only its readable prefix.
+    let mut window = [0u8; MAX_BLOCK_GUEST_BYTES];
+    let avail = read_guest_window(guest_pc, &mut window);
+    if avail == 0 {
+        return Err(Error::BadAccess(guest_pc));
+    }
+    let guest_bytes = &window[..avail];
     let mut decoder = Decoder::with_ip(64, guest_bytes, guest_pc, DecoderOptions::NONE);
     let mut instrs = Vec::new();
     let mut instr = Instruction::default();
-    let window_end = guest_pc.wrapping_add(MAX_BLOCK_GUEST_BYTES as u64);
+    let window_end = guest_pc.wrapping_add(avail as u64);
 
     // Guest PC one past the block's last decoded byte: the terminator's end, or
     // the split point when an over-long block is cut short. Used to record which
@@ -488,7 +514,11 @@ pub fn translate(
         // from a fresh window. Forward progress is guaranteed because the first
         // instruction always starts `MAX_INSTR_LEN` short of the window end.
         let next_pc = decoder.ip();
-        if next_pc.wrapping_add(MAX_INSTR_LEN) > window_end {
+        // The `next_pc != guest_pc` guard keeps a window shorter than one
+        // instruction (its readable prefix ends within `MAX_INSTR_LEN` of the
+        // block start) from splitting into a jump-to-self: the first
+        // instruction always decodes from whatever bytes are readable instead.
+        if next_pc != guest_pc && next_pc.wrapping_add(MAX_INSTR_LEN) > window_end {
             guest_end = next_pc;
             break mkinstr(Instruction::with_branch(Code::Jmp_rel32_64, next_pc))?;
         }
@@ -499,6 +529,12 @@ pub fn translate(
             )));
         }
         decoder.decode_out(&mut instr);
+        // An instruction cut off by the end of the readable window: its
+        // remaining bytes are unmapped, so executing it faults there. Only the
+        // block's first instruction can get here — later ones split above.
+        if instr.is_invalid() && decoder.last_error() == DecoderError::NoMoreBytes {
+            return Err(Error::BadAccess(window_end));
+        }
         if matches!(instr.flow_control(), FlowControl::Next) {
             instrs.push(instr);
             continue;

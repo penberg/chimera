@@ -42,6 +42,9 @@ pub const EXIT_KIND_TRAP: u64 = 2;
 /// `SIGTRAP`, raised on a guest `int3`.
 const SIGTRAP: u32 = 5;
 
+/// `SIGSEGV`, raised on a guest jump to unmapped memory (a fetch fault).
+const SIGSEGV: u32 = 11;
+
 /// Why [`Thread::run`] returned: the guest terminated, or it `execve`d and the
 /// caller must load the new image and re-enter the thread on it.
 pub enum ExitReason {
@@ -536,13 +539,25 @@ impl Thread {
             // Hold the address-space lock only long enough to resolve (and, on a
             // miss, translate) the next block; the guard drops at the end of this
             // statement, before `dispatch()` runs the block.
-            let host_pc = self
-                .process
-                .addr_space
-                .lock()
-                .unwrap()
-                .resolve(rip, block_exit, syscall_exit, trap_exit)
-                .unwrap_or_else(|e| panic!("translate failed at {:#x}: {}", rip, e));
+            let host_pc = match self.process.addr_space.lock().unwrap().resolve(
+                rip,
+                block_exit,
+                syscall_exit,
+                trap_exit,
+            ) {
+                Ok(host_pc) => host_pc,
+                // The guest jumped to unmapped memory — a wild indirect branch
+                // through a corrupted pointer, say. Natively the fetch faults;
+                // raise the same SIGSEGV: it enters the guest's handler, or
+                // (default action) terminates the process faithfully.
+                Err(Error::BadAccess(_)) => {
+                    let restart = self.restart.take();
+                    let state = &mut *self.state;
+                    self.signals.deliver(state, SIGSEGV, restart);
+                    continue;
+                }
+                Err(e) => panic!("translate failed at {:#x}: {}", rip, e),
+            };
             unsafe {
                 (*ts_ptr).exit_kind = EXIT_KIND_BLOCK;
                 dispatch(ts_ptr, host_pc);
