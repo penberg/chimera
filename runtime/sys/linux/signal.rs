@@ -178,19 +178,6 @@ struct RtSigframe {
 /// real-time at the ABI Chimera operates on.
 const SIGRTMIN_KERNEL: u32 = 32;
 
-/// Process-wide set of signals the host catcher has seen but Chimera has not yet
-/// delivered to the guest. A set bit means "at least one instance pending". For
-/// real-time signals the depth is tracked in [`COUNTS`]; standard signals simply
-/// coalesce. Written by [`chimera_sigcatch`] (async-signal-safely, via atomic
-/// OR), drained by the dispatch loop.
-static PENDING: AtomicU64 = AtomicU64::new(0);
-
-/// Per-signal queue depth for real-time signals (indexed by `signo - 1`). Bumped
-/// by the catcher and decremented as each queued instance is delivered, so the
-/// `PENDING` bit for an RT signal stays set until its queue drains. Standard
-/// signals do not use this.
-static COUNTS: [AtomicU32; NSIG] = [const { AtomicU32::new(0) }; NSIG];
-
 /// Size of the kernel `siginfo_t` on x86-64.
 const SIGINFO_SIZE: usize = 128;
 
@@ -198,80 +185,234 @@ const _: () = assert!(mem::size_of::<SigInfo>() == SIGINFO_SIZE);
 
 /// A captured `siginfo_t`, used as a per-signal slot. For a standard signal the
 /// catcher writes it directly (coalesced, latest wins); for a real-time signal
-/// it is the staging slot that [`stage_rt_siginfo`] pops the next queued payload
-/// into just before delivery. Written by the catcher (a signal handler) or the
-/// drainer and read by the dispatch loop, so access is unsynchronized; the
-/// `memcpy` is async-signal-safe and a slot is only read after the write that
-/// filled it has completed.
+/// it is the staging slot that [`PendingSet::stage_rt`] pops the next queued
+/// payload into just before delivery. Written by the catcher (a signal handler)
+/// or the drainer and read by the dispatch loop, so access is unsynchronized;
+/// the `memcpy` is async-signal-safe and a slot is only read after the write
+/// that filled it has completed.
 struct SigInfoSlot(UnsafeCell<[u8; SIGINFO_SIZE]>);
 
 // SAFETY: writes happen only in the async-signal-safe catcher; reads only at a
 // dispatch-loop safe point after the corresponding catcher has completed.
 unsafe impl Sync for SigInfoSlot {}
 
-static SIGINFO: [SigInfoSlot; NSIG] =
-    [const { SigInfoSlot(UnsafeCell::new([0u8; SIGINFO_SIZE])) }; NSIG];
-
 /// Capacity of each real-time signal's `siginfo` ring. Beyond this many queued
 /// instances the oldest `siginfo` payloads are overwritten (the host's
 /// `RLIMIT_SIGPENDING` bounds real queue depth well below this in practice).
 const RT_RING_CAP: usize = 32;
 
-/// Per-real-time-signal FIFO ring of captured `siginfo_t`, so each queued
-/// instance keeps its own payload (e.g. a `sigqueue` value). `RT_HEAD` is the
-/// push index (advanced by the catcher), `RT_TAIL` the pop index (advanced as
-/// each instance is delivered); their difference mirrors [`COUNTS`].
-static RT_RING: [[SigInfoSlot; RT_RING_CAP]; NSIG] =
-    [const { [const { SigInfoSlot(UnsafeCell::new([0u8; SIGINFO_SIZE])) }; RT_RING_CAP] }; NSIG];
-static RT_HEAD: [AtomicU32; NSIG] = [const { AtomicU32::new(0) }; NSIG];
-static RT_TAIL: [AtomicU32; NSIG] = [const { AtomicU32::new(0) }; NSIG];
+/// Per-thread pending-signal state: the signals the host catcher has recorded
+/// on this thread but the dispatch loop has not yet delivered.
+///
+/// Pending state must be per-thread, not process-wide: a thread-directed
+/// signal (`tgkill`, and with the guest's blocked masks mirrored onto the host,
+/// any signal the kernel routed) belongs to the thread that caught it. With one
+/// shared set, whichever thread reached a delivery point first consumed
+/// everyone's signals — JavaScriptCore's SIGPWR thread-suspend/resume protocol
+/// deadlocked exactly that way: a sibling swallowed the resume while the
+/// suspended thread waited in `sigsuspend` holding the heap lock.
+///
+/// Each thread's set is owned (via `Arc`) by its [`Signals`]; a raw pointer to
+/// it is published in the gs-addressed `ThreadState` so the host catcher can
+/// reach the right set with no TLS, allocation, or locking.
+pub struct PendingSet {
+    /// One bit per signal: "at least one instance pending". For real-time
+    /// signals the depth is tracked in `counts`; standard signals coalesce.
+    bits: AtomicU64,
+    /// Per-signal queue depth for real-time signals (indexed by `signo - 1`).
+    counts: [AtomicU32; NSIG],
+    /// Per-signal captured/staged `siginfo_t`.
+    siginfo: [SigInfoSlot; NSIG],
+    /// Per-real-time-signal FIFO ring of captured `siginfo_t`, so each queued
+    /// instance keeps its own payload (e.g. a `sigqueue` value). `rt_head` is
+    /// the push index (advanced by the catcher), `rt_tail` the pop index
+    /// (advanced as each instance is delivered); their difference mirrors
+    /// `counts`.
+    rt_ring: [[SigInfoSlot; RT_RING_CAP]; NSIG],
+    rt_head: [AtomicU32; NSIG],
+    rt_tail: [AtomicU32; NSIG],
+}
 
-/// Record one instance of `signo` (with its captured `siginfo_t`) in the
-/// pending bookkeeping. Called from the host catcher, so it must stay
-/// async-signal-safe: only plain global atomics and a fixed-size `memcpy` — no
-/// TLS, no allocation, no locks, no panics. For a real-time signal the queue
-/// depth is bumped before the bit is marked, so a drainer that observes the
-/// bit set always sees a positive count.
-fn record_pending(signo: u32, info: *const libc::siginfo_t) {
-    let idx = signo as usize - 1;
-    if signo >= SIGRTMIN_KERNEL {
-        // Real-time: enqueue this instance's siginfo and bump the depth.
-        let slot = RT_HEAD[idx].fetch_add(1, Ordering::AcqRel) as usize % RT_RING_CAP;
-        if !info.is_null() {
+impl PendingSet {
+    fn new() -> Self {
+        Self {
+            bits: AtomicU64::new(0),
+            counts: [const { AtomicU32::new(0) }; NSIG],
+            siginfo: [const { SigInfoSlot(UnsafeCell::new([0u8; SIGINFO_SIZE])) }; NSIG],
+            rt_ring: [const {
+                [const { SigInfoSlot(UnsafeCell::new([0u8; SIGINFO_SIZE])) }; RT_RING_CAP]
+            }; NSIG],
+            rt_head: [const { AtomicU32::new(0) }; NSIG],
+            rt_tail: [const { AtomicU32::new(0) }; NSIG],
+        }
+    }
+
+    /// Record one instance of `signo` (with its captured `siginfo_t`): the
+    /// shared body of the host catcher and of the [`wait_for_set`] drain, which
+    /// dequeues signals the host kernel held pending while the guest had them
+    /// blocked. Async-signal-safe: only plain atomics and a fixed-size `memcpy`
+    /// — no TLS, no allocation, no locks, no panics. For a real-time signal the
+    /// queue depth is bumped before the bit is marked, so a drainer that
+    /// observes the bit set always sees a positive count.
+    fn record(&self, signo: u32, info: *const libc::siginfo_t) {
+        let idx = signo as usize - 1;
+        if signo >= SIGRTMIN_KERNEL {
+            // Real-time: enqueue this instance's siginfo and bump the depth.
+            let slot = self.rt_head[idx].fetch_add(1, Ordering::AcqRel) as usize % RT_RING_CAP;
+            if !info.is_null() {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        info as *const u8,
+                        self.rt_ring[idx][slot].0.get() as *mut u8,
+                        SIGINFO_SIZE,
+                    );
+                }
+            }
+            self.counts[idx].fetch_add(1, Ordering::AcqRel);
+        } else if !info.is_null() {
+            // Standard: coalesced, a single slot holds the latest siginfo.
             unsafe {
                 ptr::copy_nonoverlapping(
                     info as *const u8,
-                    RT_RING[idx][slot].0.get() as *mut u8,
+                    self.siginfo[idx].0.get() as *mut u8,
                     SIGINFO_SIZE,
                 );
             }
         }
-        COUNTS[idx].fetch_add(1, Ordering::AcqRel);
-    } else if !info.is_null() {
-        // Standard: coalesced, a single slot holds the latest siginfo.
+        self.bits
+            .fetch_or(1u64 << (signo as u64 - 1), Ordering::Release);
+    }
+
+    /// Pop the oldest queued `siginfo` for a real-time signal into its delivery
+    /// staging slot, so [`PendingSet::captured`] reads the right per-instance
+    /// payload. Balanced with the `counts` decrement in [`PendingSet::take`],
+    /// one pop per taken instance.
+    fn stage_rt(&self, idx: usize) {
+        let slot = self.rt_tail[idx].fetch_add(1, Ordering::AcqRel) as usize % RT_RING_CAP;
         unsafe {
             ptr::copy_nonoverlapping(
-                info as *const u8,
-                SIGINFO[idx].0.get() as *mut u8,
+                self.rt_ring[idx][slot].0.get() as *const u8,
+                self.siginfo[idx].0.get() as *mut u8,
                 SIGINFO_SIZE,
             );
         }
     }
-    PENDING.fetch_or(1u64 << (signo as u64 - 1), Ordering::Release);
+
+    /// Copy the captured `siginfo_t` for `signo` out of its slot.
+    fn captured(&self, signo: u32) -> SigInfo {
+        let mut si: SigInfo = unsafe { mem::zeroed() };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.siginfo[signo as usize - 1].0.get() as *const u8,
+                &mut si as *mut SigInfo as *mut u8,
+                SIGINFO_SIZE,
+            );
+        }
+        si
+    }
+
+    /// Snapshot the recorded-but-undelivered set as a sigset bitmask.
+    fn snapshot(&self) -> u64 {
+        self.bits.load(Ordering::Acquire)
+    }
+
+    /// Clear all pending state (a freshly forked child starts empty).
+    fn reset(&self) {
+        self.bits.store(0, Ordering::Release);
+        for i in 0..NSIG {
+            self.counts[i].store(0, Ordering::Release);
+            self.rt_head[i].store(0, Ordering::Release);
+            self.rt_tail[i].store(0, Ordering::Release);
+        }
+    }
+
+    /// Atomically remove and return the lowest-numbered pending signal within
+    /// the `allowed` set, or `None`. A standard signal clears its bit
+    /// (coalesced); a real-time signal consumes one queued instance and keeps
+    /// its bit set while more remain.
+    fn take(&self, allowed: u64) -> Option<u32> {
+        loop {
+            let cur = self.bits.load(Ordering::Acquire);
+            let avail = cur & allowed;
+            if avail == 0 {
+                return None;
+            }
+            let bit = avail & avail.wrapping_neg();
+            let signo = bit.trailing_zeros() + 1;
+
+            if signo >= SIGRTMIN_KERNEL {
+                let idx = signo as usize - 1;
+                let depth = self.counts[idx].load(Ordering::Acquire);
+                if depth == 0 {
+                    // Bit set with an empty queue (already drained elsewhere):
+                    // clear it and re-pick.
+                    self.bits.fetch_and(!bit, Ordering::AcqRel);
+                    continue;
+                }
+                if self.counts[idx]
+                    .compare_exchange_weak(depth, depth - 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                // We own one instance; stage its queued siginfo for delivery.
+                self.stage_rt(idx);
+                if depth == 1 {
+                    // Took the last queued instance; clear the bit, then re-arm
+                    // it if the catcher enqueued another in the meantime.
+                    self.bits.fetch_and(!bit, Ordering::AcqRel);
+                    if self.counts[idx].load(Ordering::Acquire) > 0 {
+                        self.bits.fetch_or(bit, Ordering::Release);
+                    }
+                }
+                return Some(signo);
+            }
+
+            // Standard signal: coalesced, clear the single bit.
+            let new = cur & !bit;
+            if self
+                .bits
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(signo);
+            }
+        }
+    }
 }
 
 /// Host signal catcher. Runs asynchronously on whatever context the host thread
 /// happened to be in (translated guest code or Chimera Rust), so it must be
-/// async-signal-safe: [`record_pending`] plus one `gs`-relative store. Installed
-/// with `SA_SIGINFO`, so it captures the kernel's `siginfo_t` for the guest
-/// handler.
+/// async-signal-safe: [`PendingSet::record`] plus `gs`-relative accesses.
+/// Installed with `SA_SIGINFO`, so it captures the kernel's `siginfo_t` for the
+/// guest handler.
+///
+/// The signal is recorded on the *catching* thread's own [`PendingSet`],
+/// reached through the gs-addressed `ThreadState`. The kernel already routed
+/// the signal correctly — a `tgkill` to its target thread, a process-directed
+/// signal to a thread with it unblocked (the guest's masks are mirrored onto
+/// the host) — so catching thread == owning thread, and only that thread's
+/// dispatch loop delivers it.
 extern "C" fn chimera_sigcatch(
     signo: libc::c_int,
     info: *const libc::siginfo_t,
     _uc: *mut libc::c_void,
 ) {
     if signo >= 1 && signo as usize <= NSIG {
-        record_pending(signo as u32, info);
+        // Temporary diagnostic: raw, alloc-free trace of every SIGPWR catch
+        // (Bun/JSC's thread-suspend/resume signal) with the catching tid.
+        let pending: *const PendingSet;
+        unsafe {
+            core::arch::asm!(
+                "mov {out}, qword ptr gs:[{off}]",
+                out = out(reg) pending,
+                off = const core::mem::offset_of!(ThreadState, pending_set),
+                options(nostack, preserves_flags, readonly),
+            );
+        }
+        if !pending.is_null() {
+            unsafe { (*pending).record(signo as u32, info) };
+        }
 
         // Drag the interrupted guest thread back to its run loop. Translated code
         // keeps the guest registers live across linked block chains and only
@@ -282,10 +423,7 @@ extern "C" fn chimera_sigcatch(
         // GS is this thread's `ThreadState` throughout guest execution (bound once
         // via `ARCH_SET_GS`, never changed — only FS is swapped), so a single
         // `gs:[]` store reaches the right context with no TLS, allocation, or
-        // locking, keeping the catcher async-signal-safe. This sets the flag on the
-        // interrupted thread's own context; cross-thread fan-out (signal caught on
-        // a thread other than the one that should deliver) is out of scope and
-        // needs per-context pending state. TODO: route by owning context.
+        // locking, keeping the catcher async-signal-safe.
         unsafe {
             core::arch::asm!(
                 "mov dword ptr gs:[{off}], 1",
@@ -294,115 +432,6 @@ extern "C" fn chimera_sigcatch(
             );
         }
     }
-}
-
-/// Pop the oldest queued `siginfo` for a real-time signal into its delivery
-/// staging slot, so [`captured_siginfo`] reads the right per-instance payload.
-/// Balanced with the `COUNTS` decrement in [`pending_take`], one pop per taken
-/// instance.
-fn stage_rt_siginfo(idx: usize) {
-    let slot = RT_TAIL[idx].fetch_add(1, Ordering::AcqRel) as usize % RT_RING_CAP;
-    unsafe {
-        ptr::copy_nonoverlapping(
-            RT_RING[idx][slot].0.get() as *const u8,
-            SIGINFO[idx].0.get() as *mut u8,
-            SIGINFO_SIZE,
-        );
-    }
-}
-
-/// Copy the captured `siginfo_t` for `signo` out of its slot.
-fn captured_siginfo(signo: u32) -> SigInfo {
-    let mut si: SigInfo = unsafe { mem::zeroed() };
-    unsafe {
-        ptr::copy_nonoverlapping(
-            SIGINFO[signo as usize - 1].0.get() as *const u8,
-            &mut si as *mut SigInfo as *mut u8,
-            SIGINFO_SIZE,
-        );
-    }
-    si
-}
-
-/// Snapshot the set of signals the host catcher has recorded as pending but the
-/// dispatch loop has not yet delivered, as a sigset bitmask. Unblocked pending
-/// signals are drained at each block boundary, so by the time the guest observes
-/// this (at a syscall) the remaining bits are the blocked-and-pending ones.
-pub fn pending_snapshot() -> u64 {
-    PENDING.load(Ordering::Acquire)
-}
-
-/// Clear the process-wide pending-signal state in a freshly forked child. POSIX
-/// requires a child to start with an empty pending set, but the host `fork`
-/// copied Chimera's pending bitmask, real-time queue depths, and ring indices
-/// from the parent, so the child must reset them. The disposition table and
-/// blocked mask are per-thread state, correctly inherited, and left untouched.
-pub fn reset_pending_after_fork() {
-    PENDING.store(0, Ordering::Release);
-    for i in 0..NSIG {
-        COUNTS[i].store(0, Ordering::Release);
-        RT_HEAD[i].store(0, Ordering::Release);
-        RT_TAIL[i].store(0, Ordering::Release);
-    }
-}
-
-/// Atomically remove and return the lowest-numbered pending signal within the
-/// `allowed` set, or `None`. A standard signal clears its bit (coalesced); a
-/// real-time signal consumes one queued instance and keeps its bit set while
-/// more remain.
-fn pending_take(allowed: u64) -> Option<u32> {
-    loop {
-        let cur = PENDING.load(Ordering::Acquire);
-        let avail = cur & allowed;
-        if avail == 0 {
-            return None;
-        }
-        let bit = avail & avail.wrapping_neg();
-        let signo = bit.trailing_zeros() + 1;
-
-        if signo >= SIGRTMIN_KERNEL {
-            let idx = signo as usize - 1;
-            let depth = COUNTS[idx].load(Ordering::Acquire);
-            if depth == 0 {
-                // Bit set with an empty queue (already drained elsewhere): clear
-                // it and re-pick.
-                PENDING.fetch_and(!bit, Ordering::AcqRel);
-                continue;
-            }
-            if COUNTS[idx]
-                .compare_exchange_weak(depth, depth - 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
-            }
-            // We own one instance; stage its queued siginfo for delivery.
-            stage_rt_siginfo(idx);
-            if depth == 1 {
-                // Took the last queued instance; clear the bit, then re-arm it if
-                // the catcher enqueued another in the meantime.
-                PENDING.fetch_and(!bit, Ordering::AcqRel);
-                if COUNTS[idx].load(Ordering::Acquire) > 0 {
-                    PENDING.fetch_or(bit, Ordering::Release);
-                }
-            }
-            return Some(signo);
-        }
-
-        // Standard signal: coalesced, clear the single bit.
-        let new = cur & !bit;
-        if PENDING
-            .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return Some(signo);
-        }
-    }
-}
-
-/// Atomically remove and return the lowest-numbered deliverable (pending and not
-/// `blocked`) signal, or `None`. Blocked signals stay pending.
-pub fn pending_take_one(blocked: u64) -> Option<u32> {
-    pending_take(!blocked)
 }
 
 /// Build a host `sigset_t` holding the signals set in the `mask` bitmask.
@@ -489,7 +518,7 @@ fn host_pending_snapshot() -> u64 {
 /// `sigsuspend` atomically unblocks the deliverable ones and waits, so a signal
 /// arriving in the window is not lost. Returns once such a signal is pending,
 /// leaving it in `PENDING` for the dispatch loop to deliver.
-fn wait_for_signal(blocked: u64) {
+fn wait_for_signal(pending: &PendingSet, blocked: u64) {
     unsafe {
         let mut all: libc::sigset_t = mem::zeroed();
         libc::sigfillset(&mut all);
@@ -498,7 +527,7 @@ fn wait_for_signal(blocked: u64) {
         // During the wait, keep the guest's blocked signals masked so only a
         // deliverable signal wakes us.
         let wait = host_sigset(blocked);
-        while pending_snapshot() & !blocked == 0 {
+        while pending.snapshot() & !blocked == 0 {
             libc::sigsuspend(&wait);
         }
         libc::pthread_sigmask(libc::SIG_SETMASK, &prev, ptr::null_mut());
@@ -529,15 +558,19 @@ enum WaitResult {
 /// elapses, or a deliverable signal outside `set` arrives. All host signals
 /// are blocked around the wait so the pending checks cannot race a late
 /// arrival; the wait itself is the host's own `sigtimedwait`, which dequeues a
-/// signal without running its disposition. A deliverable signal outside `set`
-/// is dequeued too and recorded for dispatch-loop delivery — except the
-/// `ignored` ones, which the kernel would discard at generation and so must
-/// not surface as an `EINTR`, and the default-`stops`, which are left
+/// signal without running its disposition — exactly the accept semantics — and
+/// sees both a signal the catcher has recorded on this thread and one the host
+/// kernel held pending while the guest had it blocked. A deliverable signal
+/// outside `set` is dequeued too and recorded for dispatch-loop delivery —
+/// except the `ignored` ones, which the kernel would discard at generation and
+/// so must not surface as an `EINTR`, and the default-`stops`, which are left
 /// unblocked for the host kernel to act on: the process stops, and once
 /// continued the wait reports `EINTR`. Inside `set` both are still accepted;
 /// Linux holds a blocked ignored signal pending precisely so a waiter can
-/// dequeue it.
+/// dequeue it. A zero `remaining` makes `sigtimedwait` a poll, so an
+/// already-pending signal is still accepted after the deadline.
 fn wait_for_set(
+    pending: &PendingSet,
     set: u64,
     blocked: u64,
     ignored: u64,
@@ -554,10 +587,10 @@ fn wait_for_set(
         let unblock = host_sigset(unblock_stops);
 
         let result = loop {
-            if let Some(signo) = pending_take(set) {
+            if let Some(signo) = pending.take(set) {
                 break WaitResult::Got(signo);
             }
-            if pending_snapshot() & !blocked & !set & !ignored != 0 {
+            if pending.snapshot() & !blocked & !set & !ignored != 0 {
                 break WaitResult::Interrupted;
             }
             let remaining = deadline.map(|d| {
@@ -581,7 +614,7 @@ fn wait_for_set(
                 libc::pthread_sigmask(libc::SIG_BLOCK, &unblock, ptr::null_mut());
             }
             if r > 0 {
-                record_pending(r as u32, &si);
+                pending.record(r as u32, &si);
             } else if interrupted {
                 // Everything but the unblocked stop signals is blocked, so an
                 // EINTR means the process was stopped and continued.
@@ -709,6 +742,11 @@ pub fn new_shared_table() -> SharedSigTable {
 /// stack, and the suspend-saved mask are per-thread, as POSIX requires.
 pub struct Signals {
     table: SharedSigTable,
+    /// This thread's pending-signal state, written by the host catcher (via
+    /// the raw pointer published in `ThreadState`) and drained by this
+    /// thread's dispatch loop. The `Arc` keeps the set alive for as long as
+    /// the thread can receive signals.
+    pending: Arc<PendingSet>,
     /// Currently blocked signal mask (emulated in software).
     pub blocked: u64,
     /// Alternate signal stack as `(ss_sp, ss_size, ss_flags)`, if set.
@@ -727,10 +765,37 @@ impl Signals {
     pub fn new(table: SharedSigTable) -> Self {
         Self {
             table,
+            pending: Arc::new(PendingSet::new()),
             blocked: 0,
             altstack: None,
             saved_mask: None,
         }
+    }
+
+    /// The address of this thread's [`PendingSet`], for publication in the
+    /// gs-addressed `ThreadState` so the host catcher can record signals on
+    /// the thread that caught them.
+    pub fn pending_set_ptr(&self) -> *const PendingSet {
+        Arc::as_ptr(&self.pending)
+    }
+
+    /// Snapshot this thread's recorded-but-undelivered signals.
+    pub fn pending_snapshot(&self) -> u64 {
+        self.pending.snapshot()
+    }
+
+    /// Atomically remove and return the lowest-numbered deliverable (pending
+    /// and not blocked) signal on this thread, or `None`.
+    pub fn pending_take_one(&self) -> Option<u32> {
+        self.pending.take(!self.blocked)
+    }
+
+    /// Clear the pending-signal state in a freshly forked child. POSIX requires
+    /// a child to start with an empty pending set, but the host `fork` copied
+    /// the parent's pending bitmask, real-time queue depths, and ring indices.
+    /// The disposition table and blocked mask are correctly inherited.
+    pub fn reset_pending_after_fork(&self) {
+        self.pending.reset();
     }
 
     /// Set the guest's blocked mask, stripping the unblockable signals. Every
@@ -834,7 +899,7 @@ impl Signals {
             return SyscallResult::Error(libc::EINVAL);
         }
         if set != 0 {
-            let pending = pending_snapshot() | host_pending_snapshot();
+            let pending = self.pending.snapshot() | host_pending_snapshot();
             unsafe { (set as *mut u64).write_unaligned(pending) };
         }
         SyscallResult::Ok(0)
@@ -857,7 +922,7 @@ impl Signals {
         };
         self.saved_mask = Some(self.blocked);
         self.set_blocked(temp);
-        wait_for_signal(self.blocked);
+        wait_for_signal(&self.pending, self.blocked);
         SyscallResult::Error(libc::EINTR)
     }
 
@@ -894,6 +959,7 @@ impl Signals {
         };
 
         match wait_for_set(
+            &self.pending,
             want,
             self.blocked,
             self.discarded_mask(),
@@ -1065,7 +1131,7 @@ impl Signals {
             mc.eflags = state.rflags;
             mc.fpstate = fpstate_ptr;
         }
-        f.info = captured_siginfo(signo);
+        f.info = self.pending.captured(signo);
         f.info.si_signo = signo as i32;
         unsafe { ptr::write(frame, f) };
 

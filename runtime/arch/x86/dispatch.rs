@@ -137,6 +137,7 @@ impl Thread {
                 exit_requested: AtomicU32::new(0),
                 _align_fpstate: [0; 5],
                 fpstate: [0; XSAVE_AREA_SIZE],
+                pending_set: 0,
             }),
             process,
             signals,
@@ -146,6 +147,7 @@ impl Thread {
             clear_child_tid: None,
             is_main: true,
         };
+        thread.state.pending_set = thread.signals.pending_set_ptr() as u64;
         thread.reset(rip, rsp, guest_fs_base);
         Ok(thread)
     }
@@ -159,10 +161,11 @@ impl Thread {
     /// `clear_child_tid` carries the `CLONE_CHILD_CLEARTID` word, if any.
     fn from_state(
         process: Arc<Process>,
-        state: Box<ThreadState>,
+        mut state: Box<ThreadState>,
         clear_child_tid: Option<u64>,
     ) -> Self {
         let signals = Signals::new(Arc::clone(&process.sig_table));
+        state.pending_set = signals.pending_set_ptr() as u64;
         Self {
             state,
             process,
@@ -380,7 +383,7 @@ impl Thread {
     /// boundary), building its frame and redirecting the guest to the handler.
     /// Entry into the handler then happens through the normal `dispatch` path.
     fn deliver_pending_signals(&mut self) {
-        if let Some(signo) = crate::sys::linux::signal::pending_take_one(self.signals.blocked) {
+        if let Some(signo) = self.signals.pending_take_one() {
             let restart = self.restart.take();
             let state = &mut *self.state;
             self.signals.deliver(state, signo, restart);
@@ -399,7 +402,7 @@ impl Thread {
     fn refresh_exit_requested(&mut self) {
         self.state.exit_requested.store(0, Ordering::Relaxed);
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
-        let deliverable = crate::sys::linux::signal::pending_snapshot() & !self.signals.blocked;
+        let deliverable = self.signals.pending_snapshot() & !self.signals.blocked;
         if deliverable != 0 {
             self.state.exit_requested.store(1, Ordering::Relaxed);
         }
@@ -713,6 +716,12 @@ pub struct ThreadState {
     /// AVX-512). Saved on every exit, restored on every entry. Must be
     /// 64-byte aligned; the field layout above guarantees offset 256.
     pub fpstate: [u8; XSAVE_AREA_SIZE],
+    /// Address of this thread's `PendingSet` (owned by its `Signals`), read by
+    /// the host signal catcher via `gs:[]` so a caught signal is recorded on
+    /// the thread that caught it — pending state is per-thread, and this
+    /// pointer is how the async-signal-safe catcher finds the right set with
+    /// no TLS. Placed after `fpstate` so every offset above is unchanged.
+    pub pending_set: u64,
 }
 
 // XSAVE/XRSTOR #GP unless the save area is 64-byte aligned. The struct's
@@ -788,6 +797,10 @@ impl ThreadState {
             exit_requested: AtomicU32::new(0),
             _align_fpstate: [0; 5],
             fpstate: self.fpstate,
+            // Cleared, not inherited: the child's own `PendingSet` address is
+            // published by `Thread::from_state`. Copying the parent's pointer
+            // would let the catcher record the child's signals on the parent.
+            pending_set: 0,
         });
         child.regs[RAX] = 0;
         child.regs[RSP] = child_stack;

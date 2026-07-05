@@ -399,7 +399,7 @@ mod host {
                     handler.do_syscall(call);
                     drop(fork_locks);
                     if call.return_value() == 0 {
-                        crate::sys::linux::signal::reset_pending_after_fork();
+                        thread.signals_mut().reset_pending_after_fork();
                         thread.reset_after_fork();
                     }
                 }
@@ -427,7 +427,7 @@ mod host {
                 handler.do_syscall(call);
                 drop(fork_locks);
                 if call.return_value() == 0 {
-                    crate::sys::linux::signal::reset_pending_after_fork();
+                    thread.signals_mut().reset_pending_after_fork();
                     thread.reset_after_fork();
                 }
             }
