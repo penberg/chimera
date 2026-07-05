@@ -33,22 +33,24 @@ syscall does — forward it to the host kernel, log it, or virtualize it.
 
 Chimera currently supports **Linux/x86** target with work-in-progress port to **Darwin/arm64**.
 
-## Command-line tool
+## Getting started
 
-Install:
+Install the `chimera` command-line tool from GitHub:
 
 ```
-cargo install --path cli
+cargo install --git https://github.com/penberg/chimera chimera-cli
 ```
 
-Run any command:
+Then wrap any command:
 
 ```
 chimera run /bin/echo hello
 ```
 
-The default handler forwards every syscall to the host kernel, so the
+By default Chimera forwards every system call to the host kernel, so the
 wrapped process behaves like a native one.
+
+From a checkout, install with `cargo install --path cli` instead.
 
 ## Library
 
