@@ -77,8 +77,19 @@ pub fn execv(
         stack_len,
     );
 
+    let reason = thread.run()?;
+    drive(&mut thread, reason)
+}
+
+/// Drive a main thread to process termination: install each committed
+/// execve's published image and re-enter the run, until the guest exits;
+/// returns the process exit status. Two callers: [`execv`] above, with the
+/// initial thread's first run reason, and a `clone` child promoted to main
+/// by a fork in its thread (see `Thread::reset_after_fork`) — that child's
+/// host thread is all its new process has, so it must drive itself.
+pub fn drive(thread: &mut dispatch::Thread, mut reason: ExitReason) -> Result<i32, Error> {
     loop {
-        match thread.run()? {
+        match reason {
             ExitReason::Exited(code) => return Ok(code),
             ExitReason::Execve => {
                 // A committed execve: the calling thread — main or a clone
@@ -131,6 +142,7 @@ pub fn execv(
                 thread.signals_mut().on_execve();
             }
         }
+        reason = thread.run()?;
     }
 }
 

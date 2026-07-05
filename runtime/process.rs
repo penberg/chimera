@@ -9,7 +9,7 @@
 //! address space.
 
 use std::sync::{
-    Condvar, Mutex, Once,
+    Condvar, Mutex, MutexGuard, Once,
     atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
 
@@ -42,12 +42,15 @@ fn install_interrupt_handler() {
     });
 }
 
-/// A thread in the live set: its kernel TID and the address of its
-/// `ThreadState::exit_requested` safepoint slot. The pointer is valid for
-/// exactly the registration window — `Thread::run` registers after its state
-/// is pinned and unregisters, under the same mutex, before the state can be
-/// dropped — so a writer holding the `live_threads` lock never touches a dead
-/// slot.
+/// A thread in the live set: its kernel TID — the target for interrupt
+/// signals, nothing more — and the address of its `ThreadState::exit_requested`
+/// safepoint slot, which doubles as the thread's identity: it is stable where
+/// the TID is not (a fork child keeps its registration but wakes up with a new
+/// TID). The pointer is valid for exactly the registration window —
+/// `Thread::run` registers after its state is pinned and unregisters, under
+/// the same mutex, before the state can be dropped — so a writer holding the
+/// `live_threads` lock never touches a dead slot, and identity comparisons
+/// never dereference at all.
 struct LiveThread {
     tid: i32,
     exit_requested: *const AtomicU32,
@@ -125,8 +128,9 @@ impl Process {
 
     /// Register a thread as running a guest: its kernel TID and the address of
     /// its `ThreadState::exit_requested` safepoint slot, which the translated
-    /// back-edge and IB-hit polls read. Balanced by
-    /// [`Process::unregister_tid`] when its run loop ends.
+    /// back-edge and IB-hit polls read and which serves as the thread's
+    /// identity (see [`LiveThread`]). Balanced by
+    /// [`Process::unregister_thread`] when its run loop ends.
     pub fn register_thread(&self, tid: i32, exit_requested: &AtomicU32) {
         self.live_threads.lock().unwrap().push(LiveThread {
             tid,
@@ -134,11 +138,12 @@ impl Process {
         });
     }
 
-    /// Remove a thread from the live set when its run loop ends, and wake any
-    /// main thread waiting for the last sibling to finish.
-    pub fn unregister_tid(&self, tid: i32) {
+    /// Remove a thread (identified by its safepoint slot) from the live set
+    /// when its run loop ends, and wake any main thread waiting for the last
+    /// sibling to finish. The pointer is compared, never dereferenced.
+    pub fn unregister_thread(&self, slot: *const AtomicU32) {
         let mut threads = self.live_threads.lock().unwrap();
-        if let Some(pos) = threads.iter().position(|t| t.tid == tid) {
+        if let Some(pos) = threads.iter().position(|t| t.exit_requested == slot) {
             threads.swap_remove(pos);
         }
         self.exit_cv.notify_all();
@@ -148,20 +153,22 @@ impl Process {
     /// loop calls this on the way out, before it leaves the live set, so once
     /// the group drains the slot holds the last exiter's status — the value
     /// `wait(2)` reports absent an `exit_group`. The mutex inside
-    /// `unregister_tid`, taken after this store, orders it before any waiter
+    /// `unregister_thread`, taken after this store, orders it before any waiter
     /// that observes the shrunken live set.
     pub fn record_exit_status(&self, status: i32) {
         self.last_exit_status.store(status, Ordering::Relaxed);
     }
 
-    /// Block until every guest thread other than `self_tid` has finished, or a
+    /// Block until every guest thread other than the caller (identified by its
+    /// safepoint slot) has finished, or a
     /// process-wide `exit_group` is requested; returns the resulting process
     /// status. Used when the main thread exits on its own (`pthread_exit` /
     /// thread-local `exit` / raw `SYS_exit`): POSIX keeps the process alive
     /// until the last thread terminates, and the status is that last thread's —
     /// the caller's own, recorded before waiting, if no sibling outlives it —
     /// unless an `exit_group` set the whole group's.
-    pub fn wait_for_others(&self, self_tid: i32) -> i32 {
+    pub fn wait_for_others(&self, self_slot: &AtomicU32) -> i32 {
+        let self_slot = self_slot as *const AtomicU32;
         let mut threads = self.live_threads.lock().unwrap();
         loop {
             if self.is_exiting() {
@@ -173,7 +180,7 @@ impl Process {
             if self.exec_pending() {
                 return self.last_exit_status.load(Ordering::Relaxed);
             }
-            if threads.iter().all(|t| t.tid == self_tid) {
+            if threads.iter().all(|t| t.exit_requested == self_slot) {
                 return self.last_exit_status.load(Ordering::Relaxed);
             }
             threads = self.exit_cv.wait(threads).unwrap();
@@ -181,16 +188,16 @@ impl Process {
     }
 
     /// Record a process-wide exit (`exit_group`) requested by the thread whose
-    /// kernel TID is `self_tid`. The code is published before the flag, with
+    /// safepoint slot is `self_slot`. The code is published before the flag, with
     /// release/acquire ordering, so any thread that later sees `is_exiting()`
     /// reads this exact code. Every other live thread is then interrupted with
     /// [`interrupt_signal`] so one parked in a host syscall returns `EINTR` and
     /// observes the exit at its run-loop boundary, rather than waiting for a
     /// syscall that may never return on its own.
-    pub fn request_exit_group(&self, code: i32, self_tid: i32) {
+    pub fn request_exit_group(&self, code: i32, self_slot: &AtomicU32) {
         self.exit_code.store(code, Ordering::Relaxed);
         self.exiting.store(true, Ordering::Release);
-        self.interrupt_others(self_tid);
+        self.interrupt_others(self_slot);
     }
 
     /// Publish a committed `execve`: the calling thread validated and parsed
@@ -208,7 +215,7 @@ impl Process {
     /// observes a return value. A refused caller needs to do nothing: the
     /// stop already pending takes its thread at the next boundary, exactly
     /// like any other sibling.
-    pub fn request_exec(&self, prepared: PreparedExec, self_tid: i32) -> bool {
+    pub fn request_exec(&self, prepared: PreparedExec, self_slot: &AtomicU32) -> bool {
         let mut request = self.exec_request.lock().unwrap();
         if request.is_some() || self.exec_pending() || self.is_exiting() {
             return false;
@@ -216,7 +223,7 @@ impl Process {
         *request = Some(prepared);
         self.execing.store(true, Ordering::Release);
         drop(request);
-        self.interrupt_others(self_tid);
+        self.interrupt_others(self_slot);
         true
     }
 
@@ -247,7 +254,7 @@ impl Process {
         }
     }
 
-    /// Force every live thread except `self_tid` to its run-loop boundary,
+    /// Force every live thread except the caller to its run-loop boundary,
     /// where the pending process-wide stop (an `exit_group`, a committed
     /// `execve`) is observed. Two mechanisms, one per way a sibling can be
     /// away from its boundary: arming the thread's `exit_requested` safepoint
@@ -255,12 +262,13 @@ impl Process {
     /// (the back-edge and IB-hit polls read it), and [`interrupt_signal`]
     /// makes one parked in a blocking host syscall return `EINTR`. Also wakes
     /// a main thread parked in [`Process::wait_for_others`].
-    fn interrupt_others(&self, self_tid: i32) {
+    fn interrupt_others(&self, self_slot: &AtomicU32) {
+        let self_slot = self_slot as *const AtomicU32;
         let pid = unsafe { libc::getpid() };
         let sig = interrupt_signal();
         let threads = self.live_threads.lock().unwrap();
         for t in threads.iter() {
-            if t.tid != self_tid {
+            if t.exit_requested != self_slot {
                 // SAFETY: registration (see `LiveThread`) guarantees the slot
                 // outlives its entry in the set, and holding the lock keeps
                 // the entry alive across this store.
@@ -276,6 +284,55 @@ impl Process {
     pub fn is_exiting(&self) -> bool {
         self.exiting.load(Ordering::Acquire)
     }
+
+    /// Take every `Process` lock, to be held across a forwarded `fork`. fork
+    /// copies the whole address space, mutexes included: one held by a
+    /// sibling thread at the moment of the copy would be locked forever in
+    /// the child, which has no sibling to release it. Held by the forking
+    /// thread instead, the child's copies belong to that thread's own copied
+    /// guards, which unlock on drop in both processes — the `pthread_atfork`
+    /// discipline, applied at the one place Chimera forwards a fork. The
+    /// lock order nests like `request_exec` (`exec_request`, then
+    /// `live_threads`); `addr_space` is never nested with either.
+    pub fn lock_for_fork(&self) -> ForkLocks<'_> {
+        ForkLocks {
+            _exec_request: self.exec_request.lock().unwrap(),
+            _live_threads: self.live_threads.lock().unwrap(),
+            _addr_space: self.addr_space.lock().unwrap(),
+        }
+    }
+
+    /// Rebuild the process bookkeeping in the child of a fork. The copy
+    /// still describes the parent's whole thread group, but the child has
+    /// exactly one thread — the caller. Keep only the caller's live entry,
+    /// found by its safepoint slot address (the identity that survives a
+    /// fork), and rewrite its TID to `my_tid`, the caller's tid in the child
+    /// — a signal aimed at the parent-era TID would miss, leaving the thread
+    /// unreachable when parked in a host syscall. Then clear any group-wide
+    /// exit or exec the parent had in flight: the child is a fresh process,
+    /// not a participant in the parent's stop.
+    pub fn reset_after_fork(&self, my_slot: &AtomicU32, my_tid: i32) {
+        let my_slot = my_slot as *const AtomicU32;
+        let mut threads = self.live_threads.lock().unwrap();
+        threads.retain(|t| t.exit_requested == my_slot);
+        for t in threads.iter_mut() {
+            t.tid = my_tid;
+        }
+        drop(threads);
+        *self.exec_request.lock().unwrap() = None;
+        self.execing.store(false, Ordering::Release);
+        self.exiting.store(false, Ordering::Release);
+        self.exit_code.store(0, Ordering::Relaxed);
+        self.last_exit_status.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Every `Process` lock, held together across a `fork` forward; see
+/// [`Process::lock_for_fork`].
+pub struct ForkLocks<'a> {
+    _exec_request: MutexGuard<'a, Option<PreparedExec>>,
+    _live_threads: MutexGuard<'a, Vec<LiveThread>>,
+    _addr_space: MutexGuard<'a, AddressSpace>,
 }
 
 // SAFETY: the `handler` field is already `Send + Sync` (the `SystemCalls`

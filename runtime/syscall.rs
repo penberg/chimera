@@ -294,8 +294,9 @@ mod host {
                 // process exits. Forwarding to the host instead would kill the
                 // embedder's process, which the runtime must not do.
                 let code = call.args[0] as i32;
-                let self_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
-                thread.process().request_exit_group(code, self_tid);
+                thread
+                    .process()
+                    .request_exit_group(code, &thread.state.exit_requested);
                 thread.exit_code = code;
                 thread.running = false;
             }
@@ -315,7 +316,6 @@ mod host {
                 // image, and enters the new one (see `crate::sys::linux::exec`).
                 match prepare_exec(call.number, &call.args) {
                     Ok(prepared) => {
-                        let self_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
                         // First committer wins. A refused commit means a
                         // sibling's exec (or an exit_group) is already
                         // dissolving this group, this thread with it — the
@@ -323,7 +323,9 @@ mod host {
                         // and never observes a return value, and neither does
                         // this one: the pending stop takes the thread at its
                         // next boundary, before the guest could read rax.
-                        thread.process().request_exec(prepared, self_tid);
+                        thread
+                            .process()
+                            .request_exec(prepared, &thread.state.exit_requested);
                         // Report success so observers see the allowed call; the
                         // guest never reads it — a successful execve does not
                         // return.
@@ -390,10 +392,15 @@ mod host {
                 {
                     call.set_result(SyscallResult::Error(libc::EPERM));
                 }
+                // Fork-shaped: forwarded under the same locking and child
+                // rebuild as the `SYS_clone`/`SYS_fork` arm below.
                 _ => {
+                    let fork_locks = thread.process().lock_for_fork();
                     handler.do_syscall(call);
+                    drop(fork_locks);
                     if call.return_value() == 0 {
                         crate::sys::linux::signal::reset_pending_after_fork();
+                        thread.reset_after_fork();
                     }
                 }
             },
@@ -416,9 +423,12 @@ mod host {
             // pending set — and rebuild the thread and process bookkeeping
             // around the one surviving thread.
             libc::SYS_clone | libc::SYS_fork => {
+                let fork_locks = thread.process().lock_for_fork();
                 handler.do_syscall(call);
+                drop(fork_locks);
                 if call.return_value() == 0 {
                     crate::sys::linux::signal::reset_pending_after_fork();
+                    thread.reset_after_fork();
                 }
             }
             // `set_tid_address` records the calling thread's `clear_child_tid`

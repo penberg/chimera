@@ -56,16 +56,19 @@ pub enum ExitReason {
 /// selects AMX, so the area size is bounded regardless of the host's XCR0.
 const XSAVE_AREA_SIZE: usize = 4096;
 
-/// Removes a thread's kernel TID from the process's live set when its run loop
-/// ends, on every exit path. See [`Process::register_thread`].
-struct TidGuard {
+/// Removes a thread from the process's live set when its run loop ends, on
+/// every exit path. Holds the thread's identity — the address of its
+/// `exit_requested` safepoint slot, stable across a fork where the TID is not
+/// — which unregistration compares and never dereferences. See
+/// [`Process::register_thread`].
+struct LiveGuard {
     process: Arc<Process>,
-    tid: i32,
+    slot: *const AtomicU32,
 }
 
-impl Drop for TidGuard {
+impl Drop for LiveGuard {
     fn drop(&mut self) {
-        self.process.unregister_tid(self.tid);
+        self.process.unregister_thread(self.slot);
     }
 }
 
@@ -168,6 +171,25 @@ impl Thread {
         }
     }
 
+    /// Whether this is (or has become) the process's initial thread; see
+    /// [`Thread::reset_after_fork`] for how a clone child is promoted.
+    pub fn is_main(&self) -> bool {
+        self.is_main
+    }
+
+    /// Rebuild bookkeeping in the child of a fork. The caller is the child's
+    /// only thread and its thread-group leader, whatever it was in the
+    /// parent: its run returning must end the process with the guest's
+    /// status, and its `execve` must take the image-installing path, so it
+    /// is promoted to main and the copied [`Process`] group state is reset
+    /// around it.
+    pub fn reset_after_fork(&mut self) {
+        self.is_main = true;
+        let my_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        self.process
+            .reset_after_fork(&self.state.exit_requested, my_tid);
+    }
+
     /// Record this thread's `clear_child_tid` word (from `set_tid_address`). A
     /// null pointer clears it. Returns the caller's TID (its host `gettid`), the
     /// way the kernel's `set_tid_address` does.
@@ -265,7 +287,24 @@ impl Thread {
                 // The child runs until its guest issues `exit`/`exit_group`,
                 // which returns the run loop and ends this host thread — the
                 // rest of the process keeps running.
-                let _ = child.run();
+                let reason = child.run();
+                // A fork inside this thread made it the main — and only —
+                // thread of a new process (see `Thread::reset_after_fork`).
+                // This host thread is all that child process has, so drive it
+                // the way `execv` drives the initial thread — installing any
+                // committed execve image and re-entering — and end the
+                // process with the guest's status. Nothing to clear-and-wake:
+                // a fork child has no joiner inside it.
+                if child.is_main()
+                    && let Ok(reason) = reason
+                {
+                    let code =
+                        crate::sys::linux::exec::drive(&mut child, reason).unwrap_or_else(|err| {
+                            eprintln!("chimera: fork child failed: {err}");
+                            127
+                        });
+                    std::process::exit(code);
+                }
                 // Honor CLONE_CHILD_CLEARTID: clear the word and wake a joiner.
                 child.clear_tid_and_wake();
             });
@@ -390,9 +429,9 @@ impl Thread {
         let my_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
         self.process
             .register_thread(my_tid, &self.state.exit_requested);
-        let _tid_guard = TidGuard {
+        let _live_guard = LiveGuard {
             process: Arc::clone(&self.process),
-            tid: my_tid,
+            slot: &self.state.exit_requested,
         };
 
         let block_exit = exit_block as *const () as usize as u64;
@@ -482,7 +521,7 @@ impl Thread {
             // while this thread waits; the group then dissolves into the new
             // image rather than exiting.
             if !self.process.is_exiting() {
-                self.exit_code = self.process.wait_for_others(my_tid);
+                self.exit_code = self.process.wait_for_others(&self.state.exit_requested);
                 if self.process.exec_pending() {
                     return Ok(ExitReason::Execve);
                 }
