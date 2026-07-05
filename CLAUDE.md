@@ -2,6 +2,17 @@ This is the Chimera repository — a light-weight sandboxing runtime that runs u
 
 The full design lives in `ARCHITECTURE.md`. Read it before making architectural decisions.
 
+## Building and Running Chimera
+
+- **Build**: `make build` (or `cargo build`) — produces `chimera` in the cargo target directory.
+- **Run a guest binary**: `chimera run <program> [args...]`, e.g. `cargo run -q -- run /bin/ls -l`.
+  - `--code-cache-size <MiB>` sets the translated-code cache capacity (default 256).
+- **Example embedders** (each has a README with details):
+  - `cargo run --example strace -- <program> [args...]` — syscall tracer built on the `SystemCalls` trait.
+  - `cargo run --example sandbox -- --allow '<regex>' [--allow ...] <program> [args...]` — allowlist syscall sandbox; anything unmatched returns `-EPERM`.
+
+The cargo target directory may be shared across worktrees (`scripts/cargo-target-dir` prints it), so another checkout's build can clobber the `chimera` binary — rebuild before trusting a run.
+
 ## Project Layout
 
 Cargo virtual workspace with two member crates:
