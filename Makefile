@@ -7,6 +7,10 @@ build:
 check: conformance-native conformance
 .PHONY: check
 
+clean:
+	cargo clean
+.PHONY: clean
+
 # Run the GitHub Actions CI workflow locally with Agent CI (https://agent-ci.dev/).
 ci:
 	npx -y @redwoodjs/agent-ci run --workflow .github/workflows/ci.yml
