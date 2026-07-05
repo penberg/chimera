@@ -28,6 +28,11 @@ use opts::{Command, Opts};
 
 `std` and `core` first, external crates next, local modules last.
 
+### Comments
+
+A comment must say something the code cannot: a kernel contract, an invariant, a non-obvious why. Say it once, on the item that owns it, and let every other site stand bare — never restate a rat
+ionale at call sites, narrate what the next line does, or argue that the code is correct. That last kind is a review comment, and it goes stale the moment the review ends.
+
 ### Visibility
 
 Don't use `pub(crate)`. Most internal items live in private modules — declared `mod foo;`, not `pub mod foo;` — so a plain `pub` inside one of those modules is already unreachable from outside the crate. The `(crate)` is noise. If plain `pub` would genuinely widen the public API surface, move the item into a private module rather than reach for `pub(crate)`.
