@@ -482,11 +482,21 @@ enum LinkTerm {
     },
     /// `call rel`: pushes the return address (`ret`), then jumps to `target`.
     DirectCall { target: u64, ret: u64 },
+    /// `jrcxz`/`jecxz`/`loop`/`loope`/`loopne`: a conditional branch that exists
+    /// only in a `rel8` encoding, so its taken edge cannot be a patchable `rel32`
+    /// directly — it is lowered as the native instruction hopping over a jump
+    /// pair (see [`build_linked_terminator`]). `opcode` is the `rel8` opcode byte
+    /// (`E0`..`E3`); `prefix67` selects the 32-bit (`ecx`) register width.
+    ShortCond {
+        prefix67: bool,
+        opcode: u8,
+        taken: u64,
+        fallthrough: u64,
+    },
 }
 
 /// Classify a terminator as linkable, or `None` if it ends the block with a
-/// runtime-determined target (indirect branch/call, return), is a syscall, or
-/// is a conditional form this translator does not lower (`loop`, `jrcxz`).
+/// runtime-determined target (indirect branch/call, return), or is a syscall.
 fn classify_terminator(t: &Instruction) -> Option<LinkTerm> {
     if t.code() == Code::Syscall {
         return None;
@@ -495,17 +505,46 @@ fn classify_terminator(t: &Instruction) -> Option<LinkTerm> {
         FlowControl::UnconditionalBranch => Some(LinkTerm::Uncond {
             target: t.near_branch_target(),
         }),
-        FlowControl::ConditionalBranch => Some(LinkTerm::Cond {
-            opcode: jcc_opcode(t.code())?,
-            taken: t.near_branch_target(),
-            fallthrough: t.next_ip(),
-        }),
+        FlowControl::ConditionalBranch => {
+            if let Some((prefix67, opcode)) = short_cond_opcode(t.code()) {
+                Some(LinkTerm::ShortCond {
+                    prefix67,
+                    opcode,
+                    taken: t.near_branch_target(),
+                    fallthrough: t.next_ip(),
+                })
+            } else {
+                Some(LinkTerm::Cond {
+                    opcode: jcc_opcode(t.code())?,
+                    taken: t.near_branch_target(),
+                    fallthrough: t.next_ip(),
+                })
+            }
+        }
         FlowControl::Call => Some(LinkTerm::DirectCall {
             target: t.near_branch_target(),
             ret: t.next_ip(),
         }),
         _ => None,
     }
+}
+
+/// The `rel8`-only conditional branches: `(needs 67 prefix, opcode byte)`. They
+/// test `rcx`/`ecx` (the `loop` forms also decrement it) and touch no flags
+/// except `loope`/`loopne` reading ZF — all behavior the native instruction
+/// reproduces exactly, so the lowering re-emits it verbatim.
+fn short_cond_opcode(code: Code) -> Option<(bool, u8)> {
+    Some(match code {
+        Code::Loopne_rel8_64_RCX => (false, 0xE0),
+        Code::Loopne_rel8_64_ECX => (true, 0xE0),
+        Code::Loope_rel8_64_RCX => (false, 0xE1),
+        Code::Loope_rel8_64_ECX => (true, 0xE1),
+        Code::Loop_rel8_64_RCX => (false, 0xE2),
+        Code::Loop_rel8_64_ECX => (true, 0xE2),
+        Code::Jrcxz_rel8_64 => (false, 0xE3),
+        Code::Jecxz_rel8_64 => (true, 0xE3),
+        _ => return None,
+    })
 }
 
 /// Whether an edge to `target` from a block starting at `block_start` closes a
@@ -657,6 +696,53 @@ fn build_linked_terminator(
                 edges.push((jcc_rel, taken));
                 edges.push((jmp_rel, fallthrough));
             }
+        }
+        LinkTerm::ShortCond {
+            prefix67,
+            opcode,
+            taken,
+            fallthrough,
+        } => {
+            // No `rel32` form exists, so hop: the native `rel8` instruction skips
+            // the short `jmp` below to land on the taken path; not-taken falls
+            // into that short `jmp`, which reaches the fall-through path. The
+            // native instruction supplies the exact architectural behavior
+            // (`loop`'s rcx decrement, `loope`/`loopne`'s ZF read) and clobbers no
+            // flags, so the two edges link like any other direct branch.
+            if prefix67 {
+                out.push(0x67);
+            }
+            // rel8 = +2: taken skips the 2-byte `EB` short jmp that follows.
+            out.extend_from_slice(&[opcode, 0x02]);
+            out.push(0xEB);
+            let eb_at = out.len();
+            out.push(0x00); // disp8 to fall-through path, patched below
+            // Taken path. `loop`/`jrcxz` are loop primitives, so the taken edge
+            // usually closes a loop: route it through the flag- and rcx-preserving
+            // safepoint poll (the native instruction has already read/decremented
+            // rcx and read ZF, so polling after is safe).
+            let poll = is_back_edge(taken, block_start).then(|| emit_exit_poll(&mut out));
+            pad_rel32_alignment(&mut out, term_pc, 1);
+            out.push(0xE9);
+            let taken_rel = take_rel32(&mut out);
+            // Fall-through path — the `EB` above lands here.
+            let fall_path = out.len();
+            let disp = fall_path as i64 - (eb_at as i64 + 1);
+            out[eb_at] = i8::try_from(disp).expect("shortcond jmp displacement out of range") as u8;
+            pad_rel32_alignment(&mut out, term_pc, 1);
+            out.push(0xE9);
+            let fall_rel = take_rel32(&mut out);
+            let taken_stub = out.len();
+            emit_stub(&mut out, taken, exit_tramp);
+            let fall_stub = out.len();
+            emit_stub(&mut out, fallthrough, exit_tramp);
+            write_rel32(&mut out, taken_rel, taken_stub);
+            write_rel32(&mut out, fall_rel, fall_stub);
+            if let Some(poll_rel) = poll {
+                write_rel32(&mut out, poll_rel, taken_stub);
+            }
+            edges.push((taken_rel, taken));
+            edges.push((fall_rel, fallthrough));
         }
         LinkTerm::DirectCall { target, ret } => {
             // Push the 64-bit return address with a single 8-byte store so the
