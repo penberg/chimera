@@ -3,7 +3,11 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    os::unix::ffi::OsStrExt,
+    fs,
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
     ptr,
     sync::Arc,
@@ -111,6 +115,12 @@ pub fn drive(thread: &mut dispatch::Thread, mut reason: ExitReason) -> Result<i3
                     .take_exec_request()
                     .expect("an Execve exit reason always has a published image");
 
+                let mut keep = vec![parsed.as_raw_fd()];
+                if let Some(interp) = &parsed_interp {
+                    keep.push(interp.as_raw_fd());
+                }
+                close_cloexec_fds(&keep)?;
+
                 // Tear down the old image (unmapping its regions, so a fixed
                 // ET_EXEC can reuse its addresses), then map the new one.
                 thread.addr_space().reset();
@@ -144,6 +154,38 @@ pub fn drive(thread: &mut dispatch::Thread, mut reason: ExitReason) -> Result<i3
         }
         reason = thread.run()?;
     }
+}
+
+/// Close every fd flagged close-on-exec, the way the kernel does when an exec
+/// commits. Chimera services `execve` by re-entering in place — no host exec
+/// runs — so `FD_CLOEXEC` must be applied by hand: the flag sits on the host
+/// fd (the guest's `O_CLOEXEC` and `F_SETFD` pass straight through), but the
+/// kernel honors it only at a real `execve`. Left open, a close-on-exec fd
+/// leaks into the new image — git's exec-failure notify pipe, for one, whose
+/// parent then waits forever for the EOF that close-on-exec was meant to
+/// deliver. `keep` names the runtime's own fds that must survive the install
+/// (the replacement image's files, still to be mapped); any runtime fd held
+/// across an exec must be listed there, since Rust opens files `O_CLOEXEC`.
+fn close_cloexec_fds(keep: &[RawFd]) -> Result<(), Error> {
+    let entries = fs::read_dir("/proc/self/fd")
+        .map_err(|e| Error::io("execve: listing /proc/self/fd".to_string(), e))?;
+    // Collect before closing: the directory walk holds an fd of its own, and
+    // closing entries out from under it would corrupt the walk. By the time
+    // the sweep runs the iterator has been dropped, so its fd fails the
+    // `F_GETFD` below and is skipped.
+    let fds: Vec<RawFd> = entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    for fd in fds {
+        if keep.contains(&fd) {
+            continue;
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && flags & libc::FD_CLOEXEC != 0 {
+            unsafe { libc::close(fd) };
+        }
+    }
+    Ok(())
 }
 
 /// A validated, parsed `execve` replacement image: everything needed to

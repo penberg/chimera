@@ -15,6 +15,10 @@ use crate::Error;
 use super::dispatch::ThreadState;
 
 const MAX_BLOCK_GUEST_BYTES: usize = 4096;
+/// Longest possible x86-64 instruction encoding. An instruction whose start
+/// lies within this many bytes of the decode window's end could be truncated by
+/// it, so the block is split there rather than risk decoding a partial encoding.
+const MAX_INSTR_LEN: u64 = 15;
 
 /// Inline indirect-branch lookup table: a direct-mapped, guest-readable mirror
 /// of the guest-PC -> host-PC map, probed from the code cache so that `ret`,
@@ -352,8 +356,22 @@ pub fn translate(
     let mut decoder = Decoder::with_ip(64, guest_bytes, guest_pc, DecoderOptions::NONE);
     let mut instrs = Vec::new();
     let mut instr = Instruction::default();
+    let window_end = guest_pc.wrapping_add(MAX_BLOCK_GUEST_BYTES as u64);
 
     let term = loop {
+        // A basic block can be longer than the fixed decode window — most often
+        // a long straight-line run such as a jump-table initializer. Decoding an
+        // instruction that straddles the window's end would feed iced a
+        // truncated encoding, which it reports as an invalid (Exception)
+        // instruction. Split the block at this instruction boundary instead:
+        // synthesize an unconditional jump to the next guest PC, which the
+        // dispatcher translates (and links) as its own block, resuming decode
+        // from a fresh window. Forward progress is guaranteed because the first
+        // instruction always starts `MAX_INSTR_LEN` short of the window end.
+        let next_pc = decoder.ip();
+        if next_pc.wrapping_add(MAX_INSTR_LEN) > window_end {
+            break mkinstr(Instruction::with_branch(Code::Jmp_rel32_64, next_pc))?;
+        }
         if !decoder.can_decode() {
             return Err(Error::Translate(format!(
                 "decoder ran out of bytes at {:#x}",

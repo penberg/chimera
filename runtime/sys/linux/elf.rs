@@ -4,7 +4,7 @@ use std::{
     ffi::OsStr,
     fs,
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, RawFd},
         unix::{ffi::OsStrExt, fs::FileExt},
     },
     path::{Path, PathBuf},
@@ -98,6 +98,12 @@ pub struct ParsedElf {
     /// mutates the running image — the hazard every shared library has
     /// natively; a userspace loader cannot take `execve`'s `ETXTBSY` lock.
     file: fs::File,
+}
+
+impl AsRawFd for ParsedElf {
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
 }
 
 /// Read an ELF image and validate that Chimera can run it, without mapping
