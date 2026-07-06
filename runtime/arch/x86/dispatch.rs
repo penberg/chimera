@@ -108,6 +108,13 @@ pub struct Thread {
     /// while siblings are still alive, it must wait for them rather than tear the
     /// process down. A `clone(CLONE_VM)` child is never main.
     is_main: bool,
+    /// Write end of the report pipe a `vfork`/`posix_spawn` child uses to hand
+    /// its `execve` outcome back to the parent that is blocked in the clone
+    /// (see the spawn path in `crate::syscall`). Set only in such a child; its
+    /// `execve` writes the outcome and closes it, so the parent — which mirrors
+    /// `CLONE_VFORK` by blocking on the read end — can return the child PID or
+    /// the exec errno synchronously.
+    spawn_report_fd: Option<i32>,
 }
 
 impl Thread {
@@ -147,6 +154,7 @@ impl Thread {
             restart: None,
             clear_child_tid: None,
             is_main: true,
+            spawn_report_fd: None,
         };
         thread.state.pending_set = thread.signals.pending_set_ptr() as u64;
         thread.reset(rip, rsp, guest_fs_base);
@@ -176,6 +184,7 @@ impl Thread {
             restart: None,
             clear_child_tid,
             is_main: false,
+            spawn_report_fd: None,
         }
     }
 
@@ -374,6 +383,33 @@ impl Thread {
 
     pub fn signals_mut(&mut self) -> &mut Signals {
         &mut self.signals
+    }
+
+    /// Record the write end of a spawn child's `execve`-outcome report pipe.
+    pub fn set_spawn_report_fd(&mut self, fd: i32) {
+        self.spawn_report_fd = Some(fd);
+    }
+
+    /// A spawn child's `execve` succeeded: close the report pipe so the parent
+    /// blocked on its read end sees EOF and returns the child PID. A no-op on a
+    /// thread that is not a spawn child.
+    pub fn report_spawn_success(&mut self) {
+        if let Some(fd) = self.spawn_report_fd.take() {
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// A spawn child's `execve` failed: send the errno to the parent (which
+    /// returns it from `posix_spawn`) then close the pipe. A no-op on a thread
+    /// that is not a spawn child.
+    pub fn report_spawn_failure(&mut self, errno: i32) {
+        if let Some(fd) = self.spawn_report_fd.take() {
+            let bytes = errno.to_ne_bytes();
+            unsafe {
+                libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+                libc::close(fd);
+            }
+        }
     }
 
     /// Restore the pre-signal guest context on a guest `rt_sigreturn`.
@@ -607,7 +643,7 @@ impl Thread {
 /// every `clone3` must supply. The kernel rejects a smaller struct with
 /// `EINVAL` and one larger than a page with `E2BIG`.
 const CLONE_ARGS_SIZE_VER0: u64 = 64;
-const CLONE_ARGS_SIZE_MAX: u64 = 4096;
+pub const CLONE_ARGS_SIZE_MAX: u64 = 4096;
 
 /// Copy the base `clone_args` struct a `clone3` points at out of guest
 /// memory, fault-safely (see [`copy_from_guest`]). `None` — returned for an
