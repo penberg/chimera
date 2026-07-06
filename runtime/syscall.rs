@@ -132,10 +132,15 @@ pub enum SyscallResult {
 // and hands the rest to the embedder hooks.
 
 mod host {
+    use std::ptr;
+
     use super::{SyscallResult, SystemCall, SystemCalls, host_syscall};
     use crate::{
-        arch::dispatch::{Thread, read_clone3_args},
-        sys::linux::exec::{exec_errno, prepare_exec},
+        arch::dispatch::{CLONE_ARGS_SIZE_MAX, RSP, Thread, read_clone3_args},
+        sys::{
+            linux::exec::{exec_errno, prepare_exec},
+            mmap::copy_from_guest,
+        },
     };
 
     /// Drive one guest syscall. Runtime-owned syscalls are serviced inline
@@ -239,9 +244,11 @@ mod host {
                 }
                 let result = host_syscall(call);
                 if let SyscallResult::Ok(addr) = result {
-                    thread
-                        .addr_space()
-                        .add_region(addr as usize, call.args[1] as usize);
+                    let mut space = thread.addr_space();
+                    space.add_region(addr as usize, call.args[1] as usize);
+                    // Reset SMC bookkeeping for the (possibly reused) addresses,
+                    // so the new mapping arms from a clean slate.
+                    space.note_map(addr as usize, call.args[1] as usize);
                 }
                 call.set_result(result);
             }
@@ -253,13 +260,21 @@ mod host {
                     call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
                 }
                 handler.do_syscall(call);
+                // A protection change resets the host page (un-arming it) and may
+                // precede a rewrite of code on a W^X-toggled JIT page, so drop the
+                // affected pages' stale translations.
+                if call.return_value() >= 0 {
+                    thread
+                        .addr_space()
+                        .note_prot(call.args[0] as usize, call.args[1] as usize);
+                }
             }
             libc::SYS_munmap => {
                 let result = host_syscall(call);
                 if matches!(result, SyscallResult::Ok(_)) {
-                    thread
-                        .addr_space()
-                        .remove_region(call.args[0] as usize, call.args[1] as usize);
+                    let mut space = thread.addr_space();
+                    space.remove_region(call.args[0] as usize, call.args[1] as usize);
+                    space.note_unmap(call.args[0] as usize, call.args[1] as usize);
                 }
                 call.set_result(result);
             }
@@ -268,13 +283,18 @@ mod host {
                 if let SyscallResult::Ok(new_start) = result {
                     let flags = call.args[3] as libc::c_int;
                     let dontunmap = (flags & libc::MREMAP_DONTUNMAP) != 0;
-                    thread.addr_space().remap_region(
-                        call.args[0] as usize,
-                        call.args[1] as usize,
-                        new_start as usize,
-                        call.args[2] as usize,
-                        dontunmap,
-                    );
+                    let old_start = call.args[0] as usize;
+                    let old_len = call.args[1] as usize;
+                    let new_len = call.args[2] as usize;
+                    let mut space = thread.addr_space();
+                    space.remap_region(old_start, old_len, new_start as usize, new_len, dontunmap);
+                    // The bytes moved: drop translations at the old addresses
+                    // (unless kept by MREMAP_DONTUNMAP) and at the new ones, which
+                    // now hold whatever the move placed there.
+                    if !dontunmap {
+                        space.note_unmap(old_start, old_len);
+                    }
+                    space.note_unmap(new_start as usize, new_len);
                 }
                 call.set_result(result);
             }
@@ -314,6 +334,10 @@ mod host {
                 // image, and enters the new one (see `crate::sys::linux::exec`).
                 match prepare_exec(call.number, &call.args) {
                     Ok(prepared) => {
+                        // A spawn child reaching a loadable image is a successful
+                        // spawn: unblock the parent (see `spawned`) so it returns
+                        // the child PID before the new image runs.
+                        thread.report_spawn_success();
                         // First committer wins. A refused commit means a
                         // sibling's exec (or an exit_group) is already
                         // dissolving this group, this thread with it — the
@@ -331,6 +355,9 @@ mod host {
                     // errno (`EIO` is an unreachable fallback).
                     Err(err) => {
                         let errno = exec_errno(&err).unwrap_or(libc::EIO);
+                        // A spawn child's failed exec is reported to the blocked
+                        // parent, which surfaces it as `posix_spawn`'s errno.
+                        thread.report_spawn_failure(errno);
                         call.set_result(SyscallResult::Error(errno));
                     }
                 }
@@ -339,94 +366,129 @@ mod host {
             // `CLONE_THREAD` shape, which the kernel requires to carry
             // `CLONE_SIGHAND` and `CLONE_VM` — cannot be forwarded: the host
             // kernel would run guest code on the new task natively, with no
-            // Chimera context — never through the translator. Instead Chimera
+            // Chimera context, never through the translator. Instead Chimera
             // spawns a host thread that runs the child guest in the shared
-            // process and returns the child's kernel TID to the parent (see
-            // `Thread::clone_vm`). A malformed `CLONE_THREAD` (missing one of
-            // the required flags) is forwarded for the kernel's authoritative
-            // `EINVAL`; a `clone` without `CLONE_VM` is an ordinary `fork` — a
-            // copy-on-write duplicate of the whole process, Chimera included,
-            // that resumes in translated code — and falls through to the
-            // fork-shaped arm below.
+            // process and returns its kernel TID (see `Thread::clone_vm`). A
+            // malformed `CLONE_THREAD` falls through to the fork arm for the
+            // kernel's authoritative `EINVAL`.
             libc::SYS_clone if is_thread_clone(call.args[0]) => {
                 let tid = thread.clone_vm(&call.args);
                 call.set_return(tid);
             }
-            // `CLONE_VM` without `CLONE_THREAD` asks for a *separate process*
-            // that shares this address space. Chimera can honor neither half:
-            // forwarding would run the child natively outside the sandbox, and
-            // a host thread would give it this process's PID and no `waitpid`.
-            // Refuse it visibly, like `vfork` below, rather than mis-run it —
-            // no libc path reaches this shape (`pthread_create` is
-            // `CLONE_THREAD`, `fork` carries no `CLONE_VM`).
+            // `CLONE_VM | CLONE_VFORK` without `CLONE_THREAD` is the
+            // `vfork`/`posix_spawn` pattern: a child that shares the parent's
+            // memory only until it `execve`s (`CLONE_VFORK` promises it does
+            // nothing else first). Chimera cannot run it as a host thread — its
+            // `execve` would replace the whole shared image, tearing down the
+            // parent. Emulate it as `fork`: strip `CLONE_VM`/`CLONE_VFORK` so the
+            // child gets a copy-on-write image, runs its file actions and
+            // `execve` (becoming an independent process) while the parent
+            // continues. The `CLONE_VFORK` contract limits the child to
+            // `exec`/`_exit`, so the copy is observationally equivalent — except
+            // an exec failure is reported to the parent through the child's exit
+            // status, not the shared errno.
+            //
+            // The guest passes a child stack (it pre-stashes the child's entry
+            // function and argument there); the child must run on it. But that
+            // stack must NOT reach the host `fork` — the host would set *Chimera's*
+            // own stack pointer to a guest address and crash. So clear the host
+            // stack argument, let the host child keep its copy-on-write Chimera
+            // stack, and set the guest child's `rsp` to the requested stack.
+            libc::SYS_clone
+                if call.args[0] & libc::CLONE_VM as u64 != 0
+                    && call.args[0] & libc::CLONE_THREAD as u64 == 0
+                    && call.args[0] & libc::CLONE_VFORK as u64 != 0 =>
+            {
+                let guest_stack = call.args[1];
+                call.args[0] &= !((libc::CLONE_VM | libc::CLONE_VFORK) as u64);
+                call.args[1] = 0;
+                spawned(thread, call, handler, guest_stack);
+            }
+            // `CLONE_VM` without `CLONE_THREAD` or `CLONE_VFORK` asks for a
+            // *separate process* that keeps sharing this address space. Chimera
+            // can honor neither half — forwarding would run the child natively
+            // outside the sandbox; a host thread would give it this process's PID
+            // and no `waitpid`; and a fork would silently break the memory
+            // sharing the caller asked for. Refuse it visibly, like `vfork`. No
+            // libc path reaches this shape.
             libc::SYS_clone
                 if call.args[0] & libc::CLONE_VM as u64 != 0
                     && call.args[0] & libc::CLONE_THREAD as u64 == 0 =>
             {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
-            // `clone3` splits into the same cases as `clone` above, but carries
-            // its arguments in the `clone_args` struct `args[0]` points at —
-            // the path modern glibc's `pthread_create` takes. The struct is
-            // copied out of guest memory fault-safely, exactly once: the copy
-            // both decides the intercept and feeds `clone3_vm`, so a bad
-            // pointer cannot crash the runtime and the fields cannot change
-            // between check and use. A fork-shaped `clone3`, a malformed
-            // `CLONE_THREAD`, or a struct that is unreadable or of a size the
-            // kernel would reject, is forwarded — the kernel forks or reports
-            // the authoritative `EINVAL`/`EFAULT`/`E2BIG` itself, as it would
-            // natively.
+            // `clone3` carries its arguments in the `clone_args` struct `args[0]`
+            // points at. Copy it out fault-safely (a bad pointer or a size the
+            // kernel would reject falls through to a plain forward, so the kernel
+            // reports the authoritative `EFAULT`/`EINVAL`/`E2BIG`). Then split the
+            // same three ways as `clone`: a thread runs on a host thread; a
+            // `CLONE_VM`-without-`CLONE_THREAD` spawn is forked (the stripped
+            // flags written back into the guest struct first); everything else is
+            // an ordinary forwarded `fork`.
             libc::SYS_clone3 => match read_clone3_args(call.args[0], call.args[1]) {
                 Some(cargs) if is_thread_clone(cargs[0]) => {
                     let tid = thread.clone3_vm(&cargs);
                     call.set_return(tid);
                 }
-                // A separate shared-memory process: refused, as for `clone`.
+                // `vfork`/`posix_spawn` (see the `SYS_clone` arm above).
+                Some(cargs)
+                    if cargs[0] & libc::CLONE_VM as u64 != 0
+                        && cargs[0] & libc::CLONE_THREAD as u64 == 0
+                        && cargs[0] & libc::CLONE_VFORK as u64 != 0 =>
+                {
+                    // `clone_args`: [flags, pidfd, child_tid, parent_tid,
+                    // exit_signal, stack, stack_size, tls]. The child runs on
+                    // `stack + stack_size`. Strip `CLONE_VM`/`CLONE_VFORK` and
+                    // zero the stack fields so the host `fork` keeps Chimera's
+                    // own stack, then set the guest child's `rsp` to the stack
+                    // top. `clone3` only requires the struct to be readable, so
+                    // rather than rewrite the guest's copy (illegal if it is in a
+                    // read-only mapping, and observable to the caller after),
+                    // forward a private edited copy in Chimera's own memory.
+                    let guest_stack_top = if cargs[5] != 0 {
+                        cargs[5].wrapping_add(cargs[6])
+                    } else {
+                        0
+                    };
+                    let size = call.args[1] as usize;
+                    let mut buf = [0u8; CLONE_ARGS_SIZE_MAX as usize];
+                    if !copy_from_guest(call.args[0], &mut buf[..size]) {
+                        // Unreadable at the declared size: let the kernel report
+                        // the authoritative EFAULT by forwarding the original.
+                        forked(thread, call, handler, 0);
+                    } else {
+                        let stripped = cargs[0] & !((libc::CLONE_VM | libc::CLONE_VFORK) as u64);
+                        buf[0..8].copy_from_slice(&stripped.to_ne_bytes());
+                        buf[40..56].fill(0); // stack, stack_size
+                        call.args[0] = buf.as_ptr() as u64;
+                        spawned(thread, call, handler, guest_stack_top);
+                    }
+                }
+                // A separate shared-memory process (no `CLONE_VFORK`): refused,
+                // as for `clone`.
                 Some(cargs)
                     if cargs[0] & libc::CLONE_VM as u64 != 0
                         && cargs[0] & libc::CLONE_THREAD as u64 == 0 =>
                 {
                     call.set_result(SyscallResult::Error(libc::EPERM));
                 }
-                // Fork-shaped: forwarded under the same locking and child
-                // rebuild as the `SYS_clone`/`SYS_fork` arm below.
-                _ => {
-                    let fork_locks = thread.process().lock_for_fork();
-                    handler.do_syscall(call);
-                    drop(fork_locks);
-                    if call.return_value() == 0 {
-                        thread.signals_mut().reset_pending_after_fork();
-                        thread.reset_after_fork();
-                    }
-                }
+                _ => forked(thread, call, handler, 0),
             },
-            // `vfork` always shares the address space (`CLONE_VM`) and, worse,
-            // suspends the parent until the child execs or exits while both run
-            // on the same stack — there is no `fork`-shaped variant to allow, so
-            // refuse it outright.
+            // `vfork` shares memory and suspends the parent until the child
+            // execs/exits. Emulate as `fork` by forwarding a `clone` carrying only
+            // the child-exit signal: the child gets a copy-on-write image and
+            // `execve`s into a new process. A `vfork` child may only `exec`/`_exit`
+            // (so the copy is equivalent), and a `fork` parent need not be
+            // suspended.
             libc::SYS_vfork => {
-                call.set_result(SyscallResult::Error(libc::EPERM));
+                call.number = libc::SYS_clone as u64;
+                call.args = [libc::SIGCHLD as u64, 0, 0, 0, 0, 0];
+                forked(thread, call, handler, 0);
             }
             // The variants reached here: genuine `fork` shapes, and malformed
             // thread shapes the kernel rejects with `EINVAL` (the `CLONE_VM`
-            // cases were serviced or refused above). Forward the call with
-            // every `Process` lock held (see `Process::lock_for_fork`, the
-            // pthread_atfork discipline), so the child's copied mutexes are
-            // released by this thread's own guards rather than staying locked
-            // forever for a sibling that does not exist there. In the child
-            // (the call returns 0), clear the pending-signal state the host
-            // `fork` copied from the parent — POSIX gives a child an empty
-            // pending set — and rebuild the thread and process bookkeeping
-            // around the one surviving thread.
-            libc::SYS_clone | libc::SYS_fork => {
-                let fork_locks = thread.process().lock_for_fork();
-                handler.do_syscall(call);
-                drop(fork_locks);
-                if call.return_value() == 0 {
-                    thread.signals_mut().reset_pending_after_fork();
-                    thread.reset_after_fork();
-                }
-            }
+            // cases were serviced above). Forward as an ordinary fork.
+            libc::SYS_clone | libc::SYS_fork => forked(thread, call, handler, 0),
             // `set_tid_address` records the calling thread's `clear_child_tid`
             // word — the one the runtime zeroes and futex-wakes on exit so a
             // joiner returns. It is virtualized, never forwarded: forwarding
@@ -593,6 +655,107 @@ mod host {
         const THREAD_SHAPE: u64 =
             libc::CLONE_THREAD as u64 | libc::CLONE_SIGHAND as u64 | libc::CLONE_VM as u64;
         flags & THREAD_SHAPE == THREAD_SHAPE
+    }
+
+    /// Forward a `fork`-shaped duplication and fix up the child. The fork runs
+    /// under [`Process::lock_for_fork`](crate::process::Process::lock_for_fork)
+    /// — the pthread_atfork discipline — so the multithreaded host program's
+    /// child inherits every `Process` lock unlocked rather than orphaned-locked
+    /// for a sibling that does not exist there. In the child (the call returns
+    /// 0) the pending-signal set is cleared and the thread and process
+    /// bookkeeping rebuilt around the one surviving thread.
+    ///
+    /// `guest_stack_top`, when non-zero, is the stack a `vfork`/`posix_spawn`
+    /// child must run its guest code on: the caller has already kept it out of
+    /// the host `fork` (which would point Chimera's own `rsp` at a guest
+    /// address), so the child's guest `rsp` is set to it here.
+    fn forked(
+        thread: &mut Thread,
+        call: &mut SystemCall,
+        handler: &dyn SystemCalls,
+        guest_stack_top: u64,
+    ) {
+        let fork_locks = thread.process().lock_for_fork();
+        handler.do_syscall(call);
+        drop(fork_locks);
+        if call.return_value() == 0 {
+            thread.signals_mut().reset_pending_after_fork();
+            thread.reset_after_fork();
+            if guest_stack_top != 0 {
+                thread.state.regs[RSP] = guest_stack_top;
+            }
+        }
+    }
+
+    /// Fork emulation for the `vfork`/`posix_spawn` case ([`forked`] plus the
+    /// `CLONE_VFORK` semantics its callers rely on). A pipe carries the child's
+    /// `execve` outcome back to the parent, which blocks on it exactly as
+    /// `CLONE_VFORK` blocks until the child execs or exits: the child's `execve`
+    /// closes the pipe on success (parent reads EOF → returns the child PID) or
+    /// writes the errno on failure (parent reads it → returns `-errno`). That is
+    /// the same negative-clone-return path glibc's `posix_spawn` reports an exec
+    /// error through, so a missing or unloadable program fails the call
+    /// synchronously rather than only surfacing via the child's exit status.
+    fn spawned(
+        thread: &mut Thread,
+        call: &mut SystemCall,
+        handler: &dyn SystemCalls,
+        guest_stack_top: u64,
+    ) {
+        let mut fds = [0i32; 2];
+        // Without the pipe, fall back to a plain fork: the spawn still works, it
+        // just loses synchronous exec-error reporting.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            forked(thread, call, handler, guest_stack_top);
+            return;
+        }
+        let read_fd = fds[0];
+        // Move the write end clear of the low descriptors the child's file
+        // actions typically remap, so a `dup2`/`close` there does not clobber it.
+        let mut write_fd = fds[1];
+        let moved = unsafe { libc::fcntl(write_fd, libc::F_DUPFD_CLOEXEC, 100) };
+        if moved >= 0 {
+            unsafe { libc::close(write_fd) };
+            write_fd = moved;
+        }
+
+        let is_child = {
+            let fork_locks = thread.process().lock_for_fork();
+            handler.do_syscall(call);
+            let is_child = call.return_value() == 0;
+            drop(fork_locks);
+            is_child
+        };
+
+        if is_child {
+            unsafe { libc::close(read_fd) };
+            thread.set_spawn_report_fd(write_fd);
+            thread.signals_mut().reset_pending_after_fork();
+            thread.reset_after_fork();
+            if guest_stack_top != 0 {
+                thread.state.regs[RSP] = guest_stack_top;
+            }
+            return;
+        }
+
+        // Parent: block until the child reports its `execve` outcome.
+        let child_pid = call.return_value() as libc::pid_t;
+        unsafe { libc::close(write_fd) };
+        let mut buf = [0u8; 4];
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        unsafe { libc::close(read_fd) };
+        if n == buf.len() as isize {
+            let errno = i32::from_ne_bytes(buf);
+            if errno != 0 {
+                // The child's `execve` failed and it will `_exit`; reap it so it
+                // leaves no zombie (the caller gets no PID to wait on), and
+                // report the errno.
+                unsafe { libc::waitpid(child_pid, ptr::null_mut(), 0) };
+                call.set_result(SyscallResult::Error(errno));
+            }
+        }
+        // EOF or a zero errno: the child execed (or exited); the child PID the
+        // host fork returned stays as the result.
     }
 }
 

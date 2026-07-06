@@ -168,3 +168,44 @@ exit_syscall:
     pop rbx
     ret
 .size exit_syscall, . - exit_syscall
+
+// Same as exit_block, but sets exit_kind = TRAP. The translator targets this
+// trampoline from the exit stub of every block whose terminator is an `int3`
+// breakpoint. Unlike `syscall`, `int3` clobbers no registers, so every guest
+// register (including rcx, r11, and rflags) is saved exactly as in exit_block.
+.globl exit_trap
+.type exit_trap, @function
+exit_trap:
+    mov gs:[{TS_RBX}], rbx
+    mov gs:[{TS_RCX}], rcx
+    mov gs:[{TS_RDX}], rdx
+    mov gs:[{TS_RSI}], rsi
+    mov gs:[{TS_RDI}], rdi
+    mov gs:[{TS_RBP}], rbp
+    mov gs:[{TS_RSP}], rsp
+    mov gs:[{TS_R8}],  r8
+    mov gs:[{TS_R9}],  r9
+    mov gs:[{TS_R10}], r10
+    mov gs:[{TS_R11}], r11
+    mov gs:[{TS_R12}], r12
+    mov gs:[{TS_R13}], r13
+    mov gs:[{TS_R14}], r14
+    mov gs:[{TS_R15}], r15
+    mov rsp, gs:[{TS_CHIMERA_RSP}]
+    pushfq
+    pop rax
+    mov gs:[{TS_RFLAGS}], rax
+    mov eax, 0xe7
+    xor edx, edx
+    xsave64 gs:[{TS_FPSTATE}]
+    mov qword ptr gs:[{TS_EXIT_KIND}], {EXIT_KIND_TRAP}
+    mov rax, gs:[{TS_CHIMERA_FS}]
+    wrfsbase rax
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+.size exit_trap, . - exit_trap

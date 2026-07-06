@@ -3,14 +3,18 @@
 //! fixed up by `BlockEncoder`), and rewrites the terminator into a
 //! "compute next guest PC, then exit to the dispatcher" sequence.
 
-use std::{mem::offset_of, ptr};
-
-use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, FlowControl, Instruction,
-    InstructionBlock, MemoryOperand, OpKind, Register,
+use std::{
+    mem::offset_of,
+    ptr,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::Error;
+use iced_x86::{
+    BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderError, DecoderOptions, FlowControl,
+    Instruction, InstructionBlock, MemoryOperand, OpKind, Register,
+};
+
+use crate::{Error, sys::mmap::copy_from_guest};
 
 use super::dispatch::ThreadState;
 
@@ -51,11 +55,43 @@ const IB_EMPTY: u8 = 0xff;
 /// over the slot on the way out, so the guest's rbx register is preserved.
 const RBX_SLOT: i64 = 8;
 
+/// Host bounds `[lo, hi)` of the one translated-code buffer, published when it is
+/// mapped and read by the synchronous fault handler to classify a fault.
+static CODE_CACHE_LO: AtomicUsize = AtomicUsize::new(0);
+static CODE_CACHE_HI: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether `addr` is a host PC inside the translated-code buffer. The fault
+/// handler uses this to tell a self-modifying-code write — a guest store that
+/// faulted while executing translated code — from a genuine fault taken in
+/// Chimera's own Rust; it also means the faulting thread is not holding the
+/// address-space lock (only ever held off the code cache), so the handler can
+/// take it without self-deadlock.
+pub fn code_cache_contains(addr: usize) -> bool {
+    let lo = CODE_CACHE_LO.load(Ordering::Relaxed);
+    let hi = CODE_CACHE_HI.load(Ordering::Relaxed);
+    lo != 0 && addr >= lo && addr < hi
+}
+
+/// `PROT_NONE` guard reserved on each side of the RWX code buffer. The kernel
+/// places guest worker-thread stacks in the same high mmap area as the code
+/// cache, sometimes immediately adjacent to it; JavaScriptCore's stack scrubber
+/// (a descending `mov [rdx], 0` loop) can run off the end of such a stack and,
+/// without a guard, would silently zero translated code in the abutting cache —
+/// surfacing later as a wild jump into a zeroed hole. The guard turns that
+/// overrun into an immediate fault at the scrubbing store instead, so the fault
+/// handler sees it at its source. It is virtual-address-space only (`PROT_NONE`,
+/// never faulted in), so it costs no resident memory.
+const CACHE_GUARD: usize = 64 * 1024 * 1024;
+
 /// A bump-allocated RWX region into which `translate()` emits blocks, paired
 /// with the inline indirect-branch lookup table and the shared lookup routine.
 pub struct CodeCache {
     base: *mut u8,
     size: usize,
+    /// Base and length of the whole reservation (`CACHE_GUARD` + `size` +
+    /// `CACHE_GUARD`), unmapped on drop; `base` points `CACHE_GUARD` into it.
+    map_base: *mut u8,
+    map_size: usize,
     used: usize,
     /// Direct-mapped indirect-branch table (see [`IB_SLOTS`]). A separate RW
     /// mapping at a fixed address, baked into the lookup routine as an
@@ -79,18 +115,35 @@ impl CodeCache {
             size > 0 && size <= crate::MAX_CODE_CACHE_SIZE,
             "code cache size {size} out of range"
         );
-        let p = unsafe {
+        // Reserve guard + buffer + guard as one `PROT_NONE` mapping, then open
+        // only the middle to RWX. The guards (see [`CACHE_GUARD`]) catch an
+        // overrun from an adjacent guest mapping before it reaches the buffer.
+        let map_size = CACHE_GUARD + size + CACHE_GUARD;
+        let region = unsafe {
             libc::mmap(
                 ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                map_size,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                 -1,
                 0,
             )
         };
-        if p == libc::MAP_FAILED {
-            return Err(Error::last_os_error("code cache mmap"));
+        if region == libc::MAP_FAILED {
+            return Err(Error::last_os_error("code cache reservation"));
+        }
+        let p = unsafe { (region as *mut u8).add(CACHE_GUARD) as *mut libc::c_void };
+        if unsafe {
+            libc::mprotect(
+                p,
+                size,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            )
+        } != 0
+        {
+            let err = Error::last_os_error("code cache mprotect");
+            unsafe { libc::munmap(region, map_size) };
+            return Err(err);
         }
         let t = unsafe {
             libc::mmap(
@@ -104,17 +157,24 @@ impl CodeCache {
         };
         if t == libc::MAP_FAILED {
             let err = Error::last_os_error("ib table mmap");
-            unsafe { libc::munmap(p, size) };
+            unsafe { libc::munmap(region, map_size) };
             return Err(err);
         }
         let cache = Self {
             base: p as *mut u8,
             size,
+            map_base: region as *mut u8,
+            map_size,
             used: 0,
             ib_table: t as *mut u8,
             ib_lookup: None,
         };
         cache.clear_ib_table();
+        // Publish the buffer bounds for the fault handler's in-cache check. One
+        // CodeCache backs the process (reset rewinds it rather than remapping),
+        // so this is set once.
+        CODE_CACHE_LO.store(p as usize, Ordering::Relaxed);
+        CODE_CACHE_HI.store(p as usize + size, Ordering::Relaxed);
         Ok(cache)
     }
 
@@ -167,6 +227,47 @@ impl CodeCache {
             // so every empty slot fails the compare.
             let slot = ib_slot(u64::MAX) * IB_SLOT_BYTES;
             (self.ib_table.add(slot) as *mut u64).write(ib_unmatchable(u64::MAX));
+        }
+    }
+
+    /// Redirect a block's host entry to its deopt stub by overwriting the first
+    /// 5 bytes at `host_pc` with `jmp rel32 -> deopt_pc`. Called when the guest
+    /// modifies the page the block was translated from: the block is dropped
+    /// from the map, and any direct branch still linked to it now lands on the
+    /// stub, which exits to the dispatcher and re-translates from current guest
+    /// memory. Relies on JIT discipline — the guest stops every thread before
+    /// rewriting code it might be running — so no sibling executes this block
+    /// while it is patched. The `jmp` opcode is published last, so a reader that
+    /// somehow raced would see the original instruction until the redirect is
+    /// fully formed rather than a spliced one.
+    pub fn neutralize(&self, host_pc: u64, deopt_pc: u64) {
+        let rel = deopt_pc as i64 - (host_pc as i64 + 5);
+        debug_assert!(
+            i32::try_from(rel).is_ok(),
+            "deopt displacement {rel} out of rel32 range"
+        );
+        let rel = rel as i32 as u32;
+        unsafe {
+            let p = host_pc as *mut u8;
+            ptr::write_volatile(p.add(1), rel as u8);
+            ptr::write_volatile(p.add(2), (rel >> 8) as u8);
+            ptr::write_volatile(p.add(3), (rel >> 16) as u8);
+            ptr::write_volatile(p.add(4), (rel >> 24) as u8);
+            ptr::write_volatile(p, 0xE9);
+        }
+    }
+
+    /// Drop `guest_pc` from the inline indirect-branch table if it currently
+    /// holds the slot, so a later indirect branch to it misses and re-resolves
+    /// through the dispatcher (where the block has been dropped and re-translates
+    /// from current guest memory).
+    pub fn ib_remove(&self, guest_pc: u64) {
+        let slot = ib_slot(guest_pc) * IB_SLOT_BYTES;
+        unsafe {
+            let key = self.ib_table.add(slot) as *mut u64;
+            if key.read_volatile() == guest_pc {
+                key.write_volatile(u64::MAX);
+            }
         }
     }
 
@@ -288,7 +389,8 @@ impl CodeCache {
 
 impl Drop for CodeCache {
     fn drop(&mut self) {
-        let ret = unsafe { libc::munmap(self.base.cast(), self.size) };
+        // Unmap the whole reservation (both guards plus the buffer).
+        let ret = unsafe { libc::munmap(self.map_base.cast(), self.map_size) };
         debug_assert_eq!(ret, 0, "code cache munmap failed");
         let ret = unsafe { libc::munmap(self.ib_table.cast(), IB_TABLE_BYTES) };
         debug_assert_eq!(ret, 0, "ib table munmap failed");
@@ -340,6 +442,34 @@ pub struct OutEdge {
     pub site: usize,
 }
 
+/// The result of translating one basic block: where its host code begins, the
+/// guest PC one past its last decoded byte (so the cache knows which guest pages
+/// the block covers, for self-modifying-code invalidation), the address of its
+/// deopt stub (see [`CodeCache::neutralize`]), and its statically known outgoing
+/// edges for the dispatcher to link.
+pub struct Translation {
+    pub host_pc: u64,
+    pub guest_end: u64,
+    pub deopt_pc: u64,
+    pub edges: Vec<OutEdge>,
+}
+
+/// Copy up to one decode window of guest bytes at `guest_pc` into `buf`,
+/// without trusting the address ([`copy_from_guest`]). Returns how many bytes
+/// are readable: the whole window, its prefix up to the page boundary when the
+/// window straddles into an unmapped page, or 0 when `guest_pc` itself is
+/// unreadable. The window is one page long, so it crosses at most one boundary.
+fn read_guest_window(guest_pc: u64, buf: &mut [u8]) -> usize {
+    if copy_from_guest(guest_pc, buf) {
+        return buf.len();
+    }
+    let prefix = (buf.len() - (guest_pc as usize & (buf.len() - 1))) % buf.len();
+    if prefix != 0 && copy_from_guest(guest_pc, &mut buf[..prefix]) {
+        return prefix;
+    }
+    0
+}
+
 /// Translate one basic block starting at `guest_pc`. Returns the host PC at
 /// which the translated block begins, together with the block's statically
 /// known outgoing edges (empty for blocks ending in an indirect branch,
@@ -349,15 +479,30 @@ pub fn translate(
     guest_pc: u64,
     exit_tramp: u64,
     syscall_tramp: u64,
-) -> Result<(u64, Vec<OutEdge>), Error> {
+    trap_tramp: u64,
+) -> Result<Translation, Error> {
     let host_pc = cache.next_pc();
-    let guest_bytes =
-        unsafe { std::slice::from_raw_parts(guest_pc as *const u8, MAX_BLOCK_GUEST_BYTES) };
+    // Read the decode window through a guarded copy rather than dereferencing
+    // the guest PC: a wild guest jump (through a corrupted function pointer,
+    // say) lands here with an arbitrary address, and a raw read would take the
+    // fault in Chimera. An unreadable PC is the guest's fault to receive — the
+    // run loop raises SIGSEGV at it — and a window cut short by the end of a
+    // mapping decodes only its readable prefix.
+    let mut window = [0u8; MAX_BLOCK_GUEST_BYTES];
+    let avail = read_guest_window(guest_pc, &mut window);
+    if avail == 0 {
+        return Err(Error::BadAccess(guest_pc));
+    }
+    let guest_bytes = &window[..avail];
     let mut decoder = Decoder::with_ip(64, guest_bytes, guest_pc, DecoderOptions::NONE);
     let mut instrs = Vec::new();
     let mut instr = Instruction::default();
-    let window_end = guest_pc.wrapping_add(MAX_BLOCK_GUEST_BYTES as u64);
+    let window_end = guest_pc.wrapping_add(avail as u64);
 
+    // Guest PC one past the block's last decoded byte: the terminator's end, or
+    // the split point when an over-long block is cut short. Used to record which
+    // guest pages the block covers for SMC invalidation. Every break assigns it.
+    let guest_end;
     let term = loop {
         // A basic block can be longer than the fixed decode window — most often
         // a long straight-line run such as a jump-table initializer. Decoding an
@@ -369,7 +514,12 @@ pub fn translate(
         // from a fresh window. Forward progress is guaranteed because the first
         // instruction always starts `MAX_INSTR_LEN` short of the window end.
         let next_pc = decoder.ip();
-        if next_pc.wrapping_add(MAX_INSTR_LEN) > window_end {
+        // The `next_pc != guest_pc` guard keeps a window shorter than one
+        // instruction (its readable prefix ends within `MAX_INSTR_LEN` of the
+        // block start) from splitting into a jump-to-self: the first
+        // instruction always decodes from whatever bytes are readable instead.
+        if next_pc != guest_pc && next_pc.wrapping_add(MAX_INSTR_LEN) > window_end {
+            guest_end = next_pc;
             break mkinstr(Instruction::with_branch(Code::Jmp_rel32_64, next_pc))?;
         }
         if !decoder.can_decode() {
@@ -379,10 +529,17 @@ pub fn translate(
             )));
         }
         decoder.decode_out(&mut instr);
+        // An instruction cut off by the end of the readable window: its
+        // remaining bytes are unmapped, so executing it faults there. Only the
+        // block's first instruction can get here — later ones split above.
+        if instr.is_invalid() && decoder.last_error() == DecoderError::NoMoreBytes {
+            return Err(Error::BadAccess(window_end));
+        }
         if matches!(instr.flow_control(), FlowControl::Next) {
             instrs.push(instr);
             continue;
         }
+        guest_end = instr.next_ip();
         break instr;
     };
 
@@ -395,24 +552,40 @@ pub fn translate(
     // Everything else (indirect branches/calls, returns, syscalls, and the few
     // unsupported conditional forms) keeps the original "compute next guest PC,
     // exit to dispatcher" terminator and contributes no links.
-    if let Some(link) = classify_terminator(&term) {
+    let edges = if let Some(link) = classify_terminator(&term) {
         emit_body(cache, &instrs, host_pc, guest_pc)?;
         let term_pc = cache.next_pc() as usize;
         let (bytes, rel_edges) = build_linked_terminator(&link, exit_tramp, guest_pc, term_pc);
         cache.emit(&bytes)?;
-        let edges = rel_edges
+        rel_edges
             .into_iter()
             .map(|(off, target_guest)| OutEdge {
                 target_guest,
                 site: term_pc + off,
             })
-            .collect();
-        Ok((host_pc, edges))
+            .collect()
     } else {
-        emit_terminator(&mut instrs, &term, syscall_tramp)?;
+        emit_terminator(&mut instrs, &term, syscall_tramp, trap_tramp)?;
         emit_body(cache, &instrs, host_pc, guest_pc)?;
-        Ok((host_pc, Vec::new()))
-    }
+        Vec::new()
+    };
+
+    // A per-block deopt stub: it saves rax, publishes this block's own guest PC
+    // into the rip slot, and exits to the dispatcher. SMC invalidation overwrites
+    // the block's host entry with a 5-byte jump to this stub, so any surviving
+    // direct link into the dropped block falls back to the dispatcher and
+    // re-translates from current guest memory (see [`CodeCache::neutralize`]).
+    let deopt_pc = cache.next_pc();
+    let mut stub = Vec::new();
+    emit_stub(&mut stub, guest_pc, exit_tramp);
+    cache.emit(&stub)?;
+
+    Ok(Translation {
+        host_pc,
+        guest_end,
+        deopt_pc,
+        edges,
+    })
 }
 
 /// Rewrite each `lea reg, [rip + disp]` in the block body into a `movabs reg,
@@ -482,11 +655,21 @@ enum LinkTerm {
     },
     /// `call rel`: pushes the return address (`ret`), then jumps to `target`.
     DirectCall { target: u64, ret: u64 },
+    /// `jrcxz`/`jecxz`/`loop`/`loope`/`loopne`: a conditional branch that exists
+    /// only in a `rel8` encoding, so its taken edge cannot be a patchable `rel32`
+    /// directly — it is lowered as the native instruction hopping over a jump
+    /// pair (see [`build_linked_terminator`]). `opcode` is the `rel8` opcode byte
+    /// (`E0`..`E3`); `prefix67` selects the 32-bit (`ecx`) register width.
+    ShortCond {
+        prefix67: bool,
+        opcode: u8,
+        taken: u64,
+        fallthrough: u64,
+    },
 }
 
 /// Classify a terminator as linkable, or `None` if it ends the block with a
-/// runtime-determined target (indirect branch/call, return), is a syscall, or
-/// is a conditional form this translator does not lower (`loop`, `jrcxz`).
+/// runtime-determined target (indirect branch/call, return), or is a syscall.
 fn classify_terminator(t: &Instruction) -> Option<LinkTerm> {
     if t.code() == Code::Syscall {
         return None;
@@ -495,17 +678,46 @@ fn classify_terminator(t: &Instruction) -> Option<LinkTerm> {
         FlowControl::UnconditionalBranch => Some(LinkTerm::Uncond {
             target: t.near_branch_target(),
         }),
-        FlowControl::ConditionalBranch => Some(LinkTerm::Cond {
-            opcode: jcc_opcode(t.code())?,
-            taken: t.near_branch_target(),
-            fallthrough: t.next_ip(),
-        }),
+        FlowControl::ConditionalBranch => {
+            if let Some((prefix67, opcode)) = short_cond_opcode(t.code()) {
+                Some(LinkTerm::ShortCond {
+                    prefix67,
+                    opcode,
+                    taken: t.near_branch_target(),
+                    fallthrough: t.next_ip(),
+                })
+            } else {
+                Some(LinkTerm::Cond {
+                    opcode: jcc_opcode(t.code())?,
+                    taken: t.near_branch_target(),
+                    fallthrough: t.next_ip(),
+                })
+            }
+        }
         FlowControl::Call => Some(LinkTerm::DirectCall {
             target: t.near_branch_target(),
             ret: t.next_ip(),
         }),
         _ => None,
     }
+}
+
+/// The `rel8`-only conditional branches: `(needs 67 prefix, opcode byte)`. They
+/// test `rcx`/`ecx` (the `loop` forms also decrement it) and touch no flags
+/// except `loope`/`loopne` reading ZF — all behavior the native instruction
+/// reproduces exactly, so the lowering re-emits it verbatim.
+fn short_cond_opcode(code: Code) -> Option<(bool, u8)> {
+    Some(match code {
+        Code::Loopne_rel8_64_RCX => (false, 0xE0),
+        Code::Loopne_rel8_64_ECX => (true, 0xE0),
+        Code::Loope_rel8_64_RCX => (false, 0xE1),
+        Code::Loope_rel8_64_ECX => (true, 0xE1),
+        Code::Loop_rel8_64_RCX => (false, 0xE2),
+        Code::Loop_rel8_64_ECX => (true, 0xE2),
+        Code::Jrcxz_rel8_64 => (false, 0xE3),
+        Code::Jecxz_rel8_64 => (true, 0xE3),
+        _ => return None,
+    })
 }
 
 /// Whether an edge to `target` from a block starting at `block_start` closes a
@@ -657,6 +869,53 @@ fn build_linked_terminator(
                 edges.push((jcc_rel, taken));
                 edges.push((jmp_rel, fallthrough));
             }
+        }
+        LinkTerm::ShortCond {
+            prefix67,
+            opcode,
+            taken,
+            fallthrough,
+        } => {
+            // No `rel32` form exists, so hop: the native `rel8` instruction skips
+            // the short `jmp` below to land on the taken path; not-taken falls
+            // into that short `jmp`, which reaches the fall-through path. The
+            // native instruction supplies the exact architectural behavior
+            // (`loop`'s rcx decrement, `loope`/`loopne`'s ZF read) and clobbers no
+            // flags, so the two edges link like any other direct branch.
+            if prefix67 {
+                out.push(0x67);
+            }
+            // rel8 = +2: taken skips the 2-byte `EB` short jmp that follows.
+            out.extend_from_slice(&[opcode, 0x02]);
+            out.push(0xEB);
+            let eb_at = out.len();
+            out.push(0x00); // disp8 to fall-through path, patched below
+            // Taken path. `loop`/`jrcxz` are loop primitives, so the taken edge
+            // usually closes a loop: route it through the flag- and rcx-preserving
+            // safepoint poll (the native instruction has already read/decremented
+            // rcx and read ZF, so polling after is safe).
+            let poll = is_back_edge(taken, block_start).then(|| emit_exit_poll(&mut out));
+            pad_rel32_alignment(&mut out, term_pc, 1);
+            out.push(0xE9);
+            let taken_rel = take_rel32(&mut out);
+            // Fall-through path — the `EB` above lands here.
+            let fall_path = out.len();
+            let disp = fall_path as i64 - (eb_at as i64 + 1);
+            out[eb_at] = i8::try_from(disp).expect("shortcond jmp displacement out of range") as u8;
+            pad_rel32_alignment(&mut out, term_pc, 1);
+            out.push(0xE9);
+            let fall_rel = take_rel32(&mut out);
+            let taken_stub = out.len();
+            emit_stub(&mut out, taken, exit_tramp);
+            let fall_stub = out.len();
+            emit_stub(&mut out, fallthrough, exit_tramp);
+            write_rel32(&mut out, taken_rel, taken_stub);
+            write_rel32(&mut out, fall_rel, fall_stub);
+            if let Some(poll_rel) = poll {
+                write_rel32(&mut out, poll_rel, taken_stub);
+            }
+            edges.push((taken_rel, taken));
+            edges.push((fall_rel, fallthrough));
         }
         LinkTerm::DirectCall { target, ret } => {
             // Push the 64-bit return address with a single 8-byte store so the
@@ -816,6 +1075,7 @@ fn emit_terminator(
     instrs: &mut Vec<Instruction>,
     t: &Instruction,
     syscall_tramp: u64,
+    trap_tramp: u64,
 ) -> Result<(), Error> {
     let next_ip = t.next_ip();
     // `syscall` is special: the instruction itself does *not* run. We save
@@ -889,6 +1149,16 @@ fn emit_terminator(
         // guest rip in `gs:[128]`.
         emit_load_rax_imm(instrs, next_ip)?;
         return emit_exit_tail(instrs, syscall_tramp);
+    }
+    // `int3` (and `int1`): a software breakpoint. The instruction does not run
+    // in the cache; it exits through `exit_trap`, which sets `exit_kind = TRAP`
+    // so the run loop raises SIGTRAP. As a trap (not a fault), the resumed rip is
+    // the instruction *after* the breakpoint, exactly where a real `int3` leaves
+    // it, so the saved next guest PC is `next_ip`.
+    if matches!(t.code(), Code::Int3 | Code::Int1) {
+        emit_save_rax(instrs)?;
+        emit_load_rax_imm(instrs, next_ip)?;
+        return emit_exit_tail(instrs, trap_tramp);
     }
     match t.flow_control() {
         FlowControl::UnconditionalBranch => {
@@ -1134,6 +1404,8 @@ mod tests {
     /// starting alignment.
     fn assert_edges_aligned(link: &LinkTerm) {
         for term_pc in 0..8usize {
+            // block_start 0: every target here is a forward edge (no safepoint
+            // poll), exercising the bare linked-terminator alignment.
             let (bytes, edges) = build_linked_terminator(link, 0xdead_beef, 0, term_pc);
             assert!(!edges.is_empty(), "a linked terminator must expose an edge");
             for (off, _target) in edges {

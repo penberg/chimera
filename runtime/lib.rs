@@ -140,6 +140,13 @@ impl ExitStatus {
 /// Errors that can occur when constructing or running a [`Sandbox`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The guest tried to execute unmapped (or otherwise unreadable) memory:
+    /// translation could not read any bytes at this guest address. The run
+    /// loop turns it into a guest `SIGSEGV` there — the fault the guest would
+    /// have taken natively on the fetch.
+    #[error("guest fetch fault at {0:#x}")]
+    BadAccess(u64),
+
     /// The guest binary is malformed: bad magic, truncated header, an
     /// out-of-range offset, missing required segment, and so on.
     #[error("{0}")]

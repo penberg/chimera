@@ -71,6 +71,10 @@ pub fn execv(
     // embedder's syscall handler. The first thread is created against it; future
     // `clone(CLONE_VM)` siblings will share clones of this `Arc`.
     let process = Arc::new(Process::new(handler, code_cache_size)?);
+    // Publish the process for the synchronous fault handler before any guest
+    // code runs, so a self-modifying-code write trap can reach the address
+    // space.
+    super::fault::set_process(&process);
     let mut thread = dispatch::Thread::new(process, rip, rsp)?;
     let _host_mask = HostMaskGuard::save();
     record_regions(
@@ -223,6 +227,7 @@ pub fn exec_errno(err: &Error) -> Option<i32> {
     match err {
         Error::Io { source, .. } => Some(source.raw_os_error().unwrap_or(libc::EIO)),
         Error::BadBinary(_) | Error::Link(_) | Error::Unsupported(_) => Some(libc::ENOEXEC),
+        Error::BadAccess(_) => Some(libc::EFAULT),
         Error::CodeCacheExhausted | Error::Translate(_) => None,
     }
 }

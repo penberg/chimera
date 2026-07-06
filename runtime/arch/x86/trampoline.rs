@@ -18,7 +18,7 @@
 
 use std::{arch::global_asm, mem::offset_of};
 
-use super::dispatch::{EXIT_KIND_SYSCALL, ThreadState};
+use super::dispatch::{EXIT_KIND_SYSCALL, EXIT_KIND_TRAP, ThreadState};
 
 /// Byte offset of `ThreadState::regs[idx]`.
 const fn reg_off(idx: usize) -> usize {
@@ -51,10 +51,12 @@ global_asm!(
     TS_FPSTATE     = const offset_of!(ThreadState, fpstate),
     TS_CHIMERA_FS  = const offset_of!(ThreadState, chimera_fs_base),
     EXIT_KIND_SYSCALL = const EXIT_KIND_SYSCALL,
+    EXIT_KIND_TRAP = const EXIT_KIND_TRAP,
 );
 
 unsafe extern "C" {
     pub fn dispatch(ctx: *mut ThreadState, host_pc: u64);
     pub fn exit_block();
     pub fn exit_syscall();
+    pub fn exit_trap();
 }

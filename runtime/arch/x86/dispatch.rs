@@ -29,13 +29,21 @@ use crate::{
     },
 };
 
-use super::trampoline::{dispatch, exit_block, exit_syscall};
+use super::trampoline::{dispatch, exit_block, exit_syscall, exit_trap};
 
 /// Linux x86-64 `arch_prctl` subfunction code: set the GS base.
 const ARCH_SET_GS: libc::c_int = 0x1001;
 
 const EXIT_KIND_BLOCK: u64 = 0;
 pub const EXIT_KIND_SYSCALL: u64 = 1;
+/// A guest breakpoint (`int3`) exited the cache: the run loop raises `SIGTRAP`.
+pub const EXIT_KIND_TRAP: u64 = 2;
+
+/// `SIGTRAP`, raised on a guest `int3`.
+const SIGTRAP: u32 = 5;
+
+/// `SIGSEGV`, raised on a guest jump to unmapped memory (a fetch fault).
+const SIGSEGV: u32 = 11;
 
 /// Why [`Thread::run`] returned: the guest terminated, or it `execve`d and the
 /// caller must load the new image and re-enter the thread on it.
@@ -108,6 +116,13 @@ pub struct Thread {
     /// while siblings are still alive, it must wait for them rather than tear the
     /// process down. A `clone(CLONE_VM)` child is never main.
     is_main: bool,
+    /// Write end of the report pipe a `vfork`/`posix_spawn` child uses to hand
+    /// its `execve` outcome back to the parent that is blocked in the clone
+    /// (see the spawn path in `crate::syscall`). Set only in such a child; its
+    /// `execve` writes the outcome and closes it, so the parent — which mirrors
+    /// `CLONE_VFORK` by blocking on the read end — can return the child PID or
+    /// the exec errno synchronously.
+    spawn_report_fd: Option<i32>,
 }
 
 impl Thread {
@@ -147,6 +162,7 @@ impl Thread {
             restart: None,
             clear_child_tid: None,
             is_main: true,
+            spawn_report_fd: None,
         };
         thread.state.pending_set = thread.signals.pending_set_ptr() as u64;
         thread.reset(rip, rsp, guest_fs_base);
@@ -176,6 +192,7 @@ impl Thread {
             restart: None,
             clear_child_tid,
             is_main: false,
+            spawn_report_fd: None,
         }
     }
 
@@ -376,6 +393,33 @@ impl Thread {
         &mut self.signals
     }
 
+    /// Record the write end of a spawn child's `execve`-outcome report pipe.
+    pub fn set_spawn_report_fd(&mut self, fd: i32) {
+        self.spawn_report_fd = Some(fd);
+    }
+
+    /// A spawn child's `execve` succeeded: close the report pipe so the parent
+    /// blocked on its read end sees EOF and returns the child PID. A no-op on a
+    /// thread that is not a spawn child.
+    pub fn report_spawn_success(&mut self) {
+        if let Some(fd) = self.spawn_report_fd.take() {
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// A spawn child's `execve` failed: send the errno to the parent (which
+    /// returns it from `posix_spawn`) then close the pipe. A no-op on a thread
+    /// that is not a spawn child.
+    pub fn report_spawn_failure(&mut self, errno: i32) {
+        if let Some(fd) = self.spawn_report_fd.take() {
+            let bytes = errno.to_ne_bytes();
+            unsafe {
+                libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+                libc::close(fd);
+            }
+        }
+    }
+
     /// Restore the pre-signal guest context on a guest `rt_sigreturn`.
     pub fn sigreturn(&mut self) {
         let state = &mut *self.state;
@@ -448,6 +492,7 @@ impl Thread {
 
         let block_exit = exit_block as *const () as usize as u64;
         let syscall_exit = exit_syscall as *const () as usize as u64;
+        let trap_exit = exit_trap as *const () as usize as u64;
 
         // Emit (once per cache) the shared inline indirect-branch lookup routine
         // and record its address so translated indirect branches can reach it.
@@ -494,22 +539,45 @@ impl Thread {
             // Hold the address-space lock only long enough to resolve (and, on a
             // miss, translate) the next block; the guard drops at the end of this
             // statement, before `dispatch()` runs the block.
-            let host_pc = self
-                .process
-                .addr_space
-                .lock()
-                .unwrap()
-                .code
-                .resolve(rip, block_exit, syscall_exit)
-                .unwrap_or_else(|e| panic!("translate failed at {:#x}: {}", rip, e));
+            let host_pc = match self.process.addr_space.lock().unwrap().resolve(
+                rip,
+                block_exit,
+                syscall_exit,
+                trap_exit,
+            ) {
+                Ok(host_pc) => host_pc,
+                // The guest jumped to unmapped memory — a wild indirect branch
+                // through a corrupted pointer, say. Natively the fetch faults;
+                // raise the same SIGSEGV: it enters the guest's handler, or
+                // (default action) terminates the process faithfully.
+                Err(Error::BadAccess(_)) => {
+                    let restart = self.restart.take();
+                    let state = &mut *self.state;
+                    self.signals.deliver(state, SIGSEGV, restart);
+                    continue;
+                }
+                Err(e) => panic!("translate failed at {:#x}: {}", rip, e),
+            };
             unsafe {
                 (*ts_ptr).exit_kind = EXIT_KIND_BLOCK;
                 dispatch(ts_ptr, host_pc);
             }
-            if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL
-                && let Some(reason) = self.handle_syscall()
-            {
-                return Ok(reason);
+            match unsafe { (*ts_ptr).exit_kind } {
+                EXIT_KIND_SYSCALL => {
+                    if let Some(reason) = self.handle_syscall() {
+                        return Ok(reason);
+                    }
+                }
+                EXIT_KIND_TRAP => {
+                    // A guest `int3` exited here with `rip` already at the
+                    // instruction after the breakpoint. Raise SIGTRAP: it enters
+                    // the guest's handler, or (default action) terminates the
+                    // process with a faithful SIGTRAP status.
+                    let restart = self.restart.take();
+                    let state = &mut *self.state;
+                    self.signals.deliver(state, SIGTRAP, restart);
+                }
+                _ => {}
             }
         }
         // Absent an `exit_group`, the kernel reports the status of the last
@@ -607,7 +675,7 @@ impl Thread {
 /// every `clone3` must supply. The kernel rejects a smaller struct with
 /// `EINVAL` and one larger than a page with `E2BIG`.
 const CLONE_ARGS_SIZE_VER0: u64 = 64;
-const CLONE_ARGS_SIZE_MAX: u64 = 4096;
+pub const CLONE_ARGS_SIZE_MAX: u64 = 4096;
 
 /// Copy the base `clone_args` struct a `clone3` points at out of guest
 /// memory, fault-safely (see [`copy_from_guest`]). `None` — returned for an

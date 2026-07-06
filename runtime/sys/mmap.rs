@@ -1,9 +1,12 @@
 //! The guest address space: the translated-block cache ([`BlockCache`]) and the
 //! guest mappings Chimera owns on the host.
 
-use std::sync::OnceLock;
+use std::{collections::HashSet, sync::OnceLock};
 
 use crate::{Error, arch::x86::cache::BlockCache};
+
+/// Guest page size (x86-64); SMC arming and invalidation work per page.
+const PAGE: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Region {
@@ -16,14 +19,131 @@ struct Region {
 pub struct AddressSpace {
     pub code: BlockCache,
     regions: Vec<Region>,
+    /// Pages Chimera has write-protected on the host to trap self-modifying
+    /// code: every page it has translated a block from. A guest store to one
+    /// traps into [`on_smc_write`]. A page leaves the set when its trap fires
+    /// (and write is restored) or when the guest re-protects or unmaps it; it is
+    /// re-armed the next time a block is translated from it. A `HashSet` so the
+    /// fault-path `remove` neither allocates nor frees.
+    armed: HashSet<usize>,
+    /// Pages whose write permission Chimera has restored (after a trap) and not
+    /// yet re-armed. Needed to disambiguate a concurrent-store race: two threads
+    /// can both store to an armed page and both trap; the first restores write
+    /// and disarms, so the second sees the page un-armed even though its store
+    /// will now succeed. A fault on a `granted` page is that benign race — re-run
+    /// the store — not a genuine fault. Pre-reserved so the fault-path `insert`
+    /// does not allocate in the common case.
+    granted: HashSet<usize>,
 }
 
 impl AddressSpace {
     pub fn new(code_cache_size: usize) -> Result<Self, Error> {
+        let mut granted = HashSet::new();
+        granted.reserve(1 << 16);
         Ok(Self {
             code: BlockCache::new(code_cache_size)?,
             regions: Vec::new(),
+            armed: HashSet::new(),
+            granted,
         })
+    }
+
+    /// Translate (or look up) the block at guest `rip` and return its host PC.
+    /// A freshly translated block's guest page(s) are armed for SMC so a later
+    /// in-place rewrite of that code traps.
+    pub fn resolve(
+        &mut self,
+        rip: u64,
+        block_exit: u64,
+        syscall_exit: u64,
+        trap_exit: u64,
+    ) -> Result<u64, Error> {
+        let (host_pc, span) = self
+            .code
+            .resolve(rip, block_exit, syscall_exit, trap_exit)?;
+        if let Some((start, end)) = span {
+            self.arm_span(start, end);
+        }
+        Ok(host_pc)
+    }
+
+    /// A fresh `mmap` reset the host protection of `[start, start+len)`: clear
+    /// any stale armed bits and translations left by a previous mapping that
+    /// used these addresses, so the new mapping arms and translates from a clean
+    /// slate. Without this a reused page keeps its old armed bit, `arm_span`
+    /// skips re-protecting it, and a write to the new code never traps.
+    pub fn note_map(&mut self, start: usize, len: usize) {
+        self.invalidate_and_disarm(start, len);
+    }
+
+    /// A guest `mprotect` reset the host protection of `[start, start+len)`
+    /// (so its pages leave the armed set) and may precede a rewrite of code on a
+    /// W^X-toggled JIT page, so drop the stale translations there. Cheap for a
+    /// huge range: only translated pages are visited, and only armed pages
+    /// cleared.
+    pub fn note_prot(&mut self, start: usize, len: usize) {
+        self.invalidate_and_disarm(start, len);
+    }
+
+    /// Forget a range the guest unmapped: drop its translations and disarm it.
+    /// The host mapping is already gone, so a later mapping that reuses these
+    /// addresses starts clean.
+    pub fn note_unmap(&mut self, start: usize, len: usize) {
+        self.invalidate_and_disarm(start, len);
+    }
+
+    /// Handle a write fault at host/guest address `addr` (they share the address
+    /// space). If it lands on an armed SMC page, drop that page's translations,
+    /// restore write permission so the store completes, and report it handled.
+    /// A fault on any other page is not ours — a genuine guest fault. Runs in the
+    /// synchronous fault handler, so it allocates nothing.
+    pub fn on_smc_write(&mut self, addr: usize) -> bool {
+        let page = addr & !(PAGE - 1);
+        if !self.armed.remove(&page) {
+            // Already disarmed: a benign race if another thread just restored
+            // write to this same page (re-run the store); otherwise not ours.
+            return self.granted.contains(&page);
+        }
+        self.code.invalidate_page(page as u64);
+        self.granted.insert(page);
+        // Restore the guest's writable mapping (never executable on the host).
+        unsafe {
+            libc::mprotect(
+                page as *mut libc::c_void,
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
+        }
+        true
+    }
+
+    /// Write-protect every page a freshly translated block covers, so a later
+    /// store to that code traps into [`on_smc_write`]. Only executed pages reach
+    /// here, so data and stacks are never armed; static read-only code is armed
+    /// too, but the `mprotect` to read-only is a no-op and the guest never writes
+    /// it.
+    fn arm_span(&mut self, start: u64, end: u64) {
+        for page in pages(start as usize, (end - start) as usize) {
+            if self.armed.insert(page) {
+                self.granted.remove(&page);
+                unsafe { libc::mprotect(page as *mut libc::c_void, PAGE, libc::PROT_READ) };
+            }
+        }
+    }
+
+    /// Drop translations for, and disarm, every page in `[start, start+len)`.
+    /// The host protection of the range was just reset by the guest (`mprotect`)
+    /// or removed (`munmap`), so the armed pages are no longer Chimera's to
+    /// re-protect — clearing the bit lets them re-arm on the next translation.
+    fn invalidate_and_disarm(&mut self, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let lo = (start & !(PAGE - 1)) as u64;
+        let hi = ((start + len - 1) & !(PAGE - 1)) as u64;
+        self.code.invalidate_range(lo, hi);
+        self.armed.retain(|&p| (p as u64) < lo || (p as u64) > hi);
+        self.granted.retain(|&p| (p as u64) < lo || (p as u64) > hi);
     }
 
     pub fn add_region(&mut self, start: usize, len: usize) {
@@ -91,6 +211,8 @@ impl AddressSpace {
     pub fn reset(&mut self) {
         self.clear_regions();
         self.code.reset();
+        self.armed.clear();
+        self.granted.clear();
     }
 
     fn clear_regions(&mut self) {
@@ -175,6 +297,20 @@ pub fn copy_to_guest(addr: u64, buf: &[u8]) -> bool {
     };
     let copied = unsafe { libc::process_vm_writev(libc::getpid(), &local, 1, &remote, 1, 0) };
     copied == buf.len() as isize
+}
+
+/// Page-aligned base addresses of every page the range `[start, start+len)`
+/// touches. Empty when `len` is zero.
+fn pages(start: usize, len: usize) -> impl Iterator<Item = usize> {
+    let first = start & !(PAGE - 1);
+    let end = start.saturating_add(len);
+    let last = end.saturating_sub(1) & !(PAGE - 1);
+    let count = if len == 0 {
+        0
+    } else {
+        (last - first) / PAGE + 1
+    };
+    (0..count).map(move |i| first + i * PAGE)
 }
 
 fn round_mapping_len(len: usize) -> usize {
