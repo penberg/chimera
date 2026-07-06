@@ -98,7 +98,7 @@ pub fn drive(thread: &mut dispatch::Thread, mut reason: ExitReason) -> Result<i3
                 // `-errno` in place and never left the run). Linux's
                 // `de_thread` kills every other thread before installing a
                 // new image; the commit requested that stop, so wait until
-                // the last sibling has drained out of the live set before
+                // the last sibling has drained out of the thread list before
                 // tearing down mappings a straggler could still be
                 // translating or executing.
                 thread.process().wait_exec_quiesce();

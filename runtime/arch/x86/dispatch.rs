@@ -14,7 +14,7 @@ use std::{
     arch::asm,
     sync::{
         Arc, MutexGuard,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicI32, AtomicU32, Ordering},
         mpsc,
     },
     thread,
@@ -56,19 +56,19 @@ pub enum ExitReason {
 /// selects AMX, so the area size is bounded regardless of the host's XCR0.
 const XSAVE_AREA_SIZE: usize = 4096;
 
-/// Removes a thread from the process's live set when its run loop ends, on
+/// Removes a thread from the process's thread list when its run loop ends, on
 /// every exit path. Holds the thread's identity — the address of its
-/// `exit_requested` safepoint slot, stable across a fork where the TID is not
-/// — which unregistration compares and never dereferences. See
+/// `ThreadState`, stable across a fork where the TID is not — which
+/// unregistration compares and never dereferences. See
 /// [`Process::register_thread`].
-struct LiveGuard {
+struct ThreadGuard {
     process: Arc<Process>,
-    slot: *const AtomicU32,
+    state: *const ThreadState,
 }
 
-impl Drop for LiveGuard {
+impl Drop for ThreadGuard {
     fn drop(&mut self) {
-        self.process.unregister_thread(self.slot);
+        self.process.unregister_thread(self.state);
     }
 }
 
@@ -138,6 +138,7 @@ impl Thread {
                 _align_fpstate: [0; 5],
                 fpstate: [0; XSAVE_AREA_SIZE],
                 pending_set: 0,
+                tid: AtomicI32::new(0),
             }),
             process,
             signals,
@@ -192,9 +193,11 @@ impl Thread {
     /// around it.
     pub fn reset_after_fork(&mut self) {
         self.is_main = true;
-        let my_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
-        self.process
-            .reset_after_fork(&self.state.exit_requested, my_tid);
+        self.state.tid.store(
+            unsafe { libc::syscall(libc::SYS_gettid) } as i32,
+            Ordering::Release,
+        );
+        self.process.reset_after_fork(&self.state);
     }
 
     /// Record this thread's `clear_child_tid` word (from `set_tid_address`). A
@@ -428,17 +431,19 @@ impl Thread {
         self.signals.mirror_host_mask();
         self.running = true;
 
-        // Join the live-thread set so a sibling's process-wide stop can reach
+        // Join the thread list so a sibling's process-wide stop can reach
         // this thread: the interrupt signal if it parks in a host syscall, the
         // registered `exit_requested` safepoint slot if it is executing fully
         // linked translated code. The guard removes it on every exit path
         // (including the `execve` early return).
-        let my_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
-        self.process
-            .register_thread(my_tid, &self.state.exit_requested);
-        let _live_guard = LiveGuard {
+        self.state.tid.store(
+            unsafe { libc::syscall(libc::SYS_gettid) } as i32,
+            Ordering::Release,
+        );
+        self.process.register_thread(&self.state);
+        let _thread_guard = ThreadGuard {
             process: Arc::clone(&self.process),
-            slot: &self.state.exit_requested,
+            state: &*self.state,
         };
 
         let block_exit = exit_block as *const () as usize as u64;
@@ -509,7 +514,7 @@ impl Thread {
         }
         // Absent an `exit_group`, the kernel reports the status of the last
         // thread to exit as the process's `wait(2)` status, so every thread
-        // records its own on the way out — while it is still in the live set.
+        // records its own on the way out — while it is still in the thread list.
         self.process.record_exit_status(self.exit_code);
         if self.is_main {
             // A committed execve dissolves the group instead of ending the
@@ -528,7 +533,7 @@ impl Thread {
             // while this thread waits; the group then dissolves into the new
             // image rather than exiting.
             if !self.process.is_exiting() {
-                self.exit_code = self.process.wait_for_others(&self.state.exit_requested);
+                self.exit_code = self.process.wait_for_others(&self.state);
                 if self.process.exec_pending() {
                     return Ok(ExitReason::Execve);
                 }
@@ -722,6 +727,13 @@ pub struct ThreadState {
     /// pointer is how the async-signal-safe catcher finds the right set with
     /// no TLS. Placed after `fpstate` so every offset above is unchanged.
     pub pending_set: u64,
+    /// The kernel TID of the host thread backing this guest thread. Written by
+    /// the owning thread at run entry — and rewritten in a fork child, where
+    /// the copied value names a thread that no longer exists — and read by
+    /// siblings through the thread list as the target for the reserved interrupt
+    /// signal. Atomic because those reads are cross-thread; placed after
+    /// `fpstate` so every `gs:[]` offset above is unchanged.
+    pub tid: AtomicI32,
 }
 
 // XSAVE/XRSTOR #GP unless the save area is 64-byte aligned. The struct's
@@ -801,6 +813,9 @@ impl ThreadState {
             // published by `Thread::from_state`. Copying the parent's pointer
             // would let the catcher record the child's signals on the parent.
             pending_set: 0,
+            // Cleared for the same reason as the run-entry store: the child
+            // publishes its own TID before it runs any guest code.
+            tid: AtomicI32::new(0),
         });
         child.regs[RAX] = 0;
         child.regs[RSP] = child_stack;

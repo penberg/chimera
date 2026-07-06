@@ -294,9 +294,7 @@ mod host {
                 // process exits. Forwarding to the host instead would kill the
                 // embedder's process, which the runtime must not do.
                 let code = call.args[0] as i32;
-                thread
-                    .process()
-                    .request_exit_group(code, &thread.state.exit_requested);
+                thread.process().request_exit_group(code, &thread.state);
                 thread.exit_code = code;
                 thread.running = false;
             }
@@ -323,9 +321,7 @@ mod host {
                         // and never observes a return value, and neither does
                         // this one: the pending stop takes the thread at its
                         // next boundary, before the guest could read rax.
-                        thread
-                            .process()
-                            .request_exec(prepared, &thread.state.exit_requested);
+                        thread.process().request_exec(prepared, &thread.state);
                         // Report success so observers see the allowed call; the
                         // guest never reads it — a successful execve does not
                         // return.
