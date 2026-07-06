@@ -771,10 +771,121 @@ fn emit_body(
     if instrs.is_empty() {
         return Ok(());
     }
+    let rewritten = rewrite_far_rip_operands(instrs, host_pc)?;
+    let instrs = rewritten.as_deref().unwrap_or(instrs);
     let block = InstructionBlock::new(instrs, host_pc);
     let result = BlockEncoder::encode(64, block, BlockEncoderOptions::NONE)
         .map_err(|e| Error::Translate(format!("encode block at {:#x}: {}", guest_pc, e)))?;
     cache.emit(&result.code_buffer)
+}
+
+/// Slack subtracted from the `rel32` range when deciding whether a RIP-relative
+/// target is still reachable once the instruction moves into the code cache. The
+/// displacement is measured from the instruction's own position within the
+/// encoded block, not from `host_pc`, and an encoded block is bounded far below
+/// this (a block decodes at most [`MAX_BLOCK_GUEST_BYTES`] guest bytes).
+const RIP_REACH_SLACK: u64 = 1 << 20;
+
+fn rip_reachable(target: u64, host_pc: u64) -> bool {
+    let disp = target as i128 - host_pc as i128;
+    disp.unsigned_abs() < (i32::MAX as u64 - RIP_REACH_SLACK) as u128
+}
+
+/// Rewrite every RIP-relative memory operand whose effective address is out of
+/// `rel32` range of the block's spot in the code cache — guest code mapped tens
+/// of terabytes from the cache, such as a JIT region JavaScriptCore places at a
+/// randomized high address. `BlockEncoder` preserves a RIP-relative operand's
+/// effective address by adjusting its displacement, which fails outright for
+/// such a target, so the access is re-expressed through a borrowed register
+/// instead: stash the register in the `riprel_scratch` slot, materialize the
+/// absolute guest address, run the original instruction with the register as
+/// its base, and reload the register. None of the inserted `mov`s touch the
+/// arithmetic flags, so flags stay live from the block's body into its
+/// terminator, and the borrowed register's guest value is unreachable only
+/// within the sequence itself: an SMC write fault inside it resumes at the
+/// faulting store with all host registers intact, and any other fault there is
+/// terminal.
+///
+/// Returns `None` when every operand is in range, which is every block outside
+/// such far regions, so the common path encodes the original list untouched.
+fn rewrite_far_rip_operands(
+    instrs: &[Instruction],
+    host_pc: u64,
+) -> Result<Option<Vec<Instruction>>, Error> {
+    let far = |i: &Instruction| {
+        i.is_ip_rel_memory_operand() && !rip_reachable(i.ip_rel_memory_address(), host_pc)
+    };
+    if !instrs.iter().any(far) {
+        return Ok(None);
+    }
+    let slot = offset_of!(ThreadState, riprel_scratch) as i64;
+    let mut info_factory = InstructionInfoFactory::new();
+    let mut out = Vec::with_capacity(instrs.len() + 3);
+    for instr in instrs {
+        if !far(instr) {
+            out.push(*instr);
+            continue;
+        }
+        let scratch = pick_scratch(&mut info_factory, instr)?;
+        let target = instr.ip_rel_memory_address();
+        out.push(mkinstr(Instruction::with2(
+            Code::Mov_rm64_r64,
+            gs_qword(slot),
+            scratch,
+        ))?);
+        out.push(mkinstr(Instruction::with2(
+            Code::Mov_r64_imm64,
+            scratch,
+            target,
+        ))?);
+        let mut patched = *instr;
+        patched.set_memory_base(scratch);
+        patched.set_memory_displacement64(0);
+        patched.set_memory_displ_size(0);
+        out.push(patched);
+        out.push(mkinstr(Instruction::with2(
+            Code::Mov_r64_rm64,
+            scratch,
+            gs_qword(slot),
+        ))?);
+    }
+    Ok(Some(out))
+}
+
+/// Pick a register the far-RIP rewrite can borrow around `instr`: any GPR the
+/// instruction neither reads nor writes, explicitly or implicitly (`mul m64`
+/// consumes rax and rdx with no visible register operand). rsp is never a
+/// candidate — the host fault handler runs on whatever stack rsp names — and
+/// rbp/r13 are skipped so the zero-displacement base encodes uniformly. An
+/// instruction has at most a handful of register operands, so the eight
+/// candidates cannot all be taken.
+fn pick_scratch(
+    info_factory: &mut InstructionInfoFactory,
+    instr: &Instruction,
+) -> Result<Register, Error> {
+    const CANDIDATES: [Register; 8] = [
+        Register::RAX,
+        Register::RCX,
+        Register::RDX,
+        Register::RBX,
+        Register::RSI,
+        Register::RDI,
+        Register::R8,
+        Register::R9,
+    ];
+    let info = info_factory.info(instr);
+    let free = |c: &Register| {
+        !info
+            .used_registers()
+            .iter()
+            .any(|u| u.register().full_register() == *c)
+    };
+    CANDIDATES.iter().find(|c| free(c)).copied().ok_or_else(|| {
+        Error::Translate(format!(
+            "no scratch register for far RIP-relative operand at {:#x}",
+            instr.ip()
+        ))
+    })
 }
 
 /// `gs:[]` displacement of the guest's rax slot (`regs[0]`); cold exit stubs
@@ -1773,5 +1884,76 @@ mod tests {
         let key = unsafe { (cache.ib_table.add(slot) as *const u64).read() };
         assert_ne!(key, u64::MAX);
         assert_ne!(ib_slot(key), ib_slot(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod riprel_tests {
+    use super::*;
+
+    fn decode_at(bytes: &[u8], ip: u64) -> Instruction {
+        Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE).decode()
+    }
+
+    /// A RIP-relative operand within `rel32` reach of the cache is left to the
+    /// encoder's ordinary fixup: no rewrite, no inserted instructions.
+    #[test]
+    fn near_rip_operand_is_untouched() {
+        // addq $0x1e, 0x1e00(%rip)
+        let instr = decode_at(
+            &[0x48, 0x83, 0x05, 0x00, 0x1e, 0x00, 0x00, 0x1e],
+            0x7f0000001000,
+        );
+        assert!(instr.is_ip_rel_memory_operand());
+        assert!(
+            rewrite_far_rip_operands(&[instr], 0x7f0012340000)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A far RIP-relative operand becomes the borrow sequence — save scratch,
+    /// materialize the absolute target, run the access `[scratch]`-based,
+    /// reload scratch — and the result must actually encode from the cache
+    /// address the original operand could not reach.
+    #[test]
+    fn far_rip_operand_is_rewritten_and_encodes() {
+        // addq $0x1e, 0x1e00(%rip) linked tens of terabytes from the cache.
+        let instr = decode_at(
+            &[0x48, 0x83, 0x05, 0x00, 0x1e, 0x00, 0x00, 0x1e],
+            0x35f50000200,
+        );
+        let target = instr.ip_rel_memory_address();
+        let host_pc = 0x7f0012340000u64;
+        let out = rewrite_far_rip_operands(&[instr], host_pc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1].code(), Code::Mov_r64_imm64);
+        assert_eq!(out[1].immediate64(), target);
+        let scratch = out[1].op0_register();
+        assert_eq!(out[2].code(), Code::Add_rm64_imm8);
+        assert_eq!(out[2].memory_base(), scratch);
+        assert!(!out[2].is_ip_rel_memory_operand());
+        BlockEncoder::encode(
+            64,
+            InstructionBlock::new(&out, host_pc),
+            BlockEncoderOptions::NONE,
+        )
+        .expect("rewritten block must encode");
+    }
+
+    /// The borrowed register must not collide with any register the
+    /// instruction touches, including implicit uses: `mul qword [rip+d]`
+    /// names no register operand yet consumes rax and rdx.
+    #[test]
+    fn scratch_avoids_implicit_registers() {
+        // mulq 0x1e00(%rip)
+        let instr = decode_at(&[0x48, 0xf7, 0x25, 0x00, 0x1e, 0x00, 0x00], 0x35f50000200);
+        let out = rewrite_far_rip_operands(&[instr], 0x7f0012340000)
+            .unwrap()
+            .unwrap();
+        let scratch = out[1].op0_register();
+        assert!(!matches!(scratch, Register::RAX | Register::RDX));
     }
 }
