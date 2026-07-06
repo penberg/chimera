@@ -3,7 +3,10 @@
 use std::{
     ffi::OsStr,
     fs,
-    os::unix::ffi::OsStrExt,
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::FileExt},
+    },
     path::{Path, PathBuf},
     ptr,
 };
@@ -79,41 +82,56 @@ pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
 /// no memory, so a malformed image is reported as a recoverable error rather
 /// than after the loader has started committing mappings.
 pub struct ParsedElf {
-    bytes: Vec<u8>,
     ehdr: Ehdr,
     phdrs: Vec<Phdr>,
     pub interp: Option<PathBuf>,
     lo: u64,
     hi: u64,
+    /// The image, held open since [`parse_elf`] read it, for [`map_elf`] to
+    /// map `PT_LOAD` segments file-backed — a guest `madvise(MADV_DONTNEED)`
+    /// on such a segment then re-reads the file (as it would natively),
+    /// instead of zero-filling an anonymous copy and silently losing the
+    /// segment's data. Holding the fd rather than the path pins the inode the
+    /// headers were validated against, so a file swapped in at the same path
+    /// later is never mapped, and the execve commit phase resolves no paths
+    /// after the old image is torn down. Overwriting the inode in place still
+    /// mutates the running image — the hazard every shared library has
+    /// natively; a userspace loader cannot take `execve`'s `ETXTBSY` lock.
+    file: fs::File,
 }
 
 /// Read an ELF image and validate that Chimera can run it, without mapping
 /// anything.
 pub fn parse_elf(path: &Path) -> Result<ParsedElf, Error> {
-    let bytes = fs::read(path).map_err(|e| Error::io(format!("reading {}", path.display()), e))?;
-    if bytes.len() < std::mem::size_of::<Ehdr>() {
-        return Err(Error::BadBinary(format!(
-            "{} is too short for an ELF",
-            path.display()
-        )));
-    }
-    if &bytes[..4] != b"\x7fELF" {
+    let file =
+        fs::File::open(path).map_err(|e| Error::io(format!("opening {}", path.display()), e))?;
+    // A short read is a malformed image (recoverable ENOEXEC), not an I/O
+    // failure; likewise for the header-table and PT_INTERP reads below.
+    let mut ehdr_bytes = [0u8; std::mem::size_of::<Ehdr>()];
+    file.read_exact_at(&mut ehdr_bytes, 0).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::BadBinary(format!("{} is too short for an ELF", path.display()))
+        } else {
+            Error::io(format!("reading {}", path.display()), e)
+        }
+    })?;
+    if &ehdr_bytes[..4] != b"\x7fELF" {
         return Err(Error::BadBinary(format!(
             "{} is not an ELF file",
             path.display()
         )));
     }
-    if bytes[4] != 2 {
+    if ehdr_bytes[4] != 2 {
         return Err(Error::BadBinary(format!("{} is not ELF64", path.display())));
     }
-    if bytes[5] != 1 {
+    if ehdr_bytes[5] != 1 {
         return Err(Error::BadBinary(format!(
             "{} is not little-endian",
             path.display()
         )));
     }
 
-    let ehdr: Ehdr = unsafe { ptr::read_unaligned(bytes.as_ptr() as *const Ehdr) };
+    let ehdr: Ehdr = unsafe { ptr::read_unaligned(ehdr_bytes.as_ptr() as *const Ehdr) };
     if ehdr.e_machine != EM_X86_64 {
         return Err(Error::BadBinary(format!(
             "{} is not x86-64",
@@ -127,30 +145,65 @@ pub fn parse_elf(path: &Path) -> Result<ParsedElf, Error> {
         )));
     }
 
-    let phoff = ehdr.e_phoff as usize;
-    let phentsize = ehdr.e_phentsize as usize;
-    let phnum = ehdr.e_phnum as usize;
-    if phoff + phentsize * phnum > bytes.len() {
+    // Linux likewise accepts no other entry size; it is also what lets the
+    // table be read below as a packed array of `Phdr`.
+    if ehdr.e_phentsize as usize != std::mem::size_of::<Phdr>() {
         return Err(Error::BadBinary(format!(
-            "{}: program headers exceed file",
+            "{}: e_phentsize is not the size of a program header",
             path.display()
         )));
     }
+    let phnum = ehdr.e_phnum as usize;
+    let mut table = vec![0u8; phnum * std::mem::size_of::<Phdr>()];
+    file.read_exact_at(&mut table, ehdr.e_phoff).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::BadBinary(format!("{}: program headers exceed file", path.display()))
+        } else {
+            Error::io(format!("reading program headers of {}", path.display()), e)
+        }
+    })?;
 
     let mut phdrs = Vec::with_capacity(phnum);
-    for i in 0..phnum {
-        let off = phoff + i * phentsize;
-        let p: Phdr = unsafe { ptr::read_unaligned(bytes[off..].as_ptr() as *const Phdr) };
+    for entry in table.chunks_exact(std::mem::size_of::<Phdr>()) {
+        let p: Phdr = unsafe { ptr::read_unaligned(entry.as_ptr() as *const Phdr) };
+        // `map_elf` places each `PT_LOAD` by mapping the file at
+        // `p_offset - (p_vaddr % PAGE_SIZE)`, which lands the bytes at
+        // `p_vaddr` only when the two offsets share a page residue. Reject
+        // the malformed case here, in the recoverable parse phase, so a guest
+        // `execve` of such an image fails with `ENOEXEC` instead of dying
+        // mid-commit after the old image is gone.
+        if p.p_type == PT_LOAD && p.p_offset % PAGE_SIZE != p.p_vaddr % PAGE_SIZE {
+            return Err(Error::BadBinary(format!(
+                "{}: PT_LOAD vaddr {:#x} and file offset {:#x} disagree modulo the page size",
+                path.display(),
+                p.p_vaddr,
+                p.p_offset
+            )));
+        }
         phdrs.push(p);
     }
 
     let mut interp = None;
     for ph in &phdrs {
         if ph.p_type == PT_INTERP {
-            let start = ph.p_offset as usize;
-            let end = start + ph.p_filesz as usize;
-            let slice = &bytes[start..end];
-            let slice = slice.strip_suffix(b"\0").unwrap_or(slice);
+            // Linux bounds the interpreter path by PATH_MAX; without the cap a
+            // malformed p_filesz would drive the allocation here.
+            if ph.p_filesz == 0 || ph.p_filesz > PAGE_SIZE {
+                return Err(Error::BadBinary(format!(
+                    "{}: PT_INTERP size {:#x}",
+                    path.display(),
+                    ph.p_filesz
+                )));
+            }
+            let mut buf = vec![0u8; ph.p_filesz as usize];
+            file.read_exact_at(&mut buf, ph.p_offset).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    Error::BadBinary(format!("{}: PT_INTERP exceeds file", path.display()))
+                } else {
+                    Error::io(format!("reading PT_INTERP of {}", path.display()), e)
+                }
+            })?;
+            let slice = buf.strip_suffix(b"\0").unwrap_or(&buf);
             interp = Some(PathBuf::from(OsStr::from_bytes(slice)));
             break;
         }
@@ -158,12 +211,12 @@ pub fn parse_elf(path: &Path) -> Result<ParsedElf, Error> {
 
     let (lo, hi) = load_range(&phdrs);
     Ok(ParsedElf {
-        bytes,
         ehdr,
         phdrs,
         interp,
         lo,
         hi,
+        file,
     })
 }
 
@@ -171,12 +224,12 @@ pub fn parse_elf(path: &Path) -> Result<ParsedElf, Error> {
 /// `PT_LOAD` mappings it makes cannot be rolled back.
 pub fn map_elf(parsed: &ParsedElf) -> Result<LoadedElf, Error> {
     let ParsedElf {
-        bytes,
         ehdr,
         phdrs,
         interp,
         lo,
         hi,
+        file,
     } = parsed;
     let (lo, hi) = (*lo, *hi);
 
@@ -234,46 +287,80 @@ pub fn map_elf(parsed: &ParsedElf) -> Result<LoadedElf, Error> {
             prot |= libc::PROT_READ;
         }
 
-        let map_flags = if ehdr.e_type == ET_EXEC {
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE
+        let fixed = if ehdr.e_type == ET_EXEC {
+            libc::MAP_FIXED_NOREPLACE
         } else {
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED
+            libc::MAP_FIXED
         };
 
-        let p = unsafe {
-            libc::mmap(
-                vstart as *mut libc::c_void,
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                map_flags,
-                -1,
-                0,
-            )
+        // Map the file-backed part [vstart, file_map_end) from the image, at the
+        // page-aligned file offset. [`parse_elf`] verified the segment's file and
+        // virtual offsets share a page residue, so this places the bytes at
+        // `vaddr`. The last partial page's tail past `p_filesz` is zero-filled by
+        // the kernel. Mapped writable up front; `mprotect` sets the final prot.
+        let file_end = vaddr + ph.p_filesz;
+        let file_map_end = (file_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let file_off = ph.p_offset - (vaddr - vstart);
+        if ph.p_filesz > 0 {
+            let flen = (file_map_end - vstart) as usize;
+            let p = unsafe {
+                libc::mmap(
+                    vstart as *mut libc::c_void,
+                    flen,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | fixed,
+                    file.as_raw_fd(),
+                    file_off as libc::off_t,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return Err(Error::last_os_error(format!(
+                    "mmap PT_LOAD at {:#x}",
+                    vstart
+                )));
+            }
+            if p as u64 != vstart {
+                return Err(Error::BadBinary(format!(
+                    "mmap returned {:p}, expected {:#x}",
+                    p, vstart
+                )));
+            }
+            // Bytes past `p_filesz` on the last file-backed page belong to `.bss`
+            // (or nothing); zero them so `[p_filesz, p_memsz)` reads as zero.
+            if ph.p_memsz > ph.p_filesz && file_end < file_map_end {
+                unsafe {
+                    ptr::write_bytes(file_end as *mut u8, 0, (file_map_end - file_end) as usize)
+                };
+            }
+        }
+
+        // Map any whole `.bss` pages beyond the file-backed part as anonymous.
+        let anon_start = if ph.p_filesz > 0 {
+            file_map_end
+        } else {
+            vstart
         };
-        if p == libc::MAP_FAILED {
-            return Err(Error::last_os_error(format!(
-                "mmap PT_LOAD at {:#x}",
-                vstart
-            )));
+        if vend > anon_start {
+            let p = unsafe {
+                libc::mmap(
+                    anon_start as *mut libc::c_void,
+                    (vend - anon_start) as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | fixed,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED || p as u64 != anon_start {
+                return Err(Error::last_os_error(format!(
+                    "mmap bss at {:#x}",
+                    anon_start
+                )));
+            }
         }
-        if p as u64 != vstart {
-            return Err(Error::BadBinary(format!(
-                "mmap returned {:p}, expected {:#x}",
-                p, vstart
-            )));
-        }
+
         if ehdr.e_type == ET_EXEC {
             regions.push((vstart, len as u64));
-        }
-
-        if ph.p_filesz > 0 {
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    bytes.as_ptr().add(ph.p_offset as usize),
-                    vaddr as *mut u8,
-                    ph.p_filesz as usize,
-                );
-            }
         }
 
         if unsafe { libc::mprotect(vstart as *mut libc::c_void, len, prot) } != 0 {
