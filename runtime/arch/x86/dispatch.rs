@@ -10,12 +10,23 @@
 //! repeat until the guest issues `exit_group` or `exit`. The boundary-crossing
 //! assembly lives in [`super::trampoline`].
 
-use std::arch::asm;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    arch::asm,
+    sync::{
+        Arc, MutexGuard,
+        atomic::{AtomicI32, AtomicU32, Ordering},
+        mpsc,
+    },
+    thread,
+};
 
 use crate::{
-    Error, SystemCall, SystemCalls,
-    sys::{linux::signal::Signals, mmap::AddressSpace},
+    Error, SystemCall,
+    process::Process,
+    sys::{
+        linux::signal::Signals,
+        mmap::{AddressSpace, copy_from_guest, copy_to_guest},
+    },
 };
 
 use super::trampoline::{dispatch, exit_block, exit_syscall};
@@ -31,10 +42,11 @@ pub const EXIT_KIND_SYSCALL: u64 = 1;
 pub enum ExitReason {
     /// The guest issued `exit`/`exit_group`. Carries the exit code.
     Exited(i32),
-    /// The guest issued an `execve`/`execveat` the handler allowed. `number`
-    /// distinguishes the two; `args` are the raw guest syscall arguments
-    /// (pathname, argv, and envp pointers among them).
-    Execve { number: u64, args: [u64; 6] },
+    /// A guest thread committed an `execve`/`execveat`: the validated, parsed
+    /// replacement image is published on the shared [`Process`], and the
+    /// caller must wait out the dissolving thread group, then install the
+    /// image and re-enter the run (see `crate::sys::linux::exec`).
+    Execve,
 }
 
 /// Size of the XSAVE area in [`ThreadState::fpstate`]. The standard (non-
@@ -44,15 +56,35 @@ pub enum ExitReason {
 /// selects AMX, so the area size is bounded regardless of the host's XCR0.
 const XSAVE_AREA_SIZE: usize = 4096;
 
-/// The `Thread` struct represents a guest thread: the register state and the
-/// address space it runs in. The purpose of this struct is similar to the
+/// Removes a thread from the process's thread list when its run loop ends, on
+/// every exit path. Holds the thread's identity — the address of its
+/// `ThreadState`, stable across a fork where the TID is not — which
+/// unregistration compares and never dereferences. See
+/// [`Process::register_thread`].
+struct ThreadGuard {
+    process: Arc<Process>,
+    state: *const ThreadState,
+}
+
+impl Drop for ThreadGuard {
+    fn drop(&mut self) {
+        self.process.unregister_thread(self.state);
+    }
+}
+
+/// The `Thread` struct represents a guest thread: the per-thread register state
+/// and a handle to the process-wide [`Process`] (the shared address space and
+/// code cache) it runs in. The purpose of this struct is similar to the
 /// `task_struct` in the Linux kernel. `running` and `exit_code` mirror the
 /// kernel's task state: a syscall implementation can mark a thread done by
 /// clearing `running` and recording an `exit_code`, and the run loop
 /// terminates on its next iteration.
 pub struct Thread {
     pub state: Box<ThreadState>,
-    addr_space: AddressSpace,
+    /// The shared process state. Every thread of a guest process holds an `Arc`
+    /// to the same `Process`, so they translate into and map within one address
+    /// space.
+    process: Arc<Process>,
     /// Per-process guest signal state: handler table, blocked mask, alt stack.
     signals: Signals,
     /// Whether the run loop should keep iterating. Set true on entry to
@@ -66,13 +98,26 @@ pub struct Thread {
     /// Consumed at the next signal delivery to honor `SA_RESTART`. Cleared
     /// after every syscall, so it reflects only the immediately preceding one.
     restart: Option<(u64, u64)>,
+    /// Guest address of this thread's `clear_child_tid` word, set by
+    /// `set_tid_address` or a `clone` with `CLONE_CHILD_CLEARTID`. When the
+    /// thread exits, the runtime zeroes this word and futex-wakes it, exactly as
+    /// the kernel does — this is what a joiner (`pthread_join`) blocks on.
+    clear_child_tid: Option<u64>,
+    /// Whether this is the process's initial thread. The main thread's run
+    /// returning ends the process, so when it exits on its own (`pthread_exit`)
+    /// while siblings are still alive, it must wait for them rather than tear the
+    /// process down. A `clone(CLONE_VM)` child is never main.
+    is_main: bool,
 }
 
 impl Thread {
-    /// Create a new guest thread whose address space carries a
-    /// `code_cache_size`-byte translated-code cache.
-    pub fn new(rip: u64, rsp: u64, code_cache_size: usize) -> Result<Self, Error> {
+    /// Create a new guest thread that runs in the given shared [`Process`]. The
+    /// process's first thread is created with a fresh `Process`; future
+    /// `clone(CLONE_VM)` siblings are created with a clone of this `Arc`, so
+    /// they share the address space, code cache, and syscall handler.
+    pub fn new(process: Arc<Process>, rip: u64, rsp: u64) -> Result<Self, Error> {
         let guest_fs_base = current_fs_base();
+        let signals = Signals::new(Arc::clone(&process.sig_table));
         let mut thread = Self {
             state: Box::new(ThreadState {
                 regs: [0; 16],
@@ -92,27 +137,239 @@ impl Thread {
                 exit_requested: AtomicU32::new(0),
                 _align_fpstate: [0; 5],
                 fpstate: [0; XSAVE_AREA_SIZE],
+                pending_set: 0,
+                tid: AtomicI32::new(0),
             }),
-            addr_space: AddressSpace::new(code_cache_size)?,
-            signals: Signals::new(),
+            process,
+            signals,
             running: false,
             exit_code: 0,
             restart: None,
+            clear_child_tid: None,
+            is_main: true,
         };
+        thread.state.pending_set = thread.signals.pending_set_ptr() as u64;
         thread.reset(rip, rsp, guest_fs_base);
         Ok(thread)
     }
 
+    /// Assemble a thread from an already-built register state that runs in the
+    /// given shared process. Used for `clone(CLONE_VM)` children: they inherit
+    /// the parent's process (address space, code cache, handler) and a copy of
+    /// its register file. The signal-disposition table is shared with the rest
+    /// of the thread group (via the process), as POSIX requires; the per-thread
+    /// blocked mask and alternate stack start cleared.
+    /// `clear_child_tid` carries the `CLONE_CHILD_CLEARTID` word, if any.
+    fn from_state(
+        process: Arc<Process>,
+        mut state: Box<ThreadState>,
+        clear_child_tid: Option<u64>,
+    ) -> Self {
+        let signals = Signals::new(Arc::clone(&process.sig_table));
+        state.pending_set = signals.pending_set_ptr() as u64;
+        Self {
+            state,
+            process,
+            signals,
+            running: false,
+            exit_code: 0,
+            restart: None,
+            clear_child_tid,
+            is_main: false,
+        }
+    }
+
+    /// Whether this is (or has become) the process's initial thread; see
+    /// [`Thread::reset_after_fork`] for how a clone child is promoted.
+    pub fn is_main(&self) -> bool {
+        self.is_main
+    }
+
+    /// Rebuild bookkeeping in the child of a fork. The caller is the child's
+    /// only thread and its thread-group leader, whatever it was in the
+    /// parent: its run returning must end the process with the guest's
+    /// status, and its `execve` must take the image-installing path, so it
+    /// is promoted to main and the copied [`Process`] group state is reset
+    /// around it.
+    pub fn reset_after_fork(&mut self) {
+        self.is_main = true;
+        self.state.tid.store(
+            unsafe { libc::syscall(libc::SYS_gettid) } as i32,
+            Ordering::Release,
+        );
+        self.process.reset_after_fork(&self.state);
+    }
+
+    /// Record this thread's `clear_child_tid` word (from `set_tid_address`). A
+    /// null pointer clears it. Returns the caller's TID (its host `gettid`), the
+    /// way the kernel's `set_tid_address` does.
+    pub fn set_clear_child_tid(&mut self, addr: u64) -> i64 {
+        self.clear_child_tid = (addr != 0).then_some(addr);
+        unsafe { libc::syscall(libc::SYS_gettid) }
+    }
+
+    /// On thread exit, honor `CLONE_CHILD_CLEARTID`/`set_tid_address`: zero the
+    /// `clear_child_tid` word and wake one futex waiter on it, just as the kernel
+    /// does for a real task. A `pthread_join` blocked on that word (the joined
+    /// thread's TID slot) then returns. The wake is non-private, matching the
+    /// kernel's clear-child-tid wake and glibc's wait on it.
+    ///
+    /// The word is guest memory the guest may have unmapped by now, so the
+    /// store is a fault-safe best-effort write, exactly the kernel's exit
+    /// path: its `put_user(0, clear_child_tid)` is unchecked, the futex wake
+    /// is attempted regardless (`FUTEX_WAKE` on a bad address just returns
+    /// `EFAULT`), and the thread exits either way.
+    fn clear_tid_and_wake(&self) {
+        let Some(addr) = self.clear_child_tid else {
+            return;
+        };
+        copy_to_guest(addr, &0u32.to_ne_bytes());
+        unsafe {
+            libc::syscall(libc::SYS_futex, addr, libc::FUTEX_WAKE, 1, 0, 0, 0);
+        }
+    }
+
+    /// Service a `clone`/`clone3` that creates a new thread of this process
+    /// (the `CLONE_THREAD` shape, which the kernel requires to include
+    /// `CLONE_SIGHAND` and `CLONE_VM`). Chimera cannot forward it: the host
+    /// kernel would run guest code on the new task natively, outside the
+    /// translator. Instead it spawns a host thread that runs the child guest
+    /// in the shared process, and returns the child's kernel TID to the
+    /// parent. The guest-visible TID is
+    /// the host TID, so the guest's later `futex`/`tgkill` on it reach this host
+    /// thread. On spawn failure it returns `-EAGAIN`.
+    ///
+    /// `child_stack` is the child's stack pointer (its top); the child resumes
+    /// at the same post-syscall PC as the parent with `rax = 0` and its own
+    /// stack (see [`ThreadState::clone_for_child`]). The remaining arguments are
+    /// the thread-ID and TLS words the relevant flags select.
+    fn spawn_clone(
+        &self,
+        flags: u64,
+        child_stack: u64,
+        parent_tid: u64,
+        child_tid: u64,
+        tls: u64,
+    ) -> i64 {
+        // `CLONE_SETTLS` gives the child its own thread pointer; without it the
+        // child inherits the parent's FS base, as the kernel does. This is how
+        // each pthread gets private TLS.
+        let settls = (flags & libc::CLONE_SETTLS as u64 != 0).then_some(tls);
+        // `CLONE_CHILD_CLEARTID` registers a word the runtime zeroes and wakes
+        // when the child exits (the basis of `pthread_join`).
+        let clear_child_tid =
+            (flags & libc::CLONE_CHILD_CLEARTID as u64 != 0 && child_tid != 0).then_some(child_tid);
+        let child_state = self.state.clone_for_child(child_stack, settls);
+        let process = Arc::clone(&self.process);
+
+        // The parent needs the child's kernel TID to return from `clone`, but
+        // only the child can read its own `gettid`, so hand it back over a
+        // one-shot channel and block until it arrives.
+        let (tx, rx) = mpsc::channel::<i64>();
+        let spawned = thread::Builder::new()
+            .name("chimera-guest".to_string())
+            .spawn(move || {
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
+                // Replicate the kernel's set-TID writes *before* running any guest
+                // code. The kernel populates the TID word(s) at clone time, so the
+                // child observes its own TID from the first instruction. glibc
+                // points these at `&pd->tid` (the thread's TCB identity) and reads
+                // it during early thread setup; it is also the thread's identity
+                // for, e.g., `pthread_rwlock` writer ownership (`__cur_writer`).
+                // Writing from the parent after the child is already running would
+                // race those reads with a stale TID.
+                // Both words are guest-controlled addresses, so the stores are
+                // fault-safe best-effort writes, matching the kernel exactly:
+                // its `put_user` for the set-TID words is unchecked, and a
+                // clone whose TID pointers are bogus still succeeds with the
+                // writes silently skipped (verified natively).
+                if tid > 0 {
+                    if flags & libc::CLONE_PARENT_SETTID as u64 != 0 {
+                        copy_to_guest(parent_tid, &(tid as i32).to_ne_bytes());
+                    }
+                    if flags & libc::CLONE_CHILD_SETTID as u64 != 0 {
+                        copy_to_guest(child_tid, &(tid as i32).to_ne_bytes());
+                    }
+                }
+                // A failed send means the parent already gave up; nothing to do.
+                let _ = tx.send(tid);
+                let mut child = Thread::from_state(process, child_state, clear_child_tid);
+                // The child runs until its guest issues `exit`/`exit_group`,
+                // which returns the run loop and ends this host thread — the
+                // rest of the process keeps running.
+                let reason = child.run();
+                // A fork inside this thread made it the main — and only —
+                // thread of a new process (see `Thread::reset_after_fork`).
+                // This host thread is all that child process has, so drive it
+                // the way `execv` drives the initial thread — installing any
+                // committed execve image and re-entering — and end the
+                // process with the guest's status. Nothing to clear-and-wake:
+                // a fork child has no joiner inside it.
+                if child.is_main()
+                    && let Ok(reason) = reason
+                {
+                    let code =
+                        crate::sys::linux::exec::drive(&mut child, reason).unwrap_or_else(|err| {
+                            eprintln!("chimera: fork child failed: {err}");
+                            127
+                        });
+                    std::process::exit(code);
+                }
+                // Honor CLONE_CHILD_CLEARTID: clear the word and wake a joiner.
+                child.clear_tid_and_wake();
+            });
+
+        match spawned {
+            // Drop the join handle: the host thread is detached and reclaims
+            // itself when its closure returns. The child is tracked by its
+            // kernel TID through the shared address space, never by a retained
+            // handle (an accumulating roster would leak under thread churn).
+            Ok(_handle) => rx.recv().unwrap_or(-(libc::EAGAIN as i64)),
+            Err(_) => -(libc::EAGAIN as i64),
+        }
+    }
+
+    /// `clone(CLONE_VM)`: the arguments are in registers. `args[1]` is the child
+    /// stack pointer; `args[2..=4]` are `parent_tid`, `child_tid`, `tls`.
+    pub fn clone_vm(&self, args: &[u64; 6]) -> i64 {
+        self.spawn_clone(args[0], args[1], args[2], args[3], args[4])
+    }
+
+    /// `clone3(CLONE_VM)`: the arguments come from the base `clone_args`
+    /// struct already copied out of guest memory by [`read_clone3_args`], as
+    /// 8 `u64` fields (uapi `<linux/sched.h>` order): flags, pidfd, child_tid,
+    /// parent_tid, exit_signal, stack, stack_size, tls. Unlike `clone`, the
+    /// `stack` field is the *lowest* address of the child stack and
+    /// `stack_size` its length, so the child's stack pointer is their sum.
+    /// Modern glibc's `pthread_create` takes this path.
+    pub fn clone3_vm(&self, args: &[u64; 8]) -> i64 {
+        let flags = args[0];
+        let child_tid = args[2];
+        let parent_tid = args[3];
+        let child_stack = args[5].wrapping_add(args[6]); // stack + stack_size
+        let tls = args[7];
+        self.spawn_clone(flags, child_stack, parent_tid, child_tid, tls)
+    }
+
     /// Reset the thread to a new entry point and a stack.
     pub fn reset(&mut self, rip: u64, rsp: u64, guest_fs_base: u64) {
-        self.addr_space.reset();
+        self.addr_space().reset();
         self.state.reset(rip, rsp, guest_fs_base);
         self.running = false;
         self.exit_code = 0;
     }
 
-    pub fn addr_space(&mut self) -> &mut AddressSpace {
-        &mut self.addr_space
+    /// Lock and return the shared guest address space. The guard must be dropped
+    /// before re-entering the cache or issuing a blocking syscall — never held
+    /// across `dispatch()`.
+    pub fn addr_space(&self) -> MutexGuard<'_, AddressSpace> {
+        self.process.addr_space.lock().unwrap()
+    }
+
+    /// The shared process [`Process`] this thread runs in. Used by the syscall
+    /// layer to publish a process-wide `exit_group` request.
+    pub fn process(&self) -> &Process {
+        &self.process
     }
 
     pub fn signals_mut(&mut self) -> &mut Signals {
@@ -129,7 +386,7 @@ impl Thread {
     /// boundary), building its frame and redirecting the guest to the handler.
     /// Entry into the handler then happens through the normal `dispatch` path.
     fn deliver_pending_signals(&mut self) {
-        if let Some(signo) = crate::sys::linux::signal::pending_take_one(self.signals.blocked) {
+        if let Some(signo) = self.signals.pending_take_one() {
             let restart = self.restart.take();
             let state = &mut *self.state;
             self.signals.deliver(state, signo, restart);
@@ -148,7 +405,7 @@ impl Thread {
     fn refresh_exit_requested(&mut self) {
         self.state.exit_requested.store(0, Ordering::Relaxed);
         core::sync::atomic::compiler_fence(Ordering::SeqCst);
-        let deliverable = crate::sys::linux::signal::pending_snapshot() & !self.signals.blocked;
+        let deliverable = self.signals.pending_snapshot() & !self.signals.blocked;
         if deliverable != 0 {
             self.state.exit_requested.store(1, Ordering::Relaxed);
         }
@@ -164,8 +421,9 @@ impl Thread {
     /// Run the guest using the thread's current entry state. Returns when the
     /// guest issues `exit`/`exit_group` (with the code) or an allowed
     /// `execve`/`execveat` (for the caller to act on); neither syscall is
-    /// forwarded to the host kernel. The handler observes the call first.
-    pub fn run(&mut self, handler: &mut dyn SystemCalls) -> Result<ExitReason, Error> {
+    /// forwarded to the host kernel. The handler observes the call first. The
+    /// embedder's handler is reached through the shared [`Process`].
+    pub fn run(&mut self) -> Result<ExitReason, Error> {
         // GS is host-thread-local, so bind it on the OS thread that is
         // actually about to execute the translated guest.
         self.setup_gs()?;
@@ -173,22 +431,74 @@ impl Thread {
         self.signals.mirror_host_mask();
         self.running = true;
 
+        // Join the thread list so a sibling's process-wide stop can reach
+        // this thread: the interrupt signal if it parks in a host syscall, the
+        // registered `exit_requested` safepoint slot if it is executing fully
+        // linked translated code. The guard removes it on every exit path
+        // (including the `execve` early return).
+        self.state.tid.store(
+            unsafe { libc::syscall(libc::SYS_gettid) } as i32,
+            Ordering::Release,
+        );
+        self.process.register_thread(&self.state);
+        let _thread_guard = ThreadGuard {
+            process: Arc::clone(&self.process),
+            state: &*self.state,
+        };
+
         let block_exit = exit_block as *const () as usize as u64;
         let syscall_exit = exit_syscall as *const () as usize as u64;
 
         // Emit (once per cache) the shared inline indirect-branch lookup routine
         // and record its address so translated indirect branches can reach it.
-        self.state.ib_lookup = self.addr_space.code.ensure_ib_lookup(block_exit)?;
+        self.state.ib_lookup = self
+            .process
+            .addr_space
+            .lock()
+            .unwrap()
+            .code
+            .ensure_ib_lookup(block_exit)?;
 
         while self.running {
             self.deliver_pending_signals();
             self.refresh_exit_requested();
 
+            // Observe a sibling's process-wide stop only after
+            // `refresh_exit_requested`: the refresh clears this thread's
+            // safepoint slot, so checking first would open a window where a
+            // stop armed between the check and the clear is wiped — the flag
+            // already checked, the slot no longer set — and a fully linked
+            // loop runs on unwatched. Checked in this order, a stop armed
+            // before the refresh is caught by these flags, and one armed
+            // after it leaves the slot set for the in-cache polls.
+            //
+            // Another thread may have issued `exit_group`, which ends the
+            // whole thread group: stop with the process-wide code so the main
+            // thread returns it from the run and the process exits.
+            if self.process.is_exiting() {
+                self.exit_code = self.process.exit_code.load(Ordering::Relaxed);
+                break;
+            }
+            // A sibling committed an `execve`: the thread group is dissolving,
+            // the way Linux's `de_thread` kills every other thread before a
+            // new image is installed. Stop at this boundary — a worker's stop
+            // ends its host thread; the main thread hands the run over to the
+            // exec driver below.
+            if self.process.exec_pending() {
+                break;
+            }
+
             let ts_ptr: *mut ThreadState = &mut *self.state;
 
             let rip = unsafe { (*ts_ptr).rip };
+            // Hold the address-space lock only long enough to resolve (and, on a
+            // miss, translate) the next block; the guard drops at the end of this
+            // statement, before `dispatch()` runs the block.
             let host_pc = self
+                .process
                 .addr_space
+                .lock()
+                .unwrap()
                 .code
                 .resolve(rip, block_exit, syscall_exit)
                 .unwrap_or_else(|e| panic!("translate failed at {:#x}: {}", rip, e));
@@ -197,9 +507,36 @@ impl Thread {
                 dispatch(ts_ptr, host_pc);
             }
             if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL
-                && let Some(reason) = self.handle_syscall(handler)
+                && let Some(reason) = self.handle_syscall()
             {
                 return Ok(reason);
+            }
+        }
+        // Absent an `exit_group`, the kernel reports the status of the last
+        // thread to exit as the process's `wait(2)` status, so every thread
+        // records its own on the way out — while it is still in the thread list.
+        self.process.record_exit_status(self.exit_code);
+        if self.is_main {
+            // A committed execve dissolves the group instead of ending the
+            // process: hand the run to the exec driver, which waits out the
+            // last sibling and installs the published image.
+            if self.process.exec_pending() {
+                return Ok(ExitReason::Execve);
+            }
+            // The main thread's run returning ends the process. If it exited
+            // on its own (`pthread_exit` / thread-local `exit` / raw
+            // `SYS_exit`) rather than via a process-wide `exit_group`, POSIX
+            // keeps the process alive until the last thread finishes — so wait
+            // for the siblings and adopt the final status: the last exiter's
+            // (this thread's own, just recorded, if no sibling outlives it),
+            // or an `exit_group`'s code. A sibling may also commit an execve
+            // while this thread waits; the group then dissolves into the new
+            // image rather than exiting.
+            if !self.process.is_exiting() {
+                self.exit_code = self.process.wait_for_others(&self.state);
+                if self.process.exec_pending() {
+                    return Ok(ExitReason::Execve);
+                }
             }
         }
         Ok(ExitReason::Exited(self.exit_code))
@@ -208,7 +545,7 @@ impl Thread {
     /// Service the syscall that just exited the cache. Returns `Some` only when
     /// the guest issued an allowed `execve`/`execveat`, in which case the run
     /// loop hands the request back to its caller to re-enter on the new image.
-    fn handle_syscall(&mut self, handler: &mut dyn SystemCalls) -> Option<ExitReason> {
+    fn handle_syscall(&mut self) -> Option<ExitReason> {
         let number = self.state.regs[RAX];
         let args = [
             self.state.regs[RDI],
@@ -219,7 +556,11 @@ impl Thread {
             self.state.regs[R9],
         ];
         let mut call = SystemCall::new(number, args);
-        crate::syscall::syscall(self, &mut call, handler);
+        // Clone the `Arc` so the handler borrow comes from the local handle
+        // rather than `self`, leaving `self` free to be passed mutably to the
+        // syscall driver.
+        let process = self.process.clone();
+        crate::syscall::syscall(self, &mut call, process.handler.as_ref());
         let result = call.return_value();
         self.state.regs[RAX] = result as u64;
 
@@ -235,8 +576,19 @@ impl Thread {
             None
         };
 
-        if number == libc::SYS_execve as u64 || number == libc::SYS_execveat as u64 {
-            return Some(ExitReason::Execve { number, args });
+        if (number == libc::SYS_execve as u64 || number == libc::SYS_execveat as u64)
+            && self.process.exec_pending()
+        {
+            // Only a committed exec leaves the run — a failed one already
+            // wrote `-errno` into rax above and the guest just resumes. The
+            // calling thread's own stop mirrors `de_thread`: a worker
+            // dissolves (its image request is already published, and the main
+            // thread picks it up at its next boundary), while the main thread
+            // returns to the exec driver to install the new image itself.
+            if self.is_main {
+                return Some(ExitReason::Execve);
+            }
+            self.running = false;
         }
         None
     }
@@ -249,6 +601,33 @@ impl Thread {
         }
         Ok(())
     }
+}
+
+/// The base `struct clone_args` (`CLONE_ARGS_SIZE_VER0`): the 8 `u64` fields
+/// every `clone3` must supply. The kernel rejects a smaller struct with
+/// `EINVAL` and one larger than a page with `E2BIG`.
+const CLONE_ARGS_SIZE_VER0: u64 = 64;
+const CLONE_ARGS_SIZE_MAX: u64 = 4096;
+
+/// Copy the base `clone_args` struct a `clone3` points at out of guest
+/// memory, fault-safely (see [`copy_from_guest`]). `None` — returned for an
+/// unreadable struct and for a guest-declared `size` outside the kernel's
+/// accepted range — tells the caller to forward the call, so the kernel
+/// reports the authoritative error (`EFAULT`, `EINVAL`, `E2BIG`) exactly as
+/// it would natively.
+pub fn read_clone3_args(args_ptr: u64, size: u64) -> Option<[u64; 8]> {
+    if !(CLONE_ARGS_SIZE_VER0..=CLONE_ARGS_SIZE_MAX).contains(&size) {
+        return None;
+    }
+    let mut raw = [0u8; CLONE_ARGS_SIZE_VER0 as usize];
+    if !copy_from_guest(args_ptr, &mut raw) {
+        return None;
+    }
+    let mut args = [0u64; 8];
+    for (slot, chunk) in args.iter_mut().zip(raw.chunks_exact(8)) {
+        *slot = u64::from_ne_bytes(chunk.try_into().unwrap());
+    }
+    Some(args)
 }
 
 /// Whether a syscall interrupted by a signal must always fail with `EINTR`,
@@ -342,6 +721,19 @@ pub struct ThreadState {
     /// AVX-512). Saved on every exit, restored on every entry. Must be
     /// 64-byte aligned; the field layout above guarantees offset 256.
     pub fpstate: [u8; XSAVE_AREA_SIZE],
+    /// Address of this thread's `PendingSet` (owned by its `Signals`), read by
+    /// the host signal catcher via `gs:[]` so a caught signal is recorded on
+    /// the thread that caught it — pending state is per-thread, and this
+    /// pointer is how the async-signal-safe catcher finds the right set with
+    /// no TLS. Placed after `fpstate` so every offset above is unchanged.
+    pub pending_set: u64,
+    /// The kernel TID of the host thread backing this guest thread. Written by
+    /// the owning thread at run entry — and rewritten in a fork child, where
+    /// the copied value names a thread that no longer exists — and read by
+    /// siblings through the thread list as the target for the reserved interrupt
+    /// signal. Atomic because those reads are cross-thread; placed after
+    /// `fpstate` so every `gs:[]` offset above is unchanged.
+    pub tid: AtomicI32,
 }
 
 // XSAVE/XRSTOR #GP unless the save area is 64-byte aligned. The struct's
@@ -387,6 +779,47 @@ impl ThreadState {
 
     fn capture_chimera_fs(&mut self) {
         self.chimera_fs_base = current_fs_base();
+    }
+
+    /// Build the register state for a `clone(CLONE_VM)` child. The guest-visible
+    /// registers, flags, and FP/SIMD state are copied from the parent, so the
+    /// child resumes exactly where the parent's `clone` returns — except `rax`,
+    /// which is 0 (the child's `clone` return value), and `rsp`, which is the
+    /// child's own stack. `tls` is the child's thread pointer (FS base) when the
+    /// clone requested `CLONE_SETTLS`, else the child inherits the parent's. The
+    /// per-run bookkeeping slots (the Chimera/FS scratch and the indirect-branch
+    /// lookup fields) start cleared; `run` repopulates them on the child's own
+    /// host thread.
+    fn clone_for_child(&self, child_stack: u64, tls: Option<u64>) -> Box<ThreadState> {
+        let mut child = Box::new(ThreadState {
+            regs: self.regs,
+            rip: self.rip,
+            rflags: self.rflags,
+            chimera_rsp: 0,
+            host_pc_target: 0,
+            exit_kind: 0,
+            guest_fs_base: tls.unwrap_or(self.guest_fs_base),
+            chimera_fs_base: 0,
+            ib_lookup: 0,
+            ib_flags: 0,
+            ib_target: 0,
+            ib_rcx: 0,
+            ib_rdx: 0,
+            ib_host: 0,
+            exit_requested: AtomicU32::new(0),
+            _align_fpstate: [0; 5],
+            fpstate: self.fpstate,
+            // Cleared, not inherited: the child's own `PendingSet` address is
+            // published by `Thread::from_state`. Copying the parent's pointer
+            // would let the catcher record the child's signals on the parent.
+            pending_set: 0,
+            // Cleared for the same reason as the run-entry store: the child
+            // publishes its own TID before it runs any guest code.
+            tid: AtomicI32::new(0),
+        });
+        child.regs[RAX] = 0;
+        child.regs[RSP] = child_stack;
+        child
     }
 }
 

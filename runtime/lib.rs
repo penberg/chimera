@@ -8,6 +8,7 @@ use std::{
 };
 
 mod arch;
+mod process;
 mod sys;
 mod syscall;
 

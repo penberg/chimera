@@ -17,7 +17,7 @@
 //! example shows the more elaborate side, with per-syscall argument
 //! decoding.
 
-use std::{collections::HashSet, path::PathBuf, process::ExitCode};
+use std::{collections::HashSet, path::PathBuf, process::ExitCode, sync::Mutex};
 
 use argh::FromArgs;
 use mimalloc::MiMalloc;
@@ -81,20 +81,22 @@ fn main() -> ExitCode {
 
 struct Allowlist {
     allowed: Vec<Regex>,
-    denied_seen: HashSet<u64>,
+    // A single handler serves every guest thread (`SystemCalls` is `&self`), so
+    // the "first denial seen" set needs interior mutability.
+    denied_seen: Mutex<HashSet<u64>>,
 }
 
 impl Allowlist {
     fn new(allowed: Vec<Regex>) -> Self {
         Self {
             allowed,
-            denied_seen: HashSet::new(),
+            denied_seen: Mutex::new(HashSet::new()),
         }
     }
 }
 
 impl SystemCalls for Allowlist {
-    fn do_syscall(&mut self, call: &mut SystemCall) {
+    fn do_syscall(&self, call: &mut SystemCall) {
         let name = syscall_name(call.number);
         // Unknown numbers serialize as `syscall_<n>` so a user's regex
         // can never let one through by accident.
@@ -107,7 +109,7 @@ impl SystemCalls for Allowlist {
         if self.allowed.iter().any(|r| r.is_match(&display)) {
             call.set_result(host_syscall(call));
         } else {
-            if self.denied_seen.insert(call.number) {
+            if self.denied_seen.lock().unwrap().insert(call.number) {
                 eprintln!("sandbox: denied {}", display);
             }
             call.set_result(SyscallResult::Error(libc::EPERM));

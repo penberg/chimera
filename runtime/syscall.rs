@@ -82,19 +82,26 @@ impl SystemCall {
 /// `pkey_mprotect` before servicing them, clearing `PROT_EXEC` (see
 /// [`crate::syscall::syscall`]). `pre_syscall` sees the guest's original
 /// request; every later stage, including `do_syscall`, sees the rewritten one.
-pub trait SystemCalls {
+///
+/// A single handler serves every guest thread, so the trait is `Send + Sync`
+/// and its methods take `&self`: each guest thread runs on its own host thread
+/// and may be inside the handler concurrently. A handler that needs mutable
+/// state of its own reaches for interior mutability (a `Mutex`, an atomic) —
+/// the `SystemCall` it is handed is exclusive to the calling thread, but `self`
+/// is shared.
+pub trait SystemCalls: Send + Sync {
     /// Observe a guest syscall before Chimera or the embedder services it.
-    fn pre_syscall(&mut self, _call: &SystemCall) {}
+    fn pre_syscall(&self, _call: &SystemCall) {}
 
     /// Service a guest syscall that Chimera delegated to the embedder.
     ///
     /// The default implementation forwards the call to the host kernel.
-    fn do_syscall(&mut self, call: &mut SystemCall) {
+    fn do_syscall(&self, call: &mut SystemCall) {
         call.set_result(host_syscall(call));
     }
 
     /// Observe a guest syscall after its final result is known, if any.
-    fn post_syscall(&mut self, _call: &SystemCall) {}
+    fn post_syscall(&self, _call: &SystemCall) {}
 }
 
 /// The default system-call handler: forwards every delegated guest syscall to
@@ -126,7 +133,10 @@ pub enum SyscallResult {
 
 mod host {
     use super::{SyscallResult, SystemCall, SystemCalls, host_syscall};
-    use crate::arch::dispatch::Thread;
+    use crate::{
+        arch::dispatch::{Thread, read_clone3_args},
+        sys::linux::exec::{exec_errno, prepare_exec},
+    };
 
     /// Drive one guest syscall. Runtime-owned syscalls are serviced inline
     /// here, the way a kernel's syscall table services its own; delegated
@@ -169,14 +179,21 @@ mod host {
     /// runtime-owned: they still reach `do_syscall()`, only with `PROT_EXEC`
     /// already cleared from their argument.
     ///
-    /// `clone`/`clone3` are refused with `EPERM` when they request `CLONE_VM`, a
-    /// new thread sharing the address space: Chimera is single-threaded, and the
-    /// new host thread would execute guest code with no translator context,
-    /// natively. Without `CLONE_VM` the call is an ordinary `fork`, whose
-    /// copy-on-write child carries Chimera and resumes in translated code, so it
-    /// is forwarded. (`clone3` carries its flags in a `clone_args` struct rather
-    /// than a register; the rest is identical.) `vfork` always shares the
-    /// address space and has no `fork`-shaped variant, so it is refused outright.
+    /// A `clone` creating a new thread of this process (the `CLONE_THREAD`
+    /// shape) cannot be forwarded: the new host task would execute guest code
+    /// with no translator context, natively. Chimera instead spawns a host
+    /// thread that runs the child guest in the shared process and returns its
+    /// kernel TID to the parent (see `Thread::clone_vm`). `clone3` in the same
+    /// shape is handled the same way via `Thread::clone3_vm`; it carries its
+    /// arguments in a `clone_args` struct (the path modern glibc's
+    /// `pthread_create` takes). `CLONE_VM` without `CLONE_THREAD` — a separate
+    /// process sharing this address space — is refused with `EPERM`: Chimera
+    /// can provide neither native forwarding (unsandboxed) nor a faithful
+    /// emulation. Without `CLONE_VM` the call is an ordinary `fork`, whose
+    /// copy-on-write child carries Chimera and resumes in translated code, so
+    /// it is forwarded.
+    /// `vfork` always shares the address space and has no `fork`-shaped variant,
+    /// so it is refused outright.
     ///
     /// The io_uring interface (`io_uring_setup`/`io_uring_enter`/
     /// `io_uring_register`) is refused with `EPERM`: it would let the guest
@@ -210,7 +227,7 @@ mod host {
     /// (`personality(0xffffffff)`, which returns the current persona without
     /// changing it) and benign personas such as `ADDR_NO_RANDOMIZE` carry no
     /// such risk and are forwarded.
-    pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &mut dyn SystemCalls) {
+    pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &dyn SystemCalls) {
         handler.pre_syscall(call);
 
         let nr = call.number as i64;
@@ -261,39 +278,128 @@ mod host {
                 }
                 call.set_result(result);
             }
-            libc::SYS_exit | libc::SYS_exit_group => {
+            libc::SYS_exit => {
+                // Thread-local: end only this thread. The run loop stops on its
+                // next iteration; the main thread's stop ends the run (and the
+                // process), a worker's stop just ends that host thread. This is
+                // the `pthread_exit` / thread-return path.
                 thread.exit_code = call.args[0] as i32;
+                thread.running = false;
+            }
+            libc::SYS_exit_group => {
+                // Process-wide: terminate the whole thread group, from any
+                // thread. Publish the request on the shared process; every
+                // thread's run loop observes it at its next boundary and stops,
+                // so the main thread returns this code from the run and the
+                // process exits. Forwarding to the host instead would kill the
+                // embedder's process, which the runtime must not do.
+                let code = call.args[0] as i32;
+                thread.process().request_exit_group(code, &thread.state);
+                thread.exit_code = code;
                 thread.running = false;
             }
             libc::SYS_execve | libc::SYS_execveat => {
                 // Intercepted, never forwarded to the host kernel: forwarding would
                 // have the host replace Chimera's whole process image — runtime,
                 // code cache, and translation map included — with an untranslated
-                // program running natively, outside the sandbox. The dispatch loop
-                // tears down the old image and re-enters the translator on the new
-                // one (see `crate::sys::linux::exec`); report success so observers
-                // see the allowed call.
-                call.set_result(SyscallResult::Ok(0));
+                // program running natively, outside the sandbox.
+                //
+                // The replacement image is validated here, in the calling thread,
+                // the way the kernel sequences an exec: a failure reports `-errno`
+                // to the caller and disturbs no sibling. Only a loadable image
+                // commits the exec — publishing it on the shared process stops
+                // every thread (Linux's `de_thread` kills the siblings before a
+                // new image is installed, whichever thread called exec), and the
+                // main host thread waits out the stragglers, tears down the old
+                // image, and enters the new one (see `crate::sys::linux::exec`).
+                match prepare_exec(call.number, &call.args) {
+                    Ok(prepared) => {
+                        // First committer wins. A refused commit means a
+                        // sibling's exec (or an exit_group) is already
+                        // dissolving this group, this thread with it — the
+                        // kernel's loser is killed by the winner's de_thread
+                        // and never observes a return value, and neither does
+                        // this one: the pending stop takes the thread at its
+                        // next boundary, before the guest could read rax.
+                        thread.process().request_exec(prepared, &thread.state);
+                        // Report success so observers see the allowed call; the
+                        // guest never reads it — a successful execve does not
+                        // return.
+                        call.set_result(SyscallResult::Ok(0));
+                    }
+                    // `prepare_exec` only parses, so every failure carries an
+                    // errno (`EIO` is an unreachable fallback).
+                    Err(err) => {
+                        let errno = exec_errno(&err).unwrap_or(libc::EIO);
+                        call.set_result(SyscallResult::Error(errno));
+                    }
+                }
             }
-            // A `clone` that creates a new thread sharing this address space
-            // (`CLONE_VM`) would have the host kernel run guest code on the new
-            // thread with no Chimera context — natively, never through the
-            // translator — a sandbox escape (and, today, a crash). Refuse it with
-            // `EPERM`. A `clone` without `CLONE_VM` is an ordinary `fork`: a
+            // A `clone` that creates a new thread of this process — the
+            // `CLONE_THREAD` shape, which the kernel requires to carry
+            // `CLONE_SIGHAND` and `CLONE_VM` — cannot be forwarded: the host
+            // kernel would run guest code on the new task natively, with no
+            // Chimera context — never through the translator. Instead Chimera
+            // spawns a host thread that runs the child guest in the shared
+            // process and returns the child's kernel TID to the parent (see
+            // `Thread::clone_vm`). A malformed `CLONE_THREAD` (missing one of
+            // the required flags) is forwarded for the kernel's authoritative
+            // `EINVAL`; a `clone` without `CLONE_VM` is an ordinary `fork` — a
             // copy-on-write duplicate of the whole process, Chimera included,
-            // that resumes in translated code, so it falls through to the default
-            // arm and is forwarded.
-            libc::SYS_clone if call.args[0] & libc::CLONE_VM as u64 != 0 => {
+            // that resumes in translated code — and falls through to the
+            // fork-shaped arm below.
+            libc::SYS_clone if is_thread_clone(call.args[0]) => {
+                let tid = thread.clone_vm(&call.args);
+                call.set_return(tid);
+            }
+            // `CLONE_VM` without `CLONE_THREAD` asks for a *separate process*
+            // that shares this address space. Chimera can honor neither half:
+            // forwarding would run the child natively outside the sandbox, and
+            // a host thread would give it this process's PID and no `waitpid`.
+            // Refuse it visibly, like `vfork` below, rather than mis-run it —
+            // no libc path reaches this shape (`pthread_create` is
+            // `CLONE_THREAD`, `fork` carries no `CLONE_VM`).
+            libc::SYS_clone
+                if call.args[0] & libc::CLONE_VM as u64 != 0
+                    && call.args[0] & libc::CLONE_THREAD as u64 == 0 =>
+            {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
-            // `clone3` is the same escape as `clone` above, but carries its
-            // flags in the `clone_args` struct `args[0]` points at rather than
-            // in a register. Refuse it when those flags request `CLONE_VM`; a
-            // `clone3` without it (the `fork`-shaped case) falls through to the
-            // default arm and is forwarded.
-            libc::SYS_clone3 if clone3_requests_vm(call.args[0]) => {
-                call.set_result(SyscallResult::Error(libc::EPERM));
-            }
+            // `clone3` splits into the same cases as `clone` above, but carries
+            // its arguments in the `clone_args` struct `args[0]` points at —
+            // the path modern glibc's `pthread_create` takes. The struct is
+            // copied out of guest memory fault-safely, exactly once: the copy
+            // both decides the intercept and feeds `clone3_vm`, so a bad
+            // pointer cannot crash the runtime and the fields cannot change
+            // between check and use. A fork-shaped `clone3`, a malformed
+            // `CLONE_THREAD`, or a struct that is unreadable or of a size the
+            // kernel would reject, is forwarded — the kernel forks or reports
+            // the authoritative `EINVAL`/`EFAULT`/`E2BIG` itself, as it would
+            // natively.
+            libc::SYS_clone3 => match read_clone3_args(call.args[0], call.args[1]) {
+                Some(cargs) if is_thread_clone(cargs[0]) => {
+                    let tid = thread.clone3_vm(&cargs);
+                    call.set_return(tid);
+                }
+                // A separate shared-memory process: refused, as for `clone`.
+                Some(cargs)
+                    if cargs[0] & libc::CLONE_VM as u64 != 0
+                        && cargs[0] & libc::CLONE_THREAD as u64 == 0 =>
+                {
+                    call.set_result(SyscallResult::Error(libc::EPERM));
+                }
+                // Fork-shaped: forwarded under the same locking and child
+                // rebuild as the `SYS_clone`/`SYS_fork` arm below.
+                _ => {
+                    let fork_locks = thread.process().lock_for_fork();
+                    handler.do_syscall(call);
+                    drop(fork_locks);
+                    if call.return_value() == 0 {
+                        thread.signals_mut().reset_pending_after_fork();
+                        thread.reset_after_fork();
+                    }
+                }
+            },
             // `vfork` always shares the address space (`CLONE_VM`) and, worse,
             // suspends the parent until the child execs or exits while both run
             // on the same stack — there is no `fork`-shaped variant to allow, so
@@ -301,15 +407,35 @@ mod host {
             libc::SYS_vfork => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
-            // The `fork`-shaped variants reached here (the `CLONE_VM` cases were
-            // refused above). Forward the duplication, then, in the child (the
-            // call returns 0), clear the pending-signal state the host `fork`
-            // copied from the parent: POSIX gives a child an empty pending set.
-            libc::SYS_clone | libc::SYS_clone3 | libc::SYS_fork => {
+            // The variants reached here: genuine `fork` shapes, and malformed
+            // thread shapes the kernel rejects with `EINVAL` (the `CLONE_VM`
+            // cases were serviced or refused above). Forward the call with
+            // every `Process` lock held (see `Process::lock_for_fork`, the
+            // pthread_atfork discipline), so the child's copied mutexes are
+            // released by this thread's own guards rather than staying locked
+            // forever for a sibling that does not exist there. In the child
+            // (the call returns 0), clear the pending-signal state the host
+            // `fork` copied from the parent — POSIX gives a child an empty
+            // pending set — and rebuild the thread and process bookkeeping
+            // around the one surviving thread.
+            libc::SYS_clone | libc::SYS_fork => {
+                let fork_locks = thread.process().lock_for_fork();
                 handler.do_syscall(call);
+                drop(fork_locks);
                 if call.return_value() == 0 {
-                    crate::sys::linux::signal::reset_pending_after_fork();
+                    thread.signals_mut().reset_pending_after_fork();
+                    thread.reset_after_fork();
                 }
+            }
+            // `set_tid_address` records the calling thread's `clear_child_tid`
+            // word — the one the runtime zeroes and futex-wakes on exit so a
+            // joiner returns. It is virtualized, never forwarded: forwarding
+            // would point the host kernel at the guest's word and clobber the
+            // `clear_child_tid` the host thread runtime relies on. Returns the
+            // caller's TID, like the kernel.
+            libc::SYS_set_tid_address => {
+                let tid = thread.set_clear_child_tid(call.args[0]);
+                call.set_return(tid);
             }
             // io_uring lets the guest queue system calls that the kernel then
             // executes asynchronously, on its own, without ever passing them
@@ -458,16 +584,15 @@ mod host {
         handler.post_syscall(call);
     }
 
-    /// Whether a `clone3` whose `clone_args` struct lives at `args_ptr` requests
-    /// `CLONE_VM`. The flags are the first `u64` of the struct; Chimera shares
-    /// the guest's address space, so this is a plain read. A null pointer
-    /// carries no flags — the kernel rejects it with `EFAULT` once forwarded.
-    fn clone3_requests_vm(args_ptr: u64) -> bool {
-        if args_ptr == 0 {
-            return false;
-        }
-        let flags = unsafe { core::ptr::read(args_ptr as *const u64) };
-        flags & libc::CLONE_VM as u64 != 0
+    /// Whether clone flags describe a new thread of the calling process. The
+    /// kernel demands the full shape — `CLONE_THREAD` requires `CLONE_SIGHAND`,
+    /// which requires `CLONE_VM` (anything less is `EINVAL`) — so gating the
+    /// host-thread intercept on all three bits means a malformed thread clone
+    /// falls through to forwarding and gets the kernel's authoritative error.
+    fn is_thread_clone(flags: u64) -> bool {
+        const THREAD_SHAPE: u64 =
+            libc::CLONE_THREAD as u64 | libc::CLONE_SIGHAND as u64 | libc::CLONE_VM as u64;
+        flags & THREAD_SHAPE == THREAD_SHAPE
     }
 }
 
