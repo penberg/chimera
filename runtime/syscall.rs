@@ -244,9 +244,11 @@ mod host {
                 }
                 let result = host_syscall(call);
                 if let SyscallResult::Ok(addr) = result {
-                    thread
-                        .addr_space()
-                        .add_region(addr as usize, call.args[1] as usize);
+                    let mut space = thread.addr_space();
+                    space.add_region(addr as usize, call.args[1] as usize);
+                    // Reset SMC bookkeeping for the (possibly reused) addresses,
+                    // so the new mapping arms from a clean slate.
+                    space.note_map(addr as usize, call.args[1] as usize);
                 }
                 call.set_result(result);
             }
@@ -258,13 +260,21 @@ mod host {
                     call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
                 }
                 handler.do_syscall(call);
+                // A protection change resets the host page (un-arming it) and may
+                // precede a rewrite of code on a W^X-toggled JIT page, so drop the
+                // affected pages' stale translations.
+                if call.return_value() >= 0 {
+                    thread
+                        .addr_space()
+                        .note_prot(call.args[0] as usize, call.args[1] as usize);
+                }
             }
             libc::SYS_munmap => {
                 let result = host_syscall(call);
                 if matches!(result, SyscallResult::Ok(_)) {
-                    thread
-                        .addr_space()
-                        .remove_region(call.args[0] as usize, call.args[1] as usize);
+                    let mut space = thread.addr_space();
+                    space.remove_region(call.args[0] as usize, call.args[1] as usize);
+                    space.note_unmap(call.args[0] as usize, call.args[1] as usize);
                 }
                 call.set_result(result);
             }
@@ -273,13 +283,18 @@ mod host {
                 if let SyscallResult::Ok(new_start) = result {
                     let flags = call.args[3] as libc::c_int;
                     let dontunmap = (flags & libc::MREMAP_DONTUNMAP) != 0;
-                    thread.addr_space().remap_region(
-                        call.args[0] as usize,
-                        call.args[1] as usize,
-                        new_start as usize,
-                        call.args[2] as usize,
-                        dontunmap,
-                    );
+                    let old_start = call.args[0] as usize;
+                    let old_len = call.args[1] as usize;
+                    let new_len = call.args[2] as usize;
+                    let mut space = thread.addr_space();
+                    space.remap_region(old_start, old_len, new_start as usize, new_len, dontunmap);
+                    // The bytes moved: drop translations at the old addresses
+                    // (unless kept by MREMAP_DONTUNMAP) and at the new ones, which
+                    // now hold whatever the move placed there.
+                    if !dontunmap {
+                        space.note_unmap(old_start, old_len);
+                    }
+                    space.note_unmap(new_start as usize, new_len);
                 }
                 call.set_result(result);
             }

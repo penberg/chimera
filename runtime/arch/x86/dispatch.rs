@@ -535,7 +535,6 @@ impl Thread {
                 .addr_space
                 .lock()
                 .unwrap()
-                .code
                 .resolve(rip, block_exit, syscall_exit)
                 .unwrap_or_else(|e| panic!("translate failed at {:#x}: {}", rip, e));
             unsafe {

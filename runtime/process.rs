@@ -117,6 +117,9 @@ pub struct Process {
 impl Process {
     pub fn new(handler: Box<dyn SystemCalls>, code_cache_size: usize) -> Result<Self, Error> {
         install_interrupt_handler();
+        // Own the host SIGSEGV/SIGBUS slot so self-modifying-code write traps are
+        // caught synchronously (see [`crate::sys::linux::fault`]).
+        crate::sys::linux::fault::install();
         Ok(Self {
             addr_space: Mutex::new(AddressSpace::new(code_cache_size)?),
             handler,

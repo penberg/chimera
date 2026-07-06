@@ -58,6 +58,11 @@ const SS_DISABLE: i32 = 2;
 const SIGKILL: u64 = 9;
 const SIGSTOP: u64 = 19;
 
+/// The synchronous fault signals, whose host disposition Chimera keeps for its
+/// own self-modifying-code trap handler rather than mirroring the guest's.
+const SIGBUS: u64 = 7;
+const SIGSEGV: u64 = 11;
+
 // Guest register-file indices (see `crate::arch::dispatch`). r8..r15 are 8..15.
 const RAX: usize = 0;
 const RBX: usize = 1;
@@ -635,6 +640,14 @@ fn wait_for_set(
 /// handler is deliberately installed without `SA_RESTART` so a forwarded
 /// blocking syscall is interrupted and the dispatch loop regains control.
 fn install_host(signo: usize, handler: u64) {
+    // SIGSEGV and SIGBUS belong to the synchronous fault handler (see
+    // [`super::fault`]), which must run first to catch self-modifying-code write
+    // traps. The guest's disposition for them is still recorded in the table
+    // above (so it is reported back and can be honored once guest-fault delivery
+    // exists), but it is never installed on the host slot.
+    if signo == SIGSEGV as usize || signo == SIGBUS as usize {
+        return;
+    }
     let (host, flags) = match handler {
         SIG_DFL => (libc::SIG_DFL, 0),
         SIG_IGN => (libc::SIG_IGN, 0),

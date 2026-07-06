@@ -4,5 +4,6 @@
 
 pub mod elf;
 pub mod exec;
+pub mod fault;
 pub mod signal;
 pub mod syscall;
