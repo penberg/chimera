@@ -204,7 +204,31 @@ impl SystemCalls for Personality {
             libc::SYS_close if self.is_virtual(a[0] as i32) => {
                 self.fds.lock().unwrap().close(a[0] as i32).map(|_| 0)
             }
-            libc::SYS_ioctl if self.is_virtual(a[0] as i32) => Err(Errno::ENOTTY),
+            // An ioctl on a special file must reach the real device —
+            // `grantpt`/`unlockpt`, `TCGETS` (isatty), `TIOCSWINSZ` — or no
+            // pty or tty ever works, so those forward to the host on the
+            // backing fd. Regular files and directories keep answering
+            // ENOTTY: their ioctls can mutate the filesystem itself
+            // (`FS_IOC_SETFLAGS`, `FICLONE`), which would bypass the
+            // read-only mount.
+            libc::SYS_ioctl if self.is_virtual(a[0] as i32) => {
+                match self.desc(a[0] as i32).and_then(|d| d.file.fstat()) {
+                    Ok(st)
+                        if matches!(
+                            st.file_type,
+                            FileType::CharDevice
+                                | FileType::BlockDevice
+                                | FileType::Fifo
+                                | FileType::Socket
+                        ) =>
+                    {
+                        self.deny_ro_or_passthrough(call, Ok(()), Some(0));
+                        return;
+                    }
+                    Ok(_) => Err(Errno::ENOTTY),
+                    Err(e) => Err(e),
+                }
+            }
 
             // --- dup / fcntl (virtual only) ---
             libc::SYS_dup if self.is_virtual(a[0] as i32) => self.dup(a[0] as i32, 0, false),
@@ -529,11 +553,26 @@ impl Personality {
         let follow = flags & libc::O_NOFOLLOW == 0;
         let r = self.ns.resolve(&abs, follow)?;
         // Any write intent against a read-only mount is EROFS — but a plain
-        // read keeps working, so stdio/sockets are unaffected.
+        // read keeps working, so stdio/sockets are unaffected. Special files
+        // are exempt, as they are on a kernel `mount -o ro`: writing a
+        // character or block device, FIFO, or socket sends bytes to the
+        // object behind the node, not to the filesystem holding it, so
+        // `/dev/null` and pty opens keep working in a read-only sandbox.
+        // (`O_CREAT` on an existing node is a no-op, and `O_TRUNC` is ignored
+        // for devices, so neither drags a special file back under the check.)
         let writes = flags & libc::O_ACCMODE != libc::O_RDONLY
             || flags & (libc::O_CREAT | libc::O_TRUNC) != 0;
         if writes && !r.writable {
-            return Err(Errno::EROFS);
+            let special = matches!(
+                r.fs.stat(&r.rel, follow).map(|st| st.file_type),
+                Ok(FileType::CharDevice
+                    | FileType::BlockDevice
+                    | FileType::Fifo
+                    | FileType::Socket)
+            );
+            if !special {
+                return Err(Errno::EROFS);
+            }
         }
         let file: Arc<dyn File> = Arc::from(r.fs.open(&r.rel, OpenFlags(flags), Mode(mode))?);
         let guest_fd = reserve_fd(file.host_fd())?;
