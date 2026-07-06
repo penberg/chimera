@@ -9,7 +9,10 @@
 //! single `dispatch()` call instead of round-tripping through the run loop at
 //! every basic-block boundary.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicI32, Ordering},
+};
 
 use crate::Error;
 
@@ -95,14 +98,24 @@ impl BlockCache {
 /// Rewrite the `rel32` displacement at `site` (an address inside the RWX code
 /// cache) so its branch lands at `host_pc`. The displacement is measured from
 /// the end of its own four bytes. The cache stays well under 2 GiB, so the
-/// signed distance always fits in an `i32`. Safe to do unsynchronized: patching
-/// only happens in the dispatcher, between cache entries, while no translated
-/// code is executing; x86 keeps instruction and data caches coherent.
+/// signed distance always fits in an `i32`.
+///
+/// The translator aligns every patchable `rel32` field to a 4-byte boundary
+/// (see `build_linked_terminator`), so this is a single aligned atomic store:
+/// a sibling thread executing the branch reads either the old target (its cold
+/// exit stub, which round-trips through the dispatcher) or the new one, never a
+/// torn displacement spliced from both. x86 keeps instruction and data caches
+/// coherent, so the executing core picks up the new target on its next fetch.
 fn patch_site(site: usize, host_pc: u64) {
     let disp = host_pc as i64 - (site as i64 + 4);
     debug_assert!(
         i32::try_from(disp).is_ok(),
         "link displacement {disp} out of rel32 range"
     );
-    unsafe { (site as *mut i32).write_unaligned(disp as i32) };
+    debug_assert!(
+        site.is_multiple_of(4),
+        "link site {site:#x} is not 4-byte aligned"
+    );
+    let slot = unsafe { &*(site as *const AtomicI32) };
+    slot.store(disp as i32, Ordering::Release);
 }
