@@ -176,35 +176,37 @@ impl Thread {
         }
     }
 
-    /// Service a `clone` that creates a new thread of this process (the
-    /// `CLONE_THREAD` shape, which the kernel requires to include
+    /// Service a `clone`/`clone3` that creates a new thread of this process
+    /// (the `CLONE_THREAD` shape, which the kernel requires to include
     /// `CLONE_SIGHAND` and `CLONE_VM`). Chimera cannot forward it: the host
-    /// kernel would run guest
-    /// code on the new task natively, outside the translator. Instead it spawns
-    /// a host thread that runs the child guest in the shared process, and returns
-    /// the child's kernel TID to the parent. The guest-visible TID is the host
-    /// TID, so the guest's later `futex`/`tgkill` on it reach this host thread.
-    /// On spawn failure it returns `-EAGAIN`.
+    /// kernel would run guest code on the new task natively, outside the
+    /// translator. Instead it spawns a host thread that runs the child guest
+    /// in the shared process, and returns the child's kernel TID to the
+    /// parent. The guest-visible TID is
+    /// the host TID, so the guest's later `futex`/`tgkill` on it reach this host
+    /// thread. On spawn failure it returns `-EAGAIN`.
     ///
-    /// `args` are the raw `clone` syscall registers; `args[1]` is the child
-    /// stack pointer. The child resumes at the same post-syscall PC as the
-    /// parent, with `rax = 0` and its own stack (see
-    /// [`ThreadState::clone_for_child`]).
-    pub fn clone_vm(&self, args: &[u64; 6]) -> i64 {
-        let flags = args[0];
-        let child_stack = args[1];
-        // `CLONE_SETTLS` gives the child its own thread pointer from `args[4]`
-        // (the `tls` register); without it the child inherits the parent's FS
-        // base, as the kernel does. This is how each pthread gets private TLS.
-        let tls = (flags & libc::CLONE_SETTLS as u64 != 0).then_some(args[4]);
+    /// `child_stack` is the child's stack pointer (its top); the child resumes
+    /// at the same post-syscall PC as the parent with `rax = 0` and its own
+    /// stack (see [`ThreadState::clone_for_child`]). The remaining arguments are
+    /// the thread-ID and TLS words the relevant flags select.
+    fn spawn_clone(
+        &self,
+        flags: u64,
+        child_stack: u64,
+        parent_tid: u64,
+        child_tid: u64,
+        tls: u64,
+    ) -> i64 {
+        // `CLONE_SETTLS` gives the child its own thread pointer; without it the
+        // child inherits the parent's FS base, as the kernel does. This is how
+        // each pthread gets private TLS.
+        let settls = (flags & libc::CLONE_SETTLS as u64 != 0).then_some(tls);
         // `CLONE_CHILD_CLEARTID` registers a word the runtime zeroes and wakes
-        // when the child exits (the basis of `pthread_join`); `args[3]` is its
-        // address.
+        // when the child exits (the basis of `pthread_join`).
         let clear_child_tid =
-            (flags & libc::CLONE_CHILD_CLEARTID as u64 != 0 && args[3] != 0).then_some(args[3]);
-        let parent_tid = args[2];
-        let child_tid = args[3];
-        let child_state = self.state.clone_for_child(child_stack, tls);
+            (flags & libc::CLONE_CHILD_CLEARTID as u64 != 0 && child_tid != 0).then_some(child_tid);
+        let child_state = self.state.clone_for_child(child_stack, settls);
         let process = Arc::clone(&self.process);
 
         // The parent needs the child's kernel TID to return from `clone`, but
@@ -255,6 +257,28 @@ impl Thread {
             Ok(_handle) => rx.recv().unwrap_or(-(libc::EAGAIN as i64)),
             Err(_) => -(libc::EAGAIN as i64),
         }
+    }
+
+    /// `clone(CLONE_VM)`: the arguments are in registers. `args[1]` is the child
+    /// stack pointer; `args[2..=4]` are `parent_tid`, `child_tid`, `tls`.
+    pub fn clone_vm(&self, args: &[u64; 6]) -> i64 {
+        self.spawn_clone(args[0], args[1], args[2], args[3], args[4])
+    }
+
+    /// `clone3(CLONE_VM)`: the arguments come from the base `clone_args`
+    /// struct already copied out of guest memory by [`read_clone3_args`], as
+    /// 8 `u64` fields (uapi `<linux/sched.h>` order): flags, pidfd, child_tid,
+    /// parent_tid, exit_signal, stack, stack_size, tls. Unlike `clone`, the
+    /// `stack` field is the *lowest* address of the child stack and
+    /// `stack_size` its length, so the child's stack pointer is their sum.
+    /// Modern glibc's `pthread_create` takes this path.
+    pub fn clone3_vm(&self, args: &[u64; 8]) -> i64 {
+        let flags = args[0];
+        let child_tid = args[2];
+        let parent_tid = args[3];
+        let child_stack = args[5].wrapping_add(args[6]); // stack + stack_size
+        let tls = args[7];
+        self.spawn_clone(flags, child_stack, parent_tid, child_tid, tls)
     }
 
     /// Reset the thread to a new entry point and a stack.
@@ -423,6 +447,36 @@ impl Thread {
         }
         Ok(())
     }
+}
+
+/// The base `struct clone_args` (`CLONE_ARGS_SIZE_VER0`): the 8 `u64` fields
+/// every `clone3` must supply. The kernel rejects a smaller struct with
+/// `EINVAL` and one larger than a page with `E2BIG`.
+const CLONE_ARGS_SIZE_VER0: u64 = 64;
+const CLONE_ARGS_SIZE_MAX: u64 = 4096;
+
+/// Copy the base `clone_args` struct a `clone3` points at out of guest
+/// memory, without trusting the pointer. The copy goes through the kernel
+/// (`process_vm_readv` on the calling process), so an invalid pointer fails
+/// the copy instead of faulting the runtime. `None` — also returned for a
+/// guest-declared `size` outside the kernel's accepted range — tells the
+/// caller to forward the call, so the kernel reports the authoritative error
+/// (`EFAULT`, `EINVAL`, `E2BIG`) exactly as it would natively.
+pub fn read_clone3_args(args_ptr: u64, size: u64) -> Option<[u64; 8]> {
+    if args_ptr == 0 || !(CLONE_ARGS_SIZE_VER0..=CLONE_ARGS_SIZE_MAX).contains(&size) {
+        return None;
+    }
+    let mut args = [0u64; 8];
+    let local = libc::iovec {
+        iov_base: args.as_mut_ptr().cast(),
+        iov_len: CLONE_ARGS_SIZE_VER0 as usize,
+    };
+    let remote = libc::iovec {
+        iov_base: args_ptr as *mut libc::c_void,
+        iov_len: CLONE_ARGS_SIZE_VER0 as usize,
+    };
+    let copied = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+    (copied == CLONE_ARGS_SIZE_VER0 as isize).then_some(args)
 }
 
 /// Whether a syscall interrupted by a signal must always fail with `EINTR`,

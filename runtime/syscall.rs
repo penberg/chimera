@@ -133,7 +133,7 @@ pub enum SyscallResult {
 
 mod host {
     use super::{SyscallResult, SystemCall, SystemCalls, host_syscall};
-    use crate::arch::dispatch::Thread;
+    use crate::arch::dispatch::{Thread, read_clone3_args};
 
     /// Drive one guest syscall. Runtime-owned syscalls are serviced inline
     /// here, the way a kernel's syscall table services its own; delegated
@@ -180,13 +180,13 @@ mod host {
     /// shape) cannot be forwarded: the new host task would execute guest code
     /// with no translator context, natively. Chimera instead spawns a host
     /// thread that runs the child guest in the shared process and returns its
-    /// kernel TID to the parent (see `Thread::clone_vm`). `CLONE_VM` without
-    /// `CLONE_THREAD` — a separate process sharing this address space — is
-    /// refused with `EPERM`: Chimera can provide neither native forwarding
-    /// (unsandboxed) nor a faithful emulation. `clone3` requesting `CLONE_VM`
-    /// is the same case but carries its arguments in a `clone_args` struct;
-    /// spawning from it is not yet wired up, so it is still refused with
-    /// `EPERM`. Without `CLONE_VM` the call is an ordinary `fork`, whose
+    /// kernel TID to the parent (see `Thread::clone_vm`). `clone3` in the same
+    /// shape is handled the same way via `Thread::clone3_vm`; it carries its
+    /// arguments in a `clone_args` struct (the path modern glibc's
+    /// `pthread_create` takes). `CLONE_VM` without `CLONE_THREAD` — a separate
+    /// process sharing this address space — is refused with `EPERM`: Chimera
+    /// can provide neither native forwarding (unsandboxed) nor a faithful
+    /// emulation. Without `CLONE_VM` the call is an ordinary `fork`, whose
     /// copy-on-write child carries Chimera and resumes in translated code, so
     /// it is forwarded.
     /// `vfork` always shares the address space and has no `fork`-shaped variant,
@@ -319,16 +319,36 @@ mod host {
             {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
-            // `clone3` requesting `CLONE_VM` is the same thread-creation case as
-            // `clone` above, but carries its flags and child stack in the
-            // `clone_args` struct `args[0]` points at rather than in registers.
-            // Spawning a host thread from it is not yet wired up (it needs the
-            // struct reader), so refuse it with `EPERM` for now; a `clone3`
-            // without `CLONE_VM` (the `fork`-shaped case) falls through to the
-            // default arm and is forwarded.
-            libc::SYS_clone3 if clone3_requests_vm(call.args[0]) => {
-                call.set_result(SyscallResult::Error(libc::EPERM));
-            }
+            // `clone3` splits into the same cases as `clone` above, but carries
+            // its arguments in the `clone_args` struct `args[0]` points at —
+            // the path modern glibc's `pthread_create` takes. The struct is
+            // copied out of guest memory fault-safely, exactly once: the copy
+            // both decides the intercept and feeds `clone3_vm`, so a bad
+            // pointer cannot crash the runtime and the fields cannot change
+            // between check and use. A fork-shaped `clone3`, a malformed
+            // `CLONE_THREAD`, or a struct that is unreadable or of a size the
+            // kernel would reject, is forwarded — the kernel forks or reports
+            // the authoritative `EINVAL`/`EFAULT`/`E2BIG` itself, as it would
+            // natively.
+            libc::SYS_clone3 => match read_clone3_args(call.args[0], call.args[1]) {
+                Some(cargs) if is_thread_clone(cargs[0]) => {
+                    let tid = thread.clone3_vm(&cargs);
+                    call.set_return(tid);
+                }
+                // A separate shared-memory process: refused, as for `clone`.
+                Some(cargs)
+                    if cargs[0] & libc::CLONE_VM as u64 != 0
+                        && cargs[0] & libc::CLONE_THREAD as u64 == 0 =>
+                {
+                    call.set_result(SyscallResult::Error(libc::EPERM));
+                }
+                _ => {
+                    handler.do_syscall(call);
+                    if call.return_value() == 0 {
+                        crate::sys::linux::signal::reset_pending_after_fork();
+                    }
+                }
+            },
             // `vfork` always shares the address space (`CLONE_VM`) and, worse,
             // suspends the parent until the child execs or exits while both run
             // on the same stack — there is no `fork`-shaped variant to allow, so
@@ -338,11 +358,16 @@ mod host {
             }
             // The variants reached here: genuine `fork` shapes, and malformed
             // thread shapes the kernel rejects with `EINVAL` (the `CLONE_VM`
-            // cases were serviced or refused above). Forward the call, then,
-            // in the child of a successful fork (the call returns 0), clear
-            // the pending-signal state the host `fork` copied from the parent:
-            // POSIX gives a child an empty pending set.
-            libc::SYS_clone | libc::SYS_clone3 | libc::SYS_fork => {
+            // cases were serviced or refused above). Forward the call with
+            // every `Process` lock held (see `Process::lock_for_fork`, the
+            // pthread_atfork discipline), so the child's copied mutexes are
+            // released by this thread's own guards rather than staying locked
+            // forever for a sibling that does not exist there. In the child
+            // (the call returns 0), clear the pending-signal state the host
+            // `fork` copied from the parent — POSIX gives a child an empty
+            // pending set — and rebuild the thread and process bookkeeping
+            // around the one surviving thread.
+            libc::SYS_clone | libc::SYS_fork => {
                 handler.do_syscall(call);
                 if call.return_value() == 0 {
                     crate::sys::linux::signal::reset_pending_after_fork();
@@ -503,18 +528,6 @@ mod host {
             }
         };
         handler.post_syscall(call);
-    }
-
-    /// Whether a `clone3` whose `clone_args` struct lives at `args_ptr` requests
-    /// `CLONE_VM`. The flags are the first `u64` of the struct; Chimera shares
-    /// the guest's address space, so this is a plain read. A null pointer
-    /// carries no flags — the kernel rejects it with `EFAULT` once forwarded.
-    fn clone3_requests_vm(args_ptr: u64) -> bool {
-        if args_ptr == 0 {
-            return false;
-        }
-        let flags = unsafe { core::ptr::read(args_ptr as *const u64) };
-        flags & libc::CLONE_VM as u64 != 0
     }
 
     /// Whether clone flags describe a new thread of the calling process. The
