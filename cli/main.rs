@@ -59,6 +59,7 @@ fn run(cmd: RunCmd) -> ExitCode {
     };
     let root = HostFs::new("/").expect("host root / is a directory");
     let personality = Personality::new(Namespace::with_root(Arc::new(root), flags));
+    personality.set_exe(&program.exec);
     sandbox.system_calls(personality);
 
     match sandbox.args(&program.args).run() {

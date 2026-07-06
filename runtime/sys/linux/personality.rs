@@ -70,6 +70,13 @@ pub struct Personality {
     ns: Namespace,
     fds: Mutex<FdTable>,
     cwd: Mutex<PathBuf>,
+    /// The guest's executed image — what `/proc/self/exe` names. Chimera
+    /// emulates `execve` in place, so the kernel's own link points at the
+    /// runtime binary; leaking that gives a self-respawning guest (Bun's
+    /// `execPath`) the runtime to exec instead of itself. Seeded by the
+    /// embedder ([`Personality::set_exe`]), updated on every committed exec
+    /// ([`SystemCalls::on_execve`]).
+    exe: Mutex<Option<PathBuf>>,
 }
 
 impl Personality {
@@ -81,8 +88,25 @@ impl Personality {
             ns,
             fds: Mutex::new(FdTable::new()),
             cwd: Mutex::new(normalize(&cwd)),
+            exe: Mutex::new(None),
         }
     }
+
+    /// Record the guest image the sandbox launches, for `/proc/self/exe`.
+    /// Canonicalized so the guest sees the absolute path the kernel would
+    /// store.
+    pub fn set_exe(&self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        *self.exe.lock().unwrap() = Some(path);
+    }
+}
+
+/// `true` for a path the kernel resolves to the calling process's executed
+/// image rather than through the filesystem.
+fn is_magic_exe(p: &Path) -> bool {
+    let s = p.as_os_str().as_bytes();
+    s == b"/proc/self/exe" || s == b"/proc/thread-self/exe"
 }
 
 /// The descriptor table: virtual guest fd → open file. Mirrors Linux's split of
@@ -141,6 +165,30 @@ impl FdTable {
         unsafe { libc::close(fd) };
         Ok(())
     }
+}
+
+/// The descriptor named by a magic fd link — `/dev/fd/N`, `/proc/self/fd/N`,
+/// or `/proc/thread-self/fd/N` — or `None` for any other path. The kernel
+/// resolves these links to the open file itself, not through the filesystem
+/// (their readlink target, `pipe:[…]` or `socket:[…]`, is not a path), so the
+/// namespace walker cannot follow them; [`Personality::open`] services them
+/// as fd reopens instead.
+fn magic_fd_link(abs: &Path) -> Option<i32> {
+    let s = abs.as_os_str().as_bytes();
+    // The /dev/std* symlinks point into /proc/self/fd and would hit the
+    // magic link one hop later; naming their well-known descriptors here
+    // keeps the shell idioms (`< /dev/stdin`, `> /dev/stderr`) working.
+    match s {
+        b"/dev/stdin" => return Some(0),
+        b"/dev/stdout" => return Some(1),
+        b"/dev/stderr" => return Some(2),
+        _ => {}
+    }
+    let n = s
+        .strip_prefix(b"/dev/fd/")
+        .or_else(|| s.strip_prefix(b"/proc/self/fd/"))
+        .or_else(|| s.strip_prefix(b"/proc/thread-self/fd/"))?;
+    std::str::from_utf8(n).ok()?.parse().ok()
 }
 
 impl SystemCalls for Personality {
@@ -400,7 +448,9 @@ impl SystemCalls for Personality {
             .and_then(|fd| fd.desc.file.host_fd())
     }
 
-    fn on_execve(&self, _path: &Path) {
+    fn on_execve(&self, path: &Path) {
+        // The link target of /proc/self/exe follows the exec.
+        *self.exe.lock().unwrap() = Some(path.to_path_buf());
         // POSIX exec semantics for the table: close-on-exec entries go, the
         // rest survive into the new image with their numbers intact. Closing
         // through `FdTable::close` releases each reserved kernel number, so
@@ -467,6 +517,14 @@ impl Personality {
                 None => return Err(Errno::EBADF),
             }
         };
+        // /proc/self/exe names the running image, which under an emulated
+        // exec is the guest's binary, not Chimera's: leaking the runtime's
+        // own path here hands a self-respawning guest the wrong program.
+        if is_magic_exe(&joined)
+            && let Some(exe) = self.exe.lock().unwrap().clone()
+        {
+            return Ok(exe);
+        }
         // Not normalized here: the resolver must apply `..` *after* following
         // symlinks, not lexically, so it walks the joined path itself.
         Ok(joined)
@@ -550,8 +608,15 @@ impl Personality {
         };
         let raw = unsafe { read_cstr(pathptr) };
         let abs = self.abs_path(dirfd, &raw)?;
+        if let Some(fd) = magic_fd_link(&abs) {
+            return self.reopen_fd(fd, flags, mode);
+        }
+        self.open_abs(&abs, flags, mode)
+    }
+
+    fn open_abs(&self, abs: &Path, flags: i32, mode: u32) -> Result<i64, Errno> {
         let follow = flags & libc::O_NOFOLLOW == 0;
-        let r = self.ns.resolve(&abs, follow)?;
+        let r = self.ns.resolve(abs, follow)?;
         // Any write intent against a read-only mount is EROFS — but a plain
         // read keeps working, so stdio/sockets are unaffected. Special files
         // are exempt, as they are on a kernel `mount -o ro`: writing a
@@ -588,6 +653,43 @@ impl Personality {
         let cloexec = flags & libc::O_CLOEXEC != 0;
         self.fds.lock().unwrap().insert_at(guest_fd, desc, cloexec);
         Ok(guest_fd as i64)
+    }
+
+    /// Reopen the object behind one of the guest's descriptors, the way the
+    /// kernel services an open of a magic fd link (see [`magic_fd_link`]). A
+    /// virtual descriptor reopens by the path it was opened with, so the
+    /// namespace and the read-only policy apply as usual. A host descriptor
+    /// forwards to the host kernel when the object has no filesystem identity
+    /// — a pipe, socket, or tty, which is what process substitution and
+    /// `/dev/fd` redirection name. A write reopen of a regular host file is
+    /// refused with EROFS: the walker cannot reach the object to consult the
+    /// mount policy, and reopening through the magic link is the classic way
+    /// to escalate a read-only descriptor to a writable one.
+    fn reopen_fd(&self, fd: i32, flags: i32, mode: u32) -> Result<i64, Errno> {
+        if flags & libc::O_NOFOLLOW != 0 {
+            // The magic link is a symlink; the kernel answers O_NOFOLLOW on
+            // it with ELOOP.
+            return Err(Errno::ELOOP);
+        }
+        if self.is_virtual(fd) {
+            let path = self.desc(fd)?.path.clone();
+            return self.open_abs(&path, flags, mode);
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return Err(Errno::from_io(&std::io::Error::last_os_error()));
+        }
+        let special = matches!(
+            st.st_mode & libc::S_IFMT,
+            libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK
+        );
+        let writes = flags & libc::O_ACCMODE != libc::O_RDONLY
+            || flags & (libc::O_CREAT | libc::O_TRUNC) != 0;
+        if !special && writes {
+            return Err(Errno::EROFS);
+        }
+        let path = format!("/proc/self/fd/{fd}\0");
+        check_host(unsafe { libc::open(path.as_ptr() as *const libc::c_char, flags, mode) })
     }
 
     fn desc(&self, fd: i32) -> Result<Arc<OpenFileDescription>, Errno> {
@@ -755,6 +857,17 @@ impl Personality {
 
     fn readlink(&self, dirfd: i32, pathptr: u64, buf: u64, size: usize) -> Result<i64, Errno> {
         let raw = unsafe { read_cstr(pathptr) };
+        // readlink of /proc/self/exe answers with the link's target — the
+        // guest's image — before path rewriting would try to readlink the
+        // binary itself (EINVAL: it is not a symlink).
+        if is_magic_exe(Path::new(OsStr::from_bytes(&raw)))
+            && let Some(exe) = self.exe.lock().unwrap().clone()
+        {
+            let bytes = exe.as_os_str().as_bytes();
+            let n = bytes.len().min(size);
+            guest_mut(buf, n).copy_from_slice(&bytes[..n]);
+            return Ok(n as i64);
+        }
         let abs = self.abs_path(dirfd, &raw)?;
         // readlink names the link itself: never follow the final component.
         let r = self.ns.resolve(&abs, false)?;
