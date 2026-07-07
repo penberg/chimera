@@ -162,6 +162,21 @@ impl Namespace {
         })
     }
 
+    /// Stat an absolute guest path. `resolve` + `Vfs::stat` in one call, minus
+    /// the cost of materializing a [`Resolved`]: on the confining fast path the
+    /// raw path goes straight to the filesystem — no owned `rel`/`abs` buffers —
+    /// and on the walked path the stat the walk already took is reused.
+    pub fn stat_path(&self, path: &Path, follow: bool) -> Result<Stat, Errno> {
+        if self.mounts.len() == 1 && self.mounts[0].fs.confines() {
+            return self.mounts[0].fs.stat(path, follow);
+        }
+        let r = self.resolve(path, follow)?;
+        match r.stat {
+            Some(s) => Ok(s),
+            None => r.fs.stat(&r.rel, follow),
+        }
+    }
+
     /// The mount serving `abs` (longest matching mount point) and the path
     /// relative to it.
     fn lookup(&self, abs: &Path) -> (&Mount, PathBuf) {
@@ -200,29 +215,22 @@ fn parts(path: &Path) -> Vec<Part> {
         .collect()
 }
 
-/// Build an absolute path from already-resolved components.
-fn join_abs(components: &[OsString]) -> PathBuf {
-    let mut p = PathBuf::from("/");
-    p.extend(components);
-    p
-}
-
 /// Lexically normalize an absolute path (drop `.`, pop on `..`, clamp at root).
 /// Used only to seed the initial cwd from the host's; path *resolution* goes
 /// through [`Namespace::resolve`], which must handle `..` after symlinks, not
 /// lexically.
 pub fn normalize(path: &Path) -> PathBuf {
-    let mut out: Vec<OsString> = Vec::new();
+    let mut out = PathBuf::from("/");
     for c in path.components() {
         match c {
             Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
             Component::ParentDir => {
-                out.pop();
+                out.pop(); // popping at `/` stays at `/`
             }
-            Component::Normal(n) => out.push(n.to_os_string()),
+            Component::Normal(n) => out.push(n),
         }
     }
-    join_abs(&out)
+    out
 }
 
 #[cfg(test)]

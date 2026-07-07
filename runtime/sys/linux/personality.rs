@@ -15,8 +15,9 @@
 //! root.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
-    ffi::{OsStr, OsString},
+    ffi::{CStr, OsStr, OsString},
     os::{fd::RawFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
     ptr, slice,
@@ -310,8 +311,12 @@ impl SystemCalls for Personality {
 
             // --- path metadata ---
             libc::SYS_newfstatat => self.newfstatat(a[0] as i32, a[1], a[2], a[3] as i32),
-            libc::SYS_stat => self.fstatat_path(libc::AT_FDCWD, a[0], a[1], true),
-            libc::SYS_lstat => self.fstatat_path(libc::AT_FDCWD, a[0], a[1], false),
+            libc::SYS_stat => {
+                self.fstatat_path(libc::AT_FDCWD, &unsafe { read_cstr(a[0]) }, a[1], true)
+            }
+            libc::SYS_lstat => {
+                self.fstatat_path(libc::AT_FDCWD, &unsafe { read_cstr(a[0]) }, a[1], false)
+            }
             libc::SYS_statx => self.statx(a[0] as i32, a[1], a[2] as i32, a[4]),
             libc::SYS_statfs => self.statfs(a[0], a[1]),
             libc::SYS_access => self.access(libc::AT_FDCWD, a[0], a[1] as i32),
@@ -493,9 +498,9 @@ impl SystemCalls for Personality {
         // root, and a synthetic filesystem (no host path) is reported as EACCES.
         Some(
             (|| {
-                let abs = if path.is_empty() && flags & libc::AT_EMPTY_PATH != 0 {
+                let abs: Cow<Path> = if path.is_empty() && flags & libc::AT_EMPTY_PATH != 0 {
                     // execveat(fd, "", AT_EMPTY_PATH): the fd names the file.
-                    self.desc(dirfd)?.path.clone()
+                    Cow::Owned(self.desc(dirfd)?.path.clone())
                 } else {
                     self.abs_path(dirfd, path)?
                 };
@@ -522,15 +527,16 @@ impl Personality {
     }
 
     /// Turn a `dirfd` + raw guest path into an absolute, normalized guest path.
-    fn abs_path(&self, dirfd: i32, raw: &[u8]) -> Result<PathBuf, Errno> {
+    /// An already-absolute path — the common case — is borrowed, not copied.
+    fn abs_path<'a>(&self, dirfd: i32, raw: &'a [u8]) -> Result<Cow<'a, Path>, Errno> {
         let p = Path::new(OsStr::from_bytes(raw));
-        let joined = if p.is_absolute() {
-            p.to_path_buf()
+        let joined: Cow<'a, Path> = if p.is_absolute() {
+            Cow::Borrowed(p)
         } else if dirfd == libc::AT_FDCWD {
-            self.cwd.lock().unwrap().join(p)
+            Cow::Owned(self.cwd.lock().unwrap().join(p))
         } else {
             match self.fds.lock().unwrap().get(dirfd) {
-                Some(fd) => fd.desc.path.join(p),
+                Some(fd) => Cow::Owned(fd.desc.path.join(p)),
                 // A relative path against a host dirfd has no place in the
                 // namespace.
                 None => return Err(Errno::EBADF),
@@ -542,7 +548,7 @@ impl Personality {
         if is_magic_exe(&joined)
             && let Some(exe) = self.exe.lock().unwrap().clone()
         {
-            return Ok(exe);
+            return Ok(Cow::Owned(exe));
         }
         // Not normalized here: the resolver must apply `..` *after* following
         // symlinks, not lexically, so it walks the joined path itself.
@@ -827,19 +833,12 @@ impl Personality {
         if raw.is_empty() && flags & libc::AT_EMPTY_PATH != 0 && self.is_virtual(dirfd) {
             return self.fstat(dirfd, buf);
         }
-        self.fstatat_path(dirfd, pathptr, buf, flags & libc::AT_SYMLINK_NOFOLLOW == 0)
+        self.fstatat_path(dirfd, &raw, buf, flags & libc::AT_SYMLINK_NOFOLLOW == 0)
     }
 
-    fn fstatat_path(&self, dirfd: i32, pathptr: u64, buf: u64, follow: bool) -> Result<i64, Errno> {
-        let raw = unsafe { read_cstr(pathptr) };
-        let abs = self.abs_path(dirfd, &raw)?;
-        let r = self.ns.resolve(&abs, follow)?;
-        // Reuse the stat the resolver already took, if any (walked path); the
-        // confining fast path leaves it to the filesystem here.
-        let s = match r.stat {
-            Some(s) => s,
-            None => r.fs.stat(&r.rel, follow)?,
-        };
+    fn fstatat_path(&self, dirfd: i32, raw: &[u8], buf: u64, follow: bool) -> Result<i64, Errno> {
+        let abs = self.abs_path(dirfd, raw)?;
+        let s = self.ns.stat_path(&abs, follow)?;
         write_stat(buf, &s);
         Ok(0)
     }
@@ -851,11 +850,7 @@ impl Personality {
         } else {
             let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
             let abs = self.abs_path(dirfd, &raw)?;
-            let r = self.ns.resolve(&abs, follow)?;
-            match r.stat {
-                Some(s) => s,
-                None => r.fs.stat(&r.rel, follow)?,
-            }
+            self.ns.stat_path(&abs, follow)?
         };
         write_statx(buf, &s);
         Ok(0)
@@ -928,8 +923,9 @@ impl Personality {
     }
 
     fn rename(&self, odir: i32, optr: u64, ndir: i32, nptr: u64, flags: u32) -> Result<i64, Errno> {
-        let from = self.abs_path(odir, &unsafe { read_cstr(optr) })?;
-        let to = self.abs_path(ndir, &unsafe { read_cstr(nptr) })?;
+        let (oraw, nraw) = (unsafe { read_cstr(optr) }, unsafe { read_cstr(nptr) });
+        let from = self.abs_path(odir, &oraw)?;
+        let to = self.abs_path(ndir, &nraw)?;
         let rf = self.ns.resolve(&from, false)?;
         let rt = self.ns.resolve(&to, false)?;
         if !rf.writable || !rt.writable {
@@ -944,7 +940,8 @@ impl Personality {
 
     fn symlink(&self, targetptr: u64, dirfd: i32, linkptr: u64) -> Result<i64, Errno> {
         let target = unsafe { read_cstr(targetptr) };
-        let abs = self.abs_path(dirfd, &unsafe { read_cstr(linkptr) })?;
+        let link = unsafe { read_cstr(linkptr) };
+        let abs = self.abs_path(dirfd, &link)?;
         let r = self.ns.resolve(&abs, false)?;
         if !r.writable {
             return Err(Errno::EROFS);
@@ -954,8 +951,9 @@ impl Personality {
     }
 
     fn link(&self, odir: i32, optr: u64, ndir: i32, nptr: u64) -> Result<i64, Errno> {
-        let old = self.abs_path(odir, &unsafe { read_cstr(optr) })?;
-        let new = self.abs_path(ndir, &unsafe { read_cstr(nptr) })?;
+        let (oraw, nraw) = (unsafe { read_cstr(optr) }, unsafe { read_cstr(nptr) });
+        let old = self.abs_path(odir, &oraw)?;
+        let new = self.abs_path(ndir, &nraw)?;
         // The hard link names the existing entry, not its symlink target.
         let ro = self.ns.resolve(&old, false)?;
         let rn = self.ns.resolve(&new, false)?;
@@ -970,7 +968,8 @@ impl Personality {
     }
 
     fn truncate(&self, pathptr: u64, len: u64) -> Result<i64, Errno> {
-        let abs = self.abs_path(libc::AT_FDCWD, &unsafe { read_cstr(pathptr) })?;
+        let raw = unsafe { read_cstr(pathptr) };
+        let abs = self.abs_path(libc::AT_FDCWD, &raw)?;
         let r = self.ns.resolve(&abs, true)?;
         if !r.writable {
             return Err(Errno::EROFS);
@@ -991,7 +990,8 @@ impl Personality {
     }
 
     fn statfs(&self, pathptr: u64, buf: u64) -> Result<i64, Errno> {
-        let abs = self.abs_path(libc::AT_FDCWD, &unsafe { read_cstr(pathptr) })?;
+        let raw = unsafe { read_cstr(pathptr) };
+        let abs = self.abs_path(libc::AT_FDCWD, &raw)?;
         let r = self.ns.resolve(&abs, true)?;
         write_statfs(buf, &r.fs.statfs(&r.rel)?);
         Ok(0)
@@ -1129,7 +1129,8 @@ impl Personality {
     }
 
     fn chdir(&self, pathptr: u64) -> Result<i64, Errno> {
-        let abs = self.abs_path(libc::AT_FDCWD, &unsafe { read_cstr(pathptr) })?;
+        let raw = unsafe { read_cstr(pathptr) };
+        let abs = self.abs_path(libc::AT_FDCWD, &raw)?;
         let r = self.ns.resolve(&abs, true)?;
         if r.fs.stat(&r.rel, true)?.file_type != FileType::Directory {
             return Err(Errno::ENOTDIR);
@@ -1181,20 +1182,14 @@ fn guest_mut(ptr: u64, len: usize) -> &'static mut [u8] {
 
 /// Read a NUL-terminated guest string (without the terminator).
 unsafe fn read_cstr(ptr: u64) -> Vec<u8> {
-    let mut out = Vec::new();
     if ptr == 0 {
-        return out;
+        return Vec::new();
     }
-    let mut i = 0usize;
-    loop {
-        let b = unsafe { ptr::read((ptr as *const u8).add(i)) };
-        if b == 0 {
-            break;
-        }
-        out.push(b);
-        i += 1;
-    }
-    out
+    // The guest shares the address space, so this is an in-process C string:
+    // libc's strlen + one exact-size copy.
+    unsafe { CStr::from_ptr(ptr as *const libc::c_char) }
+        .to_bytes()
+        .to_vec()
 }
 
 /// Iterate a guest `struct iovec[]` as `(base, len)` pairs.
