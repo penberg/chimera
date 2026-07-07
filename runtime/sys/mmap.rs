@@ -255,13 +255,11 @@ impl Drop for AddressSpace {
 
 /// The runtime's pid, cached for the self-targeted `process_vm` copies below.
 /// glibc has not cached `getpid()` since 2.25, so taking it per copy doubles
-/// each copy's syscall bill — and the translator fetches its decode window
-/// through [`copy_from_guest`] once per translated block, which for a large
-/// program is over a million syscalls before it finishes starting. A fork
-/// invalidates the value (a stale pid would aim the copies at the *parent's*
-/// address space), so Chimera registers a `pthread_atfork` child hook for host
-/// forks and still drops the cache from [`Thread::reset_after_fork`] for the
-/// guest's raw-`clone` fork path, which never runs libc's fork handlers.
+/// each copy's syscall bill. A fork invalidates the value (a stale pid would
+/// aim the copies at the *parent's* address space), so Chimera registers a
+/// `pthread_atfork` child hook for host forks and still drops the cache from
+/// [`Thread::reset_after_fork`] for the guest's raw-`clone` fork path, which
+/// never runs libc's fork handlers.
 ///
 /// [`Thread::reset_after_fork`]: crate::arch::x86::dispatch::Thread::reset_after_fork
 static CACHED_PID: AtomicI32 = AtomicI32::new(0);

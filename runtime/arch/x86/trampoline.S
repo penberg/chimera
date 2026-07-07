@@ -7,6 +7,13 @@
 // does the same, but sets `exit_kind = SYSCALL` so the dispatcher knows to
 // invoke the embedder's `SystemCalls` handler before re-entering the cache.
 //
+// The file also defines `chimera_fetch_copy`, the fault-guarded copy the
+// translator fetches its decode window through. It lives here rather than in
+// Rust because its fault tolerance is an ABI contract with the fault handler:
+// the handler recognizes a fault by rip range and resumes at a fixed label,
+// which requires the faulting instruction and the fixup to sit at exported,
+// compiler-opaque addresses.
+//
 // All TS_* placeholders are field offsets into ThreadState, supplied by
 // global_asm! via offset_of!. Update the struct and the asm picks up the new
 // offsets at compile time — no magic numbers to keep in sync.
@@ -209,3 +216,31 @@ exit_trap:
     pop rbx
     ret
 .size exit_trap, . - exit_trap
+
+// fn chimera_fetch_copy(dst: *mut u8 /* rdi */, src: *const u8 /* rsi */,
+//                       len: usize /* rdx */) -> usize /* rax */
+//
+// Copy `len` bytes from an untrusted guest address to `dst`, returning how
+// many bytes were copied: `len` when the whole range is readable, the
+// byte-exact readable prefix when a fault cuts the copy short. The guarantee
+// is the kernel's exception-table pattern: a faulting `rep movsb` leaves
+// rcx/rsi/rdi reflecting exact progress, so the fault handler, on seeing a
+// rip inside [chimera_fetch_copy_start, chimera_fetch_fixup), rewrites the
+// rip to `chimera_fetch_fixup` and returns — execution resumes below the
+// copy and `len - rcx` is the count. The recognition is a rip-range compare
+// against these exported labels, so the primitive needs no per-thread arming
+// and the handler stays within its no-TLS, no-allocation contract.
+.globl chimera_fetch_copy
+.type chimera_fetch_copy, @function
+chimera_fetch_copy:
+    mov rcx, rdx
+    cld
+.globl chimera_fetch_copy_start
+chimera_fetch_copy_start:
+    rep movsb
+.globl chimera_fetch_fixup
+chimera_fetch_fixup:
+    mov rax, rdx
+    sub rax, rcx
+    ret
+.size chimera_fetch_copy, . - chimera_fetch_copy

@@ -14,9 +14,9 @@ use iced_x86::{
     Instruction, InstructionBlock, MemoryOperand, OpKind, Register,
 };
 
-use crate::{Error, sys::mmap::copy_from_guest};
+use crate::Error;
 
-use super::dispatch::ThreadState;
+use super::{dispatch::ThreadState, trampoline::fetch_copy};
 
 const MAX_BLOCK_GUEST_BYTES: usize = 4096;
 /// Longest possible x86-64 instruction encoding. An instruction whose start
@@ -455,19 +455,15 @@ pub struct Translation {
 }
 
 /// Copy up to one decode window of guest bytes at `guest_pc` into `buf`,
-/// without trusting the address ([`copy_from_guest`]). Returns how many bytes
-/// are readable: the whole window, its prefix up to the page boundary when the
-/// window straddles into an unmapped page, or 0 when `guest_pc` itself is
-/// unreadable. The window is one page long, so it crosses at most one boundary.
+/// without trusting the address ([`fetch_copy`]). Returns how many bytes are
+/// readable: the whole window, its prefix up to where the window runs into
+/// unreadable memory, or 0 when `guest_pc` itself is unreadable. This runs
+/// once per translated block — over a million times while a large program
+/// starts — so it is a direct fault-guarded copy, not a `process_vm_readv`
+/// probe: W^X guarantees every page the guest can execute is host-readable,
+/// so the guarded fault path never runs except on a wild jump.
 fn read_guest_window(guest_pc: u64, buf: &mut [u8]) -> usize {
-    if copy_from_guest(guest_pc, buf) {
-        return buf.len();
-    }
-    let prefix = (buf.len() - (guest_pc as usize & (buf.len() - 1))) % buf.len();
-    if prefix != 0 && copy_from_guest(guest_pc, &mut buf[..prefix]) {
-        return prefix;
-    }
-    0
+    fetch_copy(guest_pc, buf)
 }
 
 /// Translate one basic block starting at `guest_pc`. Returns the host PC at
