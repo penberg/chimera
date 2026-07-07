@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use chimera::{HostFs, MountFlags, Namespace, Personality, Sandbox};
+use chimera::{HostFs, MountFlags, Namespace, OverlayFs, Personality, Sandbox, Vfs};
 use mimalloc::MiMalloc;
 
 use opts::{Command, Opts, RunCmd};
@@ -71,8 +71,31 @@ fn run(cmd: RunCmd) -> ExitCode {
     } else {
         MountFlags::RDONLY
     };
-    let root = HostFs::new("/").expect("host root / is a directory");
-    let personality = Personality::new(Namespace::with_root(Arc::new(root), flags));
+    let host = Arc::new(HostFs::new("/").expect("host root / is a directory"));
+    // Bring-up toggle for the copy-on-write overlay: CHIMERA_COW=<delta>
+    // mounts the overlay at `/` so the whole suite can run against the read
+    // path before writes exist. Deleted when the overlay becomes the default
+    // (task 9 of the overlay plan).
+    let root: Arc<dyn Vfs> = match env::var_os("CHIMERA_COW") {
+        Some(delta) => match OverlayFs::new(host, PathBuf::from(&delta)) {
+            Ok(overlay) => Arc::new(overlay),
+            Err(err) => {
+                let err = io::Error::from_raw_os_error(err.raw());
+                let hint = if err.kind() == io::ErrorKind::Unsupported {
+                    " (the delta needs a filesystem with user xattrs)"
+                } else {
+                    ""
+                };
+                eprintln!(
+                    "chimera: cannot open CHIMERA_COW delta {}: {err}{hint}",
+                    Path::new(&delta).display(),
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+        None => host,
+    };
+    let personality = Personality::new(Namespace::with_root(root, flags));
     personality.set_exe(&program.exec);
     sandbox.system_calls(personality);
 
