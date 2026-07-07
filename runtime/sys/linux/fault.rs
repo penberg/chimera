@@ -13,16 +13,18 @@
 //! It owns the host `SIGSEGV`/`SIGBUS` disposition. The guest's own handlers for
 //! those are recorded in the disposition table but never installed on the host
 //! slot ([`super::signal`]), so this handler always runs first and can classify
-//! the fault. Besides SMC writes it recognizes one other recoverable fault, in
-//! the style of a kernel exception table: a fault whose rip lies inside the
-//! `chimera_fetch_copy` primitive — the translator probing an untrusted guest
-//! address for its decode window — resumes at the primitive's fixup label,
-//! which reports the readable prefix. A fault that is neither — a genuine guest
-//! fault, or one taken in Chimera's own code — prints a crash report
-//! ([`report_fault`]) in the style of a kernel OOPS (cause, faulting addresses,
-//! the full guest register file, the faulting instruction's bytes, and a slice
-//! of the stack) and is then left to terminate the process with the faithful
-//! signal; precise delivery into a guest fault handler is not modeled.
+//! the fault. Besides SMC writes it recognizes two recoverable faults in the
+//! style of a kernel exception table: a fault whose rip lies inside the
+//! translator's `chimera_fetch_copy` primitive resumes at its fixup label,
+//! which reports the readable decode-window prefix, and a fault inside
+//! [`crate::arch::x86::trampoline::guarded_copy`] resumes at that routine's
+//! failure tail so `copy_from_guest` reports a failed read. A fault that is
+//! neither — a genuine guest fault, or one taken in Chimera's own code — prints
+//! a crash report ([`report_fault`]) in the style of a kernel OOPS (cause,
+//! faulting addresses, the full guest register file, the faulting instruction's
+//! bytes, and a slice of the stack) and is then left to terminate the process
+//! with the faithful signal; precise delivery into a guest fault handler is not
+//! modeled.
 //!
 //! The handler is async-signal-safe: it touches only atomics, a `Mutex` and
 //! `HashMap` whose operations never allocate, and `mprotect`. It must not call
@@ -38,7 +40,10 @@ use std::{
 };
 
 use crate::{
-    arch::x86::{trampoline::fetch_copy_span, translate::code_cache_contains},
+    arch::x86::{
+        trampoline::{fetch_copy_span, guarded_copy_fixup, in_guarded_copy},
+        translate::code_cache_contains,
+    },
     process::Process,
 };
 
@@ -105,6 +110,15 @@ extern "C" fn chimera_fault(
     let (fetch_start, fetch_fixup) = fetch_copy_span();
     if (fetch_start..fetch_fixup).contains(&rip) {
         set_fault_rip(ucontext, fetch_fixup);
+        return;
+    }
+
+    // A fault inside the guarded copy routine is a failed read of untrusted
+    // guest memory (`copy_from_guest`): resume the interrupted thread at the
+    // routine's fixup label, which reports the failure to its caller — the
+    // kernel's `copy_from_user` exception-table pattern.
+    if in_guarded_copy(rip) {
+        set_fault_rip(ucontext, guarded_copy_fixup());
         return;
     }
 

@@ -68,6 +68,9 @@ unsafe extern "C" {
     fn chimera_fetch_copy(dst: *mut u8, src: *const u8, len: usize) -> usize;
     fn chimera_fetch_copy_start();
     fn chimera_fetch_fixup();
+    pub fn guarded_copy(dst: *mut u8, src: *const u8, len: usize) -> i64;
+    fn guarded_copy_fault();
+    fn guarded_copy_end();
 }
 
 /// Copy up to `buf.len()` bytes of guest memory at `src` into `buf` without
@@ -89,6 +92,20 @@ pub fn fetch_copy_span() -> (usize, usize) {
         chimera_fetch_copy_start as *const () as usize,
         chimera_fetch_fixup as *const () as usize,
     )
+}
+
+/// Whether `rip` lies inside [`guarded_copy`], so a fault taken there is a
+/// failed read of guest memory rather than a crash in Chimera.
+pub fn in_guarded_copy(rip: usize) -> bool {
+    let lo = guarded_copy as *const () as usize;
+    let hi = guarded_copy_end as *const () as usize;
+    (lo..hi).contains(&rip)
+}
+
+/// Where the fault handler resumes a faulted [`guarded_copy`]: the routine's
+/// failure tail, which returns 0 to the caller.
+pub fn guarded_copy_fixup() -> usize {
+    guarded_copy_fault as *const () as usize
 }
 
 #[cfg(test)]
