@@ -25,7 +25,7 @@ nsop() { awk '{print $2}'; }
 printf '%-14s %13s %13s %8s\n' workload native chimera ratio
 for w in "${WORKLOADS[@]}"; do
     bin="$BUILD/$w"
-    cc -O2 -o "$bin" "$DIR/perf-$w.c"
+    cc -O2 -I "$DIR/.." -o "$bin" "$DIR/perf-$w.c"
     nat=$("$bin" | nsop)
     chi=$("$CHIMERA" run -- "$bin" | nsop)
     ratio=$(awk -v a="$chi" -v b="$nat" 'BEGIN { printf "%.1f", a / b }')
