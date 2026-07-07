@@ -41,9 +41,13 @@ enum Visibility {
     Upper { lower_masked: bool },
     /// The upper has nothing on this path; the lower serves it.
     Lower,
-    /// A whiteout (or an opaque ancestor over a lower-only tail) deletes the
-    /// path from the merged view.
-    Hidden,
+    /// The final entry is a whiteout: the name reads as deleted, and a create
+    /// replaces the marker.
+    Whiteout,
+    /// The name is absent and an opaque ancestor (or a whiteout above it)
+    /// keeps any lower content invisible: reads say ENOENT, creates land in
+    /// the upper.
+    Masked,
 }
 
 /// A copy-on-write overlay: `upper` (the delta's `data/` tree) over `lower`.
@@ -92,11 +96,12 @@ impl OverlayInner {
             .peekable();
         while let Some(name) = components.next() {
             cur.push(name);
+            let is_final = components.peek().is_none();
             let md = match std::fs::symlink_metadata(&cur) {
                 Ok(md) => md,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(if lower_masked {
-                        Visibility::Hidden
+                        Visibility::Masked
                     } else {
                         Visibility::Lower
                     });
@@ -105,9 +110,12 @@ impl OverlayInner {
             };
             if is_whiteout(&cur)? {
                 // The name is deleted; nothing below it survives either.
-                return Ok(Visibility::Hidden);
+                return Ok(if is_final {
+                    Visibility::Whiteout
+                } else {
+                    Visibility::Masked
+                });
             }
-            let is_final = components.peek().is_none();
             if is_final {
                 return Ok(Visibility::Upper { lower_masked });
             }
@@ -172,6 +180,30 @@ impl OverlayInner {
     ) -> Result<(), Errno> {
         self.ensure_upper(rel)?;
         apply(&self.upper)
+    }
+
+    /// Whether the lower still has an entry at `rel` — the test that decides
+    /// if a deletion needs a whiteout and a rename must cover its source.
+    fn lower_visible(&self, rel: &Path) -> bool {
+        self.lower.stat(rel, false).is_ok()
+    }
+
+    /// The merged view's stat of `rel`, `None` when the name is absent.
+    fn merged_stat(&self, rel: &Path) -> Result<Option<Stat>, Errno> {
+        match self.visibility(rel)? {
+            Visibility::Upper { .. } => self.upper.stat(rel, false).map(Some),
+            Visibility::Lower => match self.lower.stat(rel, false) {
+                Ok(st) => Ok(Some(st)),
+                Err(Errno::ENOENT) => Ok(None),
+                Err(e) => Err(e),
+            },
+            Visibility::Whiteout | Visibility::Masked => Ok(None),
+        }
+    }
+
+    /// Drop the whiteout marker at `rel` so a create can take the name over.
+    fn remove_marker(&self, rel: &Path) -> Result<(), Errno> {
+        std::fs::remove_file(self.delta.data_path(rel)).map_err(|e| Errno::from_io(&e))
     }
 }
 
@@ -256,7 +288,18 @@ impl Vfs for OverlayFs {
                     None => Err(Errno::ENOENT),
                 }
             }
-            Visibility::Hidden => Err(Errno::ENOENT),
+            // Creating over a deleted name replaces the whiteout — the lower
+            // file it hid must not bleed through, which the fresh upper file
+            // now guarantees. (O_EXCL succeeds: the merged view had no name.)
+            Visibility::Whiteout if flags.create() => {
+                inner.remove_marker(path)?;
+                inner.upper.open(path, flags, mode)
+            }
+            Visibility::Masked if flags.create() => {
+                inner.delta.materialize_parents(path)?;
+                inner.upper.open(path, flags, mode)
+            }
+            Visibility::Whiteout | Visibility::Masked => Err(Errno::ENOENT),
         }
     }
 
@@ -264,7 +307,7 @@ impl Vfs for OverlayFs {
         match self.inner.visibility(path)? {
             Visibility::Upper { .. } => self.inner.upper.stat(path, follow),
             Visibility::Lower => self.inner.lower.stat(path, follow),
-            Visibility::Hidden => Err(Errno::ENOENT),
+            Visibility::Whiteout | Visibility::Masked => Err(Errno::ENOENT),
         }
     }
 
@@ -272,35 +315,152 @@ impl Vfs for OverlayFs {
         match self.inner.visibility(path)? {
             Visibility::Upper { .. } => self.inner.upper.readlink(path),
             Visibility::Lower => self.inner.lower.readlink(path),
-            Visibility::Hidden => Err(Errno::ENOENT),
+            Visibility::Whiteout | Visibility::Masked => Err(Errno::ENOENT),
         }
     }
 
-    // Namespace mutation (unlink, rename, mkdir, …) lands with the next
-    // task; until then those answer EROFS.
-
-    fn mkdir(&self, _path: &Path, _mode: Mode) -> Result<(), Errno> {
-        Err(Errno::EROFS)
+    fn mkdir(&self, path: &Path, mode: Mode) -> Result<(), Errno> {
+        let inner = &self.inner;
+        match inner.visibility(path)? {
+            Visibility::Upper { .. } => inner.upper.mkdir(path, mode),
+            Visibility::Lower if inner.lower_visible(path) => Err(Errno::EEXIST),
+            Visibility::Lower | Visibility::Masked => {
+                inner.delta.materialize_parents(path)?;
+                inner.upper.mkdir(path, mode)
+            }
+            // Over a whiteout the new directory must be opaque: the deleted
+            // lower directory’s contents must not merge back in.
+            Visibility::Whiteout => {
+                inner.remove_marker(path)?;
+                inner.upper.mkdir(path, mode)?;
+                inner.delta.set_opaque(path)
+            }
+        }
     }
 
-    fn unlink(&self, _path: &Path) -> Result<(), Errno> {
-        Err(Errno::EROFS)
+    fn unlink(&self, path: &Path) -> Result<(), Errno> {
+        let inner = &self.inner;
+        let st = inner.merged_stat(path)?.ok_or(Errno::ENOENT)?;
+        if st.file_type == FileType::Directory {
+            return Err(Errno::EISDIR);
+        }
+        if inner.lower_visible(path) {
+            // The whiteout’s staged rename atomically replaces any live
+            // upper entry, so the name never flickers back to the lower.
+            inner.delta.whiteout(path)
+        } else {
+            inner.upper.unlink(path)
+        }
     }
 
-    fn rmdir(&self, _path: &Path) -> Result<(), Errno> {
-        Err(Errno::EROFS)
+    fn rmdir(&self, path: &Path) -> Result<(), Errno> {
+        let inner = &self.inner;
+        let vis = inner.visibility(path)?;
+        let st = match &vis {
+            Visibility::Upper { .. } => inner.upper.stat(path, false)?,
+            Visibility::Lower => inner.lower.stat(path, false)?,
+            Visibility::Whiteout | Visibility::Masked => return Err(Errno::ENOENT),
+        };
+        if st.file_type != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        // Emptiness is a merged-view question: whiteouts hide their lower
+        // names, so a directory of nothing but markers is empty.
+        let dir = self.open(path, OpenFlags(libc::O_RDONLY | libc::O_DIRECTORY), Mode(0))?;
+        if !dir.getdents()?.is_empty() {
+            return Err(Errno::ENOTEMPTY);
+        }
+        if let Visibility::Upper { .. } = vis {
+            // Only whiteout markers can remain inside; clear them with the
+            // directory.
+            std::fs::remove_dir_all(inner.delta.data_path(path)).map_err(|e| Errno::from_io(&e))?;
+        }
+        if inner.lower_visible(path) {
+            inner.delta.whiteout(path)?;
+        }
+        Ok(())
     }
 
-    fn symlink(&self, _target: &Path, _link: &Path) -> Result<(), Errno> {
-        Err(Errno::EROFS)
+    fn symlink(&self, target: &Path, link: &Path) -> Result<(), Errno> {
+        let inner = &self.inner;
+        match inner.visibility(link)? {
+            Visibility::Upper { .. } => inner.upper.symlink(target, link),
+            Visibility::Lower if inner.lower_visible(link) => Err(Errno::EEXIST),
+            Visibility::Lower | Visibility::Masked => {
+                inner.delta.materialize_parents(link)?;
+                inner.upper.symlink(target, link)
+            }
+            Visibility::Whiteout => {
+                inner.remove_marker(link)?;
+                inner.upper.symlink(target, link)
+            }
+        }
     }
 
-    fn link(&self, _old: &Path, _new: &Path) -> Result<(), Errno> {
-        Err(Errno::EROFS)
+    fn link(&self, old: &Path, new: &Path) -> Result<(), Errno> {
+        let inner = &self.inner;
+        // The new name must link to a real inode, so the source materializes
+        // in the upper first. (A lower hardlink pair breaks here — the
+        // documented v1 deviation.)
+        inner.ensure_upper(old)?;
+        match inner.visibility(new)? {
+            Visibility::Upper { .. } => inner.upper.link(old, new),
+            Visibility::Lower if inner.lower_visible(new) => Err(Errno::EEXIST),
+            Visibility::Lower | Visibility::Masked => {
+                inner.delta.materialize_parents(new)?;
+                inner.upper.link(old, new)
+            }
+            Visibility::Whiteout => {
+                inner.remove_marker(new)?;
+                inner.upper.link(old, new)
+            }
+        }
     }
 
-    fn rename(&self, _from: &Path, _to: &Path, _flags: RenameFlags) -> Result<(), Errno> {
-        Err(Errno::EROFS)
+    fn rename(&self, from: &Path, to: &Path, flags: RenameFlags) -> Result<(), Errno> {
+        let inner = &self.inner;
+        let src = inner.merged_stat(from)?.ok_or(Errno::ENOENT)?;
+        let dst = inner.merged_stat(to)?;
+        if flags.noreplace() && dst.is_some() {
+            return Err(Errno::EEXIST);
+        }
+        if src.file_type == FileType::Directory {
+            // Only a directory that lives purely in the upper can move as a
+            // rename; anything lower-visible would need a redirect the format
+            // does not carry, so the guest gets EXDEV and its libc falls back
+            // to copy+delete, as across any mount.
+            let upper_only = matches!(inner.visibility(from)?, Visibility::Upper { .. })
+                && !inner.lower_visible(from);
+            if !upper_only {
+                return Err(Errno::EXDEV);
+            }
+        } else if !flags.exchange()
+            && dst
+                .as_ref()
+                .is_some_and(|d| d.file_type == FileType::Directory)
+        {
+            return Err(Errno::EISDIR);
+        }
+        if flags.exchange() {
+            // Both names stay live, so both sides materialize and swap in
+            // the upper; nothing needs a whiteout.
+            if dst.is_none() {
+                return Err(Errno::ENOENT);
+            }
+            inner.ensure_upper(from)?;
+            inner.ensure_upper(to)?;
+            return inner.upper.rename(from, to, flags);
+        }
+        inner.ensure_upper(from)?;
+        inner.delta.materialize_parents(to)?;
+        // The upper rename atomically claims `to` — replacing a live upper
+        // entry or a whiteout marker alike — and the moved entry then
+        // shadows any lower `to`.
+        inner.upper.rename(from, to, flags)?;
+        if inner.lower_visible(from) {
+            inner.delta.whiteout(from)?;
+        }
+        Ok(())
     }
 
     fn chmod(&self, path: &Path, follow: bool, mode: Mode) -> Result<(), Errno> {
@@ -327,10 +487,10 @@ impl Vfs for OverlayFs {
         // The node is a new name: a lower-visible one must answer EEXIST
         // here, because the upper (where the node lands) cannot see it.
         match self.inner.visibility(path)? {
-            Visibility::Lower if self.inner.lower.stat(path, false).is_ok() => {
+            Visibility::Lower if self.inner.lower_visible(path) => {
                 return Err(Errno::EEXIST);
             }
-            Visibility::Hidden => return Err(Errno::ENOENT),
+            Visibility::Whiteout => self.inner.remove_marker(path)?,
             _ => {}
         }
         self.inner.delta.materialize_parents(path)?;
@@ -359,7 +519,7 @@ impl Vfs for OverlayFs {
         match self.inner.visibility(path)? {
             Visibility::Upper { .. } => self.inner.upper.statfs(path),
             Visibility::Lower => self.inner.lower.statfs(path),
-            Visibility::Hidden => Err(Errno::ENOENT),
+            Visibility::Whiteout | Visibility::Masked => Err(Errno::ENOENT),
         }
     }
 
@@ -369,7 +529,7 @@ impl Vfs for OverlayFs {
             // loads the delta's copy, not the host's.
             Visibility::Upper { .. } => Some(self.inner.delta.data_path(path)),
             Visibility::Lower => self.inner.lower.host_path(path),
-            Visibility::Hidden => None,
+            Visibility::Whiteout | Visibility::Masked => None,
         }
     }
 
@@ -928,6 +1088,217 @@ mod tests {
         assert_eq!(
             fs.mknod(Path::new("/taken"), Mode(libc::S_IFIFO | 0o644), 0),
             Err(Errno::EEXIST)
+        );
+    }
+
+    #[test]
+    fn unlink_lower_writes_whiteout() {
+        let scratch = Scratch::new();
+        let Some((fs, delta)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::write(scratch.join("lower/f"), b"x").unwrap();
+
+        fs.unlink(Path::new("/f")).unwrap();
+        assert_eq!(fs.stat(Path::new("/f"), true).unwrap_err(), Errno::ENOENT);
+        let root = fs
+            .open(Path::new("/"), OpenFlags(libc::O_RDONLY), Mode(0))
+            .unwrap();
+        assert!(names(root.as_ref()).is_empty());
+        assert!(super::super::delta::is_whiteout(&delta.data_path(Path::new("/f"))).unwrap());
+        assert!(scratch.join("lower/f").is_file());
+
+        // Deleting it again is ENOENT, and unlinking a directory is EISDIR.
+        assert_eq!(fs.unlink(Path::new("/f")), Err(Errno::ENOENT));
+        std::fs::create_dir(scratch.join("lower/d")).unwrap();
+        assert_eq!(fs.unlink(Path::new("/d")), Err(Errno::EISDIR));
+    }
+
+    #[test]
+    fn unlink_upper_only_leaves_no_marker() {
+        let scratch = Scratch::new();
+        let Some((fs, delta)) = overlay(&scratch) else {
+            return;
+        };
+        fs.open(
+            Path::new("/fresh"),
+            OpenFlags(libc::O_CREAT | libc::O_WRONLY),
+            Mode(0o644),
+        )
+        .unwrap();
+        fs.unlink(Path::new("/fresh")).unwrap();
+        assert_eq!(
+            fs.stat(Path::new("/fresh"), true).unwrap_err(),
+            Errno::ENOENT
+        );
+        assert!(!delta.data_path(Path::new("/fresh")).exists());
+    }
+
+    #[test]
+    fn delete_then_recreate_does_not_bleed_lower() {
+        let scratch = Scratch::new();
+        let Some((fs, _)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::write(scratch.join("lower/f"), b"old lower bytes").unwrap();
+
+        fs.unlink(Path::new("/f")).unwrap();
+        // O_EXCL succeeds: the merged view has no such name anymore.
+        let f = fs
+            .open(
+                Path::new("/f"),
+                OpenFlags(libc::O_CREAT | libc::O_EXCL | libc::O_RDWR),
+                Mode(0o644),
+            )
+            .unwrap();
+        assert_eq!(f.fstat().unwrap().size, 0);
+        assert_eq!(f.pwrite(b"new", 0).unwrap(), 3);
+        let g = fs
+            .open(Path::new("/f"), OpenFlags(libc::O_RDONLY), Mode(0))
+            .unwrap();
+        assert_eq!(read_all(g.as_ref()), b"new");
+        assert_eq!(
+            std::fs::read(scratch.join("lower/f")).unwrap(),
+            b"old lower bytes"
+        );
+    }
+
+    #[test]
+    fn rmdir_whiteouts_lower_directory() {
+        let scratch = Scratch::new();
+        let Some((fs, _)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::create_dir(scratch.join("lower/d")).unwrap();
+        std::fs::write(scratch.join("lower/d/f"), b"x").unwrap();
+
+        // Not empty in the merged view yet.
+        assert_eq!(fs.rmdir(Path::new("/d")), Err(Errno::ENOTEMPTY));
+        fs.unlink(Path::new("/d/f")).unwrap();
+        // Now merged-empty: the upper holds only the whiteout marker.
+        fs.rmdir(Path::new("/d")).unwrap();
+        assert_eq!(fs.stat(Path::new("/d"), true).unwrap_err(), Errno::ENOENT);
+        assert!(scratch.join("lower/d/f").is_file());
+
+        // mkdir over the deleted name: opaque, so the lower file must not
+        // bleed back through.
+        fs.mkdir(Path::new("/d"), Mode(0o755)).unwrap();
+        assert_eq!(fs.stat(Path::new("/d/f"), true).unwrap_err(), Errno::ENOENT);
+        let d = fs
+            .open(Path::new("/d"), OpenFlags(libc::O_RDONLY), Mode(0))
+            .unwrap();
+        assert!(names(d.as_ref()).is_empty());
+    }
+
+    #[test]
+    fn symlink_and_link_materialize_in_upper() {
+        let scratch = Scratch::new();
+        let Some((fs, delta)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::write(scratch.join("lower/orig"), b"data").unwrap();
+
+        fs.symlink(Path::new("orig"), Path::new("/sl")).unwrap();
+        assert_eq!(
+            fs.readlink(Path::new("/sl")).unwrap(),
+            PathBuf::from("orig")
+        );
+        assert!(!scratch.join("lower/sl").exists());
+
+        // A hard link to a lower file copies the source up first; the two
+        // upper names share an inode, and the host never grows a link.
+        fs.link(Path::new("/orig"), Path::new("/alias")).unwrap();
+        let a = fs.stat(Path::new("/orig"), false).unwrap();
+        let b = fs.stat(Path::new("/alias"), false).unwrap();
+        assert_eq!(a.ino, b.ino);
+        assert_eq!(b.nlink, 2);
+        assert!(delta.data_path(Path::new("/alias")).is_file());
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(scratch.join("lower/orig"))
+                .unwrap()
+                .nlink(),
+            1
+        );
+
+        assert_eq!(
+            fs.symlink(Path::new("x"), Path::new("/orig")),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(
+            fs.link(Path::new("/orig"), Path::new("/alias")),
+            Err(Errno::EEXIST)
+        );
+    }
+
+    #[test]
+    fn rename_copies_up_and_whiteouts_source() {
+        let scratch = Scratch::new();
+        let Some((fs, delta)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::write(scratch.join("lower/from"), b"payload").unwrap();
+        std::fs::write(scratch.join("lower/victim"), b"gone").unwrap();
+
+        fs.rename(Path::new("/from"), Path::new("/to"), RenameFlags::EMPTY)
+            .unwrap();
+        assert_eq!(
+            fs.stat(Path::new("/from"), true).unwrap_err(),
+            Errno::ENOENT
+        );
+        let to = fs
+            .open(Path::new("/to"), OpenFlags(libc::O_RDONLY), Mode(0))
+            .unwrap();
+        assert_eq!(read_all(to.as_ref()), b"payload");
+        assert!(scratch.join("lower/from").is_file());
+        assert!(super::super::delta::is_whiteout(&delta.data_path(Path::new("/from"))).unwrap());
+
+        // Renaming over a lower-visible name shadows it; no whiteout needed,
+        // and the host victim survives.
+        fs.rename(Path::new("/to"), Path::new("/victim"), RenameFlags::EMPTY)
+            .unwrap();
+        let v = fs
+            .open(Path::new("/victim"), OpenFlags(libc::O_RDONLY), Mode(0))
+            .unwrap();
+        assert_eq!(read_all(v.as_ref()), b"payload");
+        assert_eq!(
+            std::fs::read(scratch.join("lower/victim")).unwrap(),
+            b"gone"
+        );
+
+        // RENAME_NOREPLACE sees the merged target.
+        std::fs::write(scratch.join("lower/other"), b"z").unwrap();
+        assert_eq!(
+            fs.rename(
+                Path::new("/victim"),
+                Path::new("/other"),
+                RenameFlags(libc::RENAME_NOREPLACE),
+            ),
+            Err(Errno::EEXIST)
+        );
+    }
+
+    #[test]
+    fn rename_of_lower_directory_is_exdev() {
+        let scratch = Scratch::new();
+        let Some((fs, _)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::create_dir(scratch.join("lower/d")).unwrap();
+        std::fs::write(scratch.join("lower/d/f"), b"x").unwrap();
+
+        assert_eq!(
+            fs.rename(Path::new("/d"), Path::new("/e"), RenameFlags::EMPTY),
+            Err(Errno::EXDEV)
+        );
+
+        // A directory born in the upper renames freely.
+        fs.mkdir(Path::new("/u"), Mode(0o755)).unwrap();
+        fs.rename(Path::new("/u"), Path::new("/v"), RenameFlags::EMPTY)
+            .unwrap();
+        assert_eq!(
+            fs.stat(Path::new("/v"), true).unwrap().file_type,
+            FileType::Directory
         );
     }
 
