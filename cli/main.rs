@@ -95,6 +95,15 @@ fn run(cmd: RunCmd) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // An attach the user typed is self-evident; one inherited from the
+        // environment is not, and a stale exported CHIMERA_WORKSPACE would
+        // otherwise resurrect old deletions with no visible cause.
+        if cmd.workspace.is_none() && selector.is_some() {
+            eprintln!(
+                "chimera: attached to workspace {} (CHIMERA_WORKSPACE)",
+                ws.root.display(),
+            );
+        }
         match OverlayFs::new(host, &ws.root) {
             Ok(overlay) => (Arc::new(overlay), Some(ws)),
             Err(err) => {
