@@ -1,7 +1,14 @@
 //! The guest address space: the translated-block cache ([`BlockCache`]) and the
 //! guest mappings Chimera owns on the host.
 
-use std::{collections::HashSet, sync::OnceLock};
+use std::{
+    collections::HashSet,
+    io,
+    sync::{
+        OnceLock,
+        atomic::{AtomicI32, Ordering},
+    },
+};
 
 use crate::{Error, arch::x86::cache::BlockCache};
 
@@ -246,6 +253,53 @@ impl Drop for AddressSpace {
     }
 }
 
+/// The runtime's pid, cached for the self-targeted `process_vm` copies below.
+/// glibc has not cached `getpid()` since 2.25, so taking it per copy doubles
+/// each copy's syscall bill — and the translator fetches its decode window
+/// through [`copy_from_guest`] once per translated block, which for a large
+/// program is over a million syscalls before it finishes starting. A fork
+/// invalidates the value (a stale pid would aim the copies at the *parent's*
+/// address space), so Chimera registers a `pthread_atfork` child hook for host
+/// forks and still drops the cache from [`Thread::reset_after_fork`] for the
+/// guest's raw-`clone` fork path, which never runs libc's fork handlers.
+///
+/// [`Thread::reset_after_fork`]: crate::arch::x86::dispatch::Thread::reset_after_fork
+static CACHED_PID: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn reset_cached_pid_after_fork() {
+    reset_cached_pid();
+}
+
+pub fn init() -> Result<(), Error> {
+    static INIT: OnceLock<Result<(), i32>> = OnceLock::new();
+
+    match INIT.get_or_init(|| {
+        let ret = unsafe { libc::pthread_atfork(None, None, Some(reset_cached_pid_after_fork)) };
+        if ret == 0 { Ok(()) } else { Err(ret) }
+    }) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(Error::io(
+            "pthread_atfork",
+            io::Error::from_raw_os_error(*err),
+        )),
+    }
+}
+
+fn own_pid() -> libc::pid_t {
+    let pid = CACHED_PID.load(Ordering::Relaxed);
+    if pid != 0 {
+        return pid;
+    }
+    let pid = unsafe { libc::getpid() };
+    CACHED_PID.store(pid, Ordering::Relaxed);
+    pid
+}
+
+/// Drop the cached pid in the child of a fork; the next copy re-reads it.
+pub fn reset_cached_pid() {
+    CACHED_PID.store(0, Ordering::Relaxed);
+}
+
 /// Copy `buf.len()` bytes out of guest memory at `addr` without trusting the
 /// pointer. Chimera and the guest share one address space, so the copy is a
 /// self-targeted `process_vm_readv`: the kernel walks the page tables and an
@@ -268,7 +322,7 @@ pub fn copy_from_guest(addr: u64, buf: &mut [u8]) -> bool {
         iov_base: addr as *mut libc::c_void,
         iov_len: buf.len(),
     };
-    let copied = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+    let copied = unsafe { libc::process_vm_readv(own_pid(), &local, 1, &remote, 1, 0) };
     copied == buf.len() as isize
 }
 
@@ -295,7 +349,7 @@ pub fn copy_to_guest(addr: u64, buf: &[u8]) -> bool {
         iov_base: addr as *mut libc::c_void,
         iov_len: buf.len(),
     };
-    let copied = unsafe { libc::process_vm_writev(libc::getpid(), &local, 1, &remote, 1, 0) };
+    let copied = unsafe { libc::process_vm_writev(own_pid(), &local, 1, &remote, 1, 0) };
     copied == buf.len() as isize
 }
 

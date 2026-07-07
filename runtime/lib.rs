@@ -43,6 +43,7 @@ impl Sandbox {
     /// Create a new sandbox for the given program.
     pub fn new(program: impl AsRef<Path>) -> Result<Self, Error> {
         arch::init()?;
+        sys::mmap::init()?;
         Ok(Self {
             program: program.as_ref().to_path_buf(),
             args: Vec::new(),
