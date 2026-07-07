@@ -17,7 +17,7 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
-    ffi::{CStr, OsStr, OsString},
+    ffi::{CStr, CString, OsStr, OsString},
     os::{
         fd::{IntoRawFd, RawFd},
         unix::ffi::OsStrExt,
@@ -440,6 +440,19 @@ impl SystemCalls for Personality {
             libc::SYS_lremovexattr => self.removexattr_path(a[0], a[1], false),
             libc::SYS_fremovexattr if self.is_virtual(a[0] as i32) => {
                 self.fremovexattr(a[0] as i32, a[1])
+            }
+            // Xattr reads carry no write policy, but the path must still
+            // resolve through the namespace: the file may live only in an
+            // overlay's delta, and the host kernel then serves the backing
+            // path. (Fd forms need nothing: a virtual fd is a kernel alias
+            // of its backing file.)
+            libc::SYS_getxattr | libc::SYS_listxattr => {
+                self.xattr_read_path(call, true);
+                return;
+            }
+            libc::SYS_lgetxattr | libc::SYS_llistxattr => {
+                self.xattr_read_path(call, false);
+                return;
             }
             libc::SYS_fallocate if self.is_virtual(a[0] as i32) => {
                 self.fallocate(a[0] as i32, a[1] as i32, a[2], a[3])
@@ -1416,6 +1429,29 @@ impl Personality {
     fn fallocate(&self, fd: i32, mode: i32, offset: u64, len: u64) -> Result<i64, Errno> {
         self.writable_desc(fd)?.file.fallocate(mode, offset, len)?;
         Ok(0)
+    }
+
+    /// Forward a path-keyed xattr read (`getxattr`, `listxattr`, and their
+    /// `l`-variants) to the host against the backing host path the namespace
+    /// resolves to.
+    fn xattr_read_path(&self, call: &mut SystemCall, follow: bool) {
+        let host = (|| -> Result<CString, Errno> {
+            let raw = unsafe { read_cstr(call.args[0]) };
+            let abs = self.abs_path(libc::AT_FDCWD, &raw)?;
+            let r = self.ns.resolve(&abs, follow)?;
+            let host = r.fs.host_path(&r.rel).ok_or(Errno::ENOENT)?;
+            CString::new(host.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)
+        })();
+        match host {
+            Ok(host) => {
+                let saved = call.args[0];
+                call.args[0] = host.as_ptr() as u64;
+                let result = host_syscall(call);
+                call.args[0] = saved;
+                call.set_result(result);
+            }
+            Err(e) => call.set_result(SyscallResult::Error(e.raw())),
+        }
     }
 }
 

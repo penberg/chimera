@@ -66,19 +66,14 @@ fn run(cmd: RunCmd) -> ExitCode {
     // operation crosses the Vfs seam. The mount is read-only by default — the
     // guest can read the host but not change it — and `--unsafe` opts into
     // read-write. The root must exist, so this construction cannot fail.
-    let flags = if cmd.unsafe_ {
-        MountFlags::NONE
-    } else {
-        MountFlags::RDONLY
-    };
     let host = Arc::new(HostFs::new("/").expect("host root / is a directory"));
     // Bring-up toggle for the copy-on-write overlay: CHIMERA_COW=<delta>
-    // mounts the overlay at `/` so the whole suite can run against the read
-    // path before writes exist. Deleted when the overlay becomes the default
-    // (task 9 of the overlay plan).
-    let root: Arc<dyn Vfs> = match env::var_os("CHIMERA_COW") {
+    // mounts the overlay at `/`, writable — the overlay itself confines every
+    // mutation to the delta, so the host stays untouched. Deleted when the
+    // overlay becomes the default (task 9 of the overlay plan).
+    let (root, flags): (Arc<dyn Vfs>, MountFlags) = match env::var_os("CHIMERA_COW") {
         Some(delta) => match OverlayFs::new(host, PathBuf::from(&delta)) {
-            Ok(overlay) => Arc::new(overlay),
+            Ok(overlay) => (Arc::new(overlay), MountFlags::NONE),
             Err(err) => {
                 let err = io::Error::from_raw_os_error(err.raw());
                 let hint = if err.kind() == io::ErrorKind::Unsupported {
@@ -93,7 +88,14 @@ fn run(cmd: RunCmd) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
-        None => host,
+        None => {
+            let flags = if cmd.unsafe_ {
+                MountFlags::NONE
+            } else {
+                MountFlags::RDONLY
+            };
+            (host, flags)
+        }
     };
     let personality = Personality::new(Namespace::with_root(root, flags));
     personality.set_exe(&program.exec);

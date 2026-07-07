@@ -120,7 +120,7 @@ impl Delta {
     /// Create the upper directories a copy-up or marker at `rel` needs.
     /// Parents materialize lazily — only when something lands beneath them —
     /// so an untouched subtree leaves no trace in the delta.
-    fn materialize_parents(&self, rel: &Path) -> Result<(), Errno> {
+    pub fn materialize_parents(&self, rel: &Path) -> Result<(), Errno> {
         if let Some(parent) = self.data_path(rel).parent() {
             std::fs::create_dir_all(parent).map_err(|e| Errno::from_io(&e))?;
         }
