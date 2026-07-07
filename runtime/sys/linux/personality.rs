@@ -1129,6 +1129,27 @@ impl Personality {
                 }
                 Ok(0)
             }
+            // Byte-range record locks — SQLite's locking protocol (cargo's
+            // global-cache database is the first customer). Forwarded on the
+            // guest number itself: the reservation is an `F_DUPFD` alias of
+            // the backing open file description, so the kernel locks the real
+            // file for both families — classic locks key on (process, inode),
+            // OFD locks on the description, and the alias shares both. The
+            // `struct flock` pointer is guest memory, which the kernel
+            // validates itself. A synthetic file reserves its number on
+            // `/dev/null`, where every synthetic file's locks would alias one
+            // inode and conflict with each other; those stay refused.
+            libc::F_SETLK
+            | libc::F_SETLKW
+            | libc::F_GETLK
+            | libc::F_OFD_SETLK
+            | libc::F_OFD_SETLKW
+            | libc::F_OFD_GETLK => {
+                if self.desc(fd)?.file.host_fd().is_none() {
+                    return Err(Errno::EINVAL);
+                }
+                Ok(check_host(unsafe { libc::fcntl(fd, cmd, arg) })? as i64)
+            }
             _ => Err(Errno::EINVAL),
         }
     }

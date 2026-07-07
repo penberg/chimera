@@ -375,6 +375,7 @@ mod host {
                 // the `pthread_exit` / thread-return path.
                 thread.exit_code = call.args[0] as i32;
                 thread.running = false;
+                thread.report_spawn_exit();
             }
             libc::SYS_exit_group => {
                 // Process-wide: terminate the whole thread group, from any
@@ -387,6 +388,7 @@ mod host {
                 thread.process().request_exit_group(code, &thread.state);
                 thread.exit_code = code;
                 thread.running = false;
+                thread.report_spawn_exit();
             }
             libc::SYS_execve | libc::SYS_execveat => {
                 // Intercepted, never forwarded to the host kernel: forwarding would
@@ -527,11 +529,15 @@ mod host {
                         // the authoritative EFAULT by forwarding the original.
                         forked(thread, call, handler, 0);
                     } else {
-                        let stripped = cargs[0] & !((libc::CLONE_VM | libc::CLONE_VFORK) as u64);
+                        let stripped = cargs[0]
+                            & !((libc::CLONE_VM | libc::CLONE_VFORK) as u64 | CLONE_CLEAR_SIGHAND);
                         buf[0..8].copy_from_slice(&stripped.to_ne_bytes());
                         buf[40..56].fill(0); // stack, stack_size
                         call.args[0] = buf.as_ptr() as u64;
                         spawned(thread, call, handler, guest_stack_top);
+                        if cargs[0] & CLONE_CLEAR_SIGHAND != 0 && call.return_value() == 0 {
+                            thread.signals_mut().clear_sighand();
+                        }
                     }
                 }
                 // A separate shared-memory process (no `CLONE_VFORK`): refused,
@@ -541,6 +547,23 @@ mod host {
                         && cargs[0] & libc::CLONE_THREAD as u64 == 0 =>
                 {
                     call.set_result(SyscallResult::Error(libc::EPERM));
+                }
+                // A fork-shaped `clone3` can carry `CLONE_CLEAR_SIGHAND` too:
+                // strip it from a forwarded private copy, as in the spawn arm.
+                Some(cargs) if cargs[0] & CLONE_CLEAR_SIGHAND != 0 => {
+                    let size = call.args[1] as usize;
+                    let mut buf = [0u8; CLONE_ARGS_SIZE_MAX as usize];
+                    if !copy_from_guest(call.args[0], &mut buf[..size]) {
+                        forked(thread, call, handler, 0);
+                    } else {
+                        let stripped = cargs[0] & !CLONE_CLEAR_SIGHAND;
+                        buf[0..8].copy_from_slice(&stripped.to_ne_bytes());
+                        call.args[0] = buf.as_ptr() as u64;
+                        forked(thread, call, handler, 0);
+                        if call.return_value() == 0 {
+                            thread.signals_mut().clear_sighand();
+                        }
+                    }
                 }
                 _ => forked(thread, call, handler, 0),
             },
@@ -716,6 +739,17 @@ mod host {
         handler.post_syscall(call);
     }
 
+    /// `clone3`'s reset-the-child's-signal-dispositions flag (bit 32; `libc`'s
+    /// `c_int` constant truncates it to 0). Only `clone3` accepts it — the
+    /// legacy `clone` entry keeps just the low 32 flag bits. It must never
+    /// reach the host `clone3`: the kernel would flush *Chimera's* handlers —
+    /// the syscall interrupt, the guest-signal catcher — out of the child's
+    /// slots, and the first exit-time interrupt would then kill the child
+    /// with the runtime's reserved signal. It is stripped from the forwarded
+    /// call and applied to the child's virtual table instead
+    /// ([`crate::sys::linux::signal::Signals::clear_sighand`]).
+    const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
+
     /// Whether clone flags describe a new thread of the calling process. The
     /// kernel demands the full shape — `CLONE_THREAD` requires `CLONE_SIGHAND`,
     /// which requires `CLONE_VM` (anything less is `EINVAL`) — so gating the
@@ -762,12 +796,16 @@ mod host {
     /// Fork emulation for the `vfork`/`posix_spawn` case ([`forked`] plus the
     /// `CLONE_VFORK` semantics its callers rely on). A pipe carries the child's
     /// `execve` outcome back to the parent, which blocks on it exactly as
-    /// `CLONE_VFORK` blocks until the child execs or exits: the child's `execve`
-    /// closes the pipe on success (parent reads EOF → returns the child PID) or
-    /// writes the errno on failure (parent reads it → returns `-errno`). That is
-    /// the same negative-clone-return path glibc's `posix_spawn` reports an exec
-    /// error through, so a missing or unloadable program fails the call
-    /// synchronously rather than only surfacing via the child's exit status.
+    /// `CLONE_VFORK` blocks until the child execs or exits: a committed `execve`
+    /// closes the pipe (parent reads EOF → returns the child PID), and a child
+    /// that exits without one writes the errno of its last failed attempt, if
+    /// any (parent reads it → returns `-errno`). That is the same
+    /// negative-clone-return path glibc's `posix_spawn` reports an exec error
+    /// through, so a missing or unloadable program fails the call synchronously
+    /// rather than only surfacing via the child's exit status. Reporting waits
+    /// for the exit, not the first failed `execve`, because `posix_spawnp`
+    /// walks `$PATH` inside the child — one `execve` per candidate — and an
+    /// early failure is routinely followed by one that succeeds.
     fn spawned(
         thread: &mut Thread,
         call: &mut SystemCall,

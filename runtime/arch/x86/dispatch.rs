@@ -123,6 +123,10 @@ pub struct Thread {
     /// `CLONE_VFORK` by blocking on the read end — can return the child PID or
     /// the exec errno synchronously.
     spawn_report_fd: Option<i32>,
+    /// The errno of the spawn child's most recent failed `execve` attempt,
+    /// reported to the parent only when the child exits without a committed
+    /// exec (see [`Thread::report_spawn_failure`]).
+    spawn_exec_errno: Option<i32>,
 }
 
 impl Thread {
@@ -166,6 +170,7 @@ impl Thread {
             clear_child_tid: None,
             is_main: true,
             spawn_report_fd: None,
+            spawn_exec_errno: None,
         };
         thread.state.pending_set = thread.signals.pending_set_ptr() as u64;
         thread.reset(rip, rsp, guest_fs_base);
@@ -196,6 +201,7 @@ impl Thread {
             clear_child_tid,
             is_main: false,
             spawn_report_fd: None,
+            spawn_exec_errno: None,
         }
     }
 
@@ -402,6 +408,7 @@ impl Thread {
     /// Record the write end of a spawn child's `execve`-outcome report pipe.
     pub fn set_spawn_report_fd(&mut self, fd: i32) {
         self.spawn_report_fd = Some(fd);
+        self.spawn_exec_errno = None;
     }
 
     /// A spawn child's `execve` succeeded: close the report pipe so the parent
@@ -413,16 +420,34 @@ impl Thread {
         }
     }
 
-    /// A spawn child's `execve` failed: send the errno to the parent (which
-    /// returns it from `posix_spawn`) then close the pipe. A no-op on a thread
-    /// that is not a spawn child.
+    /// A spawn child's `execve` failed. Not reported to the parent yet: glibc's
+    /// `posix_spawnp` walks `$PATH` inside the child, issuing one `execve` per
+    /// candidate, so a failure may be followed by a retry that succeeds —
+    /// natively the parent learns the errno from the `CLONE_VM`-shared spawn
+    /// state only once the vfork child dies. The last failure becomes final
+    /// when the child exits without a committed exec
+    /// ([`Thread::report_spawn_exit`]).
     pub fn report_spawn_failure(&mut self, errno: i32) {
+        if self.spawn_report_fd.is_some() {
+            self.spawn_exec_errno = Some(errno);
+        }
+    }
+
+    /// A spawn child is exiting without a committed `execve`: send the last
+    /// exec failure, if any, to the blocked parent (which returns it from
+    /// `posix_spawn`) and close the pipe. A child that never attempted an exec
+    /// reports nothing — the parent sees EOF, returns the PID, and the exit
+    /// status travels through `waitpid` as `CLONE_VFORK` semantics demand. A
+    /// no-op on a thread that is not a spawn child.
+    pub fn report_spawn_exit(&mut self) {
         if let Some(fd) = self.spawn_report_fd.take() {
-            let bytes = errno.to_ne_bytes();
-            unsafe {
-                libc::write(fd, bytes.as_ptr().cast(), bytes.len());
-                libc::close(fd);
+            if let Some(errno) = self.spawn_exec_errno.take() {
+                let bytes = errno.to_ne_bytes();
+                unsafe {
+                    libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+                }
             }
+            unsafe { libc::close(fd) };
         }
     }
 
