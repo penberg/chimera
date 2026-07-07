@@ -209,6 +209,9 @@ impl Thread {
     /// is promoted to main and the copied [`Process`] group state is reset
     /// around it.
     pub fn reset_after_fork(&mut self) {
+        // The guest-copy pid cache still holds the parent's pid; drop it
+        // before anything reads guest memory in the child.
+        crate::sys::mmap::reset_cached_pid();
         self.is_main = true;
         self.state.tid.store(
             unsafe { libc::syscall(libc::SYS_gettid) } as i32,
