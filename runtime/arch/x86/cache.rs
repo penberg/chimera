@@ -8,6 +8,17 @@
 //! branch graph. Linking keeps a chain of blocks running back-to-back inside a
 //! single `dispatch()` call instead of round-tripping through the run loop at
 //! every basic-block boundary.
+//!
+//! Sibling threads execute out of the cache the whole time this bookkeeping
+//! runs, so every mutation of reachable code is a single aligned atomic store
+//! into a `rel32` field ([`patch_site`]) — a branch is re-aimed, but no
+//! instruction bytes are ever spliced. Invalidation severs a dropped block's
+//! incoming edges the same way, re-aiming each one back at its own cold exit
+//! stub; the dropped block's body is left intact (cache memory is never reused
+//! short of [`BlockCache::reset`]), so a thread already in flight through a
+//! stale edge executes one intact pre-invalidation block and re-resolves at
+//! its next boundary — the same staleness a native core sees when it executes
+//! prefetched bytes an instant before a cross-modifying write lands.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -23,21 +34,21 @@ use super::translate::{CodeCache, OutEdge, Translation, translate};
 /// touches it.
 const PAGE: u64 = 4096;
 
-/// One translated block's bookkeeping: where its host code begins and the
-/// address of its deopt stub (used to neutralize the block on invalidation).
-#[derive(Clone, Copy)]
-struct Block {
-    host: u64,
-    deopt: u64,
+/// One direct-branch link site: the address of a patchable `rel32` field and
+/// the address of the cold exit stub the field targets while its edge is
+/// unlinked.
+struct LinkSite {
+    site: usize,
+    stub: u64,
 }
 
-/// The translated-block cache: the host code buffer, the guest-PC → block map,
-/// the page → blocks index that drives SMC invalidation, and the pending
-/// direct-branch links awaiting their successors.
+/// The translated-block cache: the host code buffer, the guest-PC → host-PC
+/// map, the page → blocks index that drives SMC invalidation, and the link
+/// registry that records every direct branch by successor.
 pub struct BlockCache {
     cache: CodeCache,
-    /// Guest block PC -> the block translated there.
-    map: HashMap<u64, Block>,
+    /// Guest block PC -> its host entry.
+    map: HashMap<u64, u64>,
     /// Guest page base -> start PCs of the blocks whose code touches that page,
     /// so a write to the page can find and drop them. A block spanning two pages
     /// is listed under both; stale entries (a block already dropped) are skipped
@@ -45,11 +56,17 @@ pub struct BlockCache {
     /// `BTreeMap` so [`invalidate_range`] can drop a span of pages without
     /// walking the whole index — a guest `munmap`/`mprotect` may cover gigabytes.
     page_blocks: BTreeMap<u64, Vec<u64>>,
-    /// Direct branches awaiting their successor: guest target PC -> addresses
-    /// of the `rel32` displacement fields to rewrite once that block exists.
-    /// An edge whose target is already translated is patched on the spot and
-    /// never lands here. Drained in [`BlockCache::resolve`].
-    pending: HashMap<u64, Vec<usize>>,
+    /// Successor guest PC -> every direct-branch site that targets it, live for
+    /// the lifetime of the cache. A site is aimed at the successor's host entry
+    /// exactly while that guest PC is in `map`, and at its own cold exit stub
+    /// otherwise: translation patches the list toward the new entry, and
+    /// invalidation patches it back ([`invalidate_page`] runs inside the
+    /// synchronous fault handler, so severing edges must not allocate — it only
+    /// walks this list and stores). Sites inside blocks that have themselves
+    /// been dropped linger here; re-aiming them writes into cache bytes nothing
+    /// jumps to any more, which is harmless, and they are shed only at
+    /// [`reset`].
+    links: HashMap<u64, Vec<LinkSite>>,
 }
 
 impl BlockCache {
@@ -58,7 +75,7 @@ impl BlockCache {
             cache: CodeCache::new(cache_size)?,
             map: HashMap::new(),
             page_blocks: BTreeMap::new(),
-            pending: HashMap::new(),
+            links: HashMap::new(),
         })
     }
 
@@ -68,10 +85,11 @@ impl BlockCache {
     /// returns `None` for the span.
     ///
     /// On a translation, the new block is linked into the cache's branch graph:
-    /// any direct branches that were waiting for this guest PC are patched to
-    /// jump straight here, and the new block's own outgoing direct branches are
-    /// either patched to their (already-translated) successors or recorded as
-    /// pending. After warm-up, chains of linked blocks execute back-to-back
+    /// every direct branch registered for this guest PC — waiting since its own
+    /// translation, or severed by an earlier invalidation — is patched to jump
+    /// straight here, and the new block's own outgoing direct branches are
+    /// registered under their successors and patched to any that are already
+    /// translated. After warm-up, chains of linked blocks execute back-to-back
     /// without returning to the dispatcher.
     pub fn resolve(
         &mut self,
@@ -80,17 +98,16 @@ impl BlockCache {
         syscall_exit: u64,
         trap_exit: u64,
     ) -> Result<(u64, Option<(u64, u64)>), Error> {
-        if let Some(&block) = self.map.get(&guest_pc) {
+        if let Some(&host) = self.map.get(&guest_pc) {
             // Refresh the in-cache lookup entry: reaching here means an indirect
             // branch missed it (a direct-mapped collision evicted it), so
             // reinstate it to return the hot target to the fast path.
-            self.cache.ib_insert(guest_pc, block.host);
-            return Ok((block.host, None));
+            self.cache.ib_insert(guest_pc, host);
+            return Ok((host, None));
         }
         let Translation {
             host_pc,
             guest_end,
-            deopt_pc,
             edges,
         } = translate(
             &mut self.cache,
@@ -99,13 +116,7 @@ impl BlockCache {
             syscall_exit,
             trap_exit,
         )?;
-        self.map.insert(
-            guest_pc,
-            Block {
-                host: host_pc,
-                deopt: deopt_pc,
-            },
-        );
+        self.map.insert(guest_pc, host_pc);
         // Index the block under every guest page it touches.
         let mut page = guest_pc & !(PAGE - 1);
         let last = guest_end.saturating_sub(1) & !(PAGE - 1);
@@ -119,36 +130,46 @@ impl BlockCache {
         // Mirror the mapping into the in-cache lookup table so indirect
         // branches to this block resolve without leaving the cache.
         self.cache.ib_insert(guest_pc, host_pc);
-        if let Some(sites) = self.pending.remove(&guest_pc) {
-            for site in sites {
-                patch_site(site, host_pc);
+        if let Some(sites) = self.links.get(&guest_pc) {
+            for s in sites {
+                patch_site(s.site, host_pc);
             }
         }
-        for OutEdge { target_guest, site } in edges {
-            match self.map.get(&target_guest) {
-                Some(&target) => patch_site(site, target.host),
-                None => self.pending.entry(target_guest).or_default().push(site),
+        for OutEdge {
+            target_guest,
+            site,
+            stub,
+        } in edges
+        {
+            if let Some(&target) = self.map.get(&target_guest) {
+                patch_site(site, target);
             }
+            self.links
+                .entry(target_guest)
+                .or_default()
+                .push(LinkSite { site, stub });
         }
         Ok((host_pc, Some((guest_pc, guest_end))))
     }
 
     /// Drop every block whose code touches guest `page`, for self-modifying
     /// code: each is removed from the map, evicted from the indirect-branch
-    /// table, and its host entry redirected to its deopt stub so any surviving
-    /// direct link into it re-translates. Returns whether anything was dropped.
+    /// table, and severed from the branch graph — every direct branch linked to
+    /// it is re-aimed at its own cold exit stub, so the next traversal of the
+    /// edge falls back to the dispatcher and re-translates from current guest
+    /// memory. Returns whether anything was dropped.
     ///
     /// Allocation-free: it runs inside the synchronous fault handler, so it must
     /// not call the allocator. The page's block list is cleared in place
-    /// (retaining its buffer) rather than removed, and `HashMap::remove` neither
-    /// shrinks nor frees.
+    /// (retaining its buffer) rather than removed, `HashMap::remove` neither
+    /// shrinks nor frees, and unlinking only walks `links` and stores.
     pub fn invalidate_page(&mut self, page: u64) -> bool {
         let mut dropped = false;
         if let Some(starts) = self.page_blocks.get_mut(&page) {
             for &guest_pc in starts.iter() {
-                if let Some(block) = self.map.remove(&guest_pc) {
+                if self.map.remove(&guest_pc).is_some() {
                     self.cache.ib_remove(guest_pc);
-                    self.cache.neutralize(block.host, block.deopt);
+                    unlink(&self.links, guest_pc);
                     dropped = true;
                 }
             }
@@ -165,9 +186,9 @@ impl BlockCache {
     pub fn invalidate_range(&mut self, lo_page: u64, hi_page: u64) {
         for (_, starts) in self.page_blocks.range_mut(lo_page..=hi_page) {
             for &guest_pc in starts.iter() {
-                if let Some(block) = self.map.remove(&guest_pc) {
+                if self.map.remove(&guest_pc).is_some() {
                     self.cache.ib_remove(guest_pc);
-                    self.cache.neutralize(block.host, block.deopt);
+                    unlink(&self.links, guest_pc);
                 }
             }
             starts.clear();
@@ -193,13 +214,24 @@ impl BlockCache {
     }
 
     /// Flush every translated block and its link bookkeeping. The backing code
-    /// buffer is rewound; the guest-PC map, page index, and pending links are
+    /// buffer is rewound; the guest-PC map, page index, and link registry are
     /// cleared.
     pub fn reset(&mut self) {
         self.cache.reset();
         self.map.clear();
         self.page_blocks.clear();
-        self.pending.clear();
+        self.links.clear();
+    }
+}
+
+/// Sever every direct branch targeting `guest_pc` by re-aiming its `rel32`
+/// back at its own cold exit stub — the reverse of the linking in
+/// [`BlockCache::resolve`], and the same single atomic store.
+fn unlink(links: &HashMap<u64, Vec<LinkSite>>, guest_pc: u64) {
+    if let Some(sites) = links.get(&guest_pc) {
+        for s in sites {
+            patch_site(s.site, s.stub);
+        }
     }
 }
 
@@ -208,11 +240,12 @@ impl BlockCache {
 /// the end of its own four bytes. The cache stays well under 2 GiB, so the
 /// signed distance always fits in an `i32`.
 ///
-/// The translator aligns every patchable `rel32` field to a 4-byte boundary
-/// (see `build_linked_terminator`), so this is a single aligned atomic store:
-/// a sibling thread executing the branch reads either the old target (its cold
-/// exit stub, which round-trips through the dispatcher) or the new one, never a
-/// torn displacement spliced from both. x86 keeps instruction and data caches
+/// The translator places every patchable `rel32` field on a 4-byte boundary
+/// that keeps the whole branch instruction inside one aligned 16-byte fetch
+/// window (see `pad_rel32_alignment`), so this single aligned atomic store is
+/// indivisible for a sibling thread's instruction fetch as well: the sibling
+/// executes the branch toward the old target or the new one, never a torn
+/// displacement spliced from both. x86 keeps instruction and data caches
 /// coherent, so the executing core picks up the new target on its next fetch.
 fn patch_site(site: usize, host_pc: u64) {
     let disp = host_pc as i64 - (site as i64 + 4);
@@ -221,8 +254,8 @@ fn patch_site(site: usize, host_pc: u64) {
         "link displacement {disp} out of rel32 range"
     );
     debug_assert!(
-        site.is_multiple_of(4),
-        "link site {site:#x} is not 4-byte aligned"
+        site.is_multiple_of(4) && !site.is_multiple_of(16),
+        "link site {site:#x} straddles a fetch window"
     );
     let slot = unsafe { &*(site as *const AtomicI32) };
     slot.store(disp as i32, Ordering::Release);

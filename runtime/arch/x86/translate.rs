@@ -268,33 +268,6 @@ impl CodeCache {
         }
     }
 
-    /// Redirect a block's host entry to its deopt stub by overwriting the first
-    /// 5 bytes at `host_pc` with `jmp rel32 -> deopt_pc`. Called when the guest
-    /// modifies the page the block was translated from: the block is dropped
-    /// from the map, and any direct branch still linked to it now lands on the
-    /// stub, which exits to the dispatcher and re-translates from current guest
-    /// memory. Relies on JIT discipline — the guest stops every thread before
-    /// rewriting code it might be running — so no sibling executes this block
-    /// while it is patched. The `jmp` opcode is published last, so a reader that
-    /// somehow raced would see the original instruction until the redirect is
-    /// fully formed rather than a spliced one.
-    pub fn neutralize(&self, host_pc: u64, deopt_pc: u64) {
-        let rel = deopt_pc as i64 - (host_pc as i64 + 5);
-        debug_assert!(
-            i32::try_from(rel).is_ok(),
-            "deopt displacement {rel} out of rel32 range"
-        );
-        let rel = rel as i32 as u32;
-        unsafe {
-            let p = host_pc as *mut u8;
-            ptr::write_volatile(p.add(1), rel as u8);
-            ptr::write_volatile(p.add(2), (rel >> 8) as u8);
-            ptr::write_volatile(p.add(3), (rel >> 16) as u8);
-            ptr::write_volatile(p.add(4), (rel >> 24) as u8);
-            ptr::write_volatile(p, 0xE9);
-        }
-    }
-
     /// Drop `guest_pc` from the inline indirect-branch table if it currently
     /// holds the slot, so a later indirect branch to it misses and re-resolves
     /// through the dispatcher (where the block has been dropped and re-translates
@@ -566,26 +539,27 @@ fn gs_qword(disp: i64) -> MemoryOperand {
 }
 
 /// A patchable outgoing edge of a translated block: the guest PC of a
-/// statically known successor, and the address of the `rel32` displacement
-/// field of the direct branch that currently targets the block's cold exit
-/// stub. Once the successor is translated, the dispatcher rewrites the
-/// displacement so the branch jumps straight into the successor's host code,
-/// keeping the guest register file live across the edge instead of
-/// round-tripping through the dispatcher. See [`super::super::sys::mmap`].
+/// statically known successor, the address of the `rel32` displacement field
+/// of the direct branch that currently targets the block's cold exit stub, and
+/// the address of that stub. Once the successor is translated, the dispatcher
+/// rewrites the displacement so the branch jumps straight into the successor's
+/// host code, keeping the guest register file live across the edge instead of
+/// round-tripping through the dispatcher; when the successor is invalidated,
+/// the dispatcher rewrites it back to `stub`, severing the edge with the same
+/// single atomic store. See [`super::super::sys::mmap`].
 pub struct OutEdge {
     pub target_guest: u64,
     pub site: usize,
+    pub stub: u64,
 }
 
 /// The result of translating one basic block: where its host code begins, the
 /// guest PC one past its last decoded byte (so the cache knows which guest pages
-/// the block covers, for self-modifying-code invalidation), the address of its
-/// deopt stub (see [`CodeCache::neutralize`]), and its statically known outgoing
-/// edges for the dispatcher to link.
+/// the block covers, for self-modifying-code invalidation), and its statically
+/// known outgoing edges for the dispatcher to link.
 pub struct Translation {
     pub host_pc: u64,
     pub guest_end: u64,
-    pub deopt_pc: u64,
     pub edges: Vec<OutEdge>,
 }
 
@@ -746,9 +720,10 @@ pub fn translate(
         cache.emit(&bytes)?;
         rel_edges
             .into_iter()
-            .map(|(off, target_guest)| OutEdge {
+            .map(|(off, stub_off, target_guest)| OutEdge {
                 target_guest,
                 site: term_pc + off,
+                stub: (term_pc + stub_off) as u64,
             })
             .collect()
     } else {
@@ -757,20 +732,9 @@ pub fn translate(
         Vec::new()
     };
 
-    // A per-block deopt stub: it saves rax, publishes this block's own guest PC
-    // into the rip slot, and exits to the dispatcher. SMC invalidation overwrites
-    // the block's host entry with a 5-byte jump to this stub, so any surviving
-    // direct link into the dropped block falls back to the dispatcher and
-    // re-translates from current guest memory (see [`CodeCache::neutralize`]).
-    let deopt_pc = cache.next_pc();
-    let mut stub = Vec::new();
-    emit_stub(&mut stub, guest_pc, exit_tramp);
-    cache.emit(&stub)?;
-
     Ok(Translation {
         host_pc,
         guest_end,
-        deopt_pc,
         edges,
     })
 }
@@ -1066,10 +1030,11 @@ fn emit_exit_poll(out: &mut Vec<u8>) -> usize {
 
 /// Build the raw machine code for a linkable terminator: a fast-path direct
 /// branch followed by one cold exit stub per successor. Returns the encoded
-/// bytes and, for each edge, the byte offset of its fast-path `rel32`
-/// displacement paired with the successor's guest PC. The displacements are
-/// initialized to target the stubs; the dispatcher rewrites them to the
-/// successor blocks as those are translated.
+/// bytes and, for each edge, the byte offsets of its fast-path `rel32`
+/// displacement and of its cold exit stub, paired with the successor's guest
+/// PC. The displacements are initialized to target the stubs; the dispatcher
+/// rewrites them to the successor blocks as those are translated, and back to
+/// the stubs when a successor is invalidated.
 ///
 /// A back-edge ([`is_back_edge`]) is preceded by a safepoint poll
 /// ([`emit_exit_poll`]) that diverts to the edge's own cold-exit stub when an
@@ -1087,7 +1052,7 @@ fn build_linked_terminator(
     exit_tramp: u64,
     block_start: u64,
     term_pc: usize,
-) -> (Vec<u8>, Vec<(usize, u64)>) {
+) -> (Vec<u8>, Vec<(usize, usize, u64)>) {
     let mut out = Vec::new();
     let mut edges = Vec::new();
     match *link {
@@ -1106,7 +1071,7 @@ fn build_linked_terminator(
             if let Some(poll_rel) = poll {
                 write_rel32(&mut out, poll_rel, stub);
             }
-            edges.push((rel, target));
+            edges.push((rel, stub, target));
         }
         LinkTerm::Cond {
             opcode,
@@ -1140,8 +1105,8 @@ fn build_linked_terminator(
                 write_rel32(&mut out, jmp_rel, fall_stub);
                 write_rel32(&mut out, taken_jmp_rel, taken_stub);
                 write_rel32(&mut out, poll_rel, taken_stub);
-                edges.push((taken_jmp_rel, taken));
-                edges.push((jmp_rel, fallthrough));
+                edges.push((taken_jmp_rel, taken_stub, taken));
+                edges.push((jmp_rel, fall_stub, fallthrough));
             } else {
                 // jcc rel32 -> taken stub ; jmp rel32 -> fall-through stub.
                 // The native jcc reads the block's live guest flags directly. Each
@@ -1158,8 +1123,8 @@ fn build_linked_terminator(
                 emit_stub(&mut out, fallthrough, exit_tramp);
                 write_rel32(&mut out, jcc_rel, taken_stub);
                 write_rel32(&mut out, jmp_rel, fall_stub);
-                edges.push((jcc_rel, taken));
-                edges.push((jmp_rel, fallthrough));
+                edges.push((jcc_rel, taken_stub, taken));
+                edges.push((jmp_rel, fall_stub, fallthrough));
             }
         }
         LinkTerm::ShortCond {
@@ -1206,8 +1171,8 @@ fn build_linked_terminator(
             if let Some(poll_rel) = poll {
                 write_rel32(&mut out, poll_rel, taken_stub);
             }
-            edges.push((taken_rel, taken));
-            edges.push((fall_rel, fallthrough));
+            edges.push((taken_rel, taken_stub, taken));
+            edges.push((fall_rel, fall_stub, fallthrough));
         }
         LinkTerm::DirectCall { target, ret } => {
             // Push the 64-bit return address with a single 8-byte store so the
@@ -1242,7 +1207,7 @@ fn build_linked_terminator(
             if let Some(poll_rel) = poll {
                 write_rel32(&mut out, poll_rel, stub);
             }
-            edges.push((rel, target));
+            edges.push((rel, stub, target));
         }
     }
     (out, edges)
@@ -1432,12 +1397,25 @@ fn take_rel32(out: &mut Vec<u8>) -> usize {
 }
 
 /// Pad `out` with single-byte NOPs until the `rel32` field that will follow
-/// `opcode_len` opcode bytes lands on a 4-byte boundary in the cache, given the
-/// terminator will be emitted at `term_pc`. A naturally aligned `rel32` can be
-/// back-patched with a single atomic 32-bit store, so a sibling thread executing
-/// the branch sees the old displacement or the new one but never a torn mix.
+/// `opcode_len` opcode bytes lands on a 4-byte boundary in the cache — but not
+/// a 16-byte one — given the terminator will be emitted at `term_pc`.
+///
+/// The 4-byte alignment lets the field be back-patched with a single atomic
+/// 32-bit store; that alone, though, only makes the *store* indivisible. A
+/// sibling core's instruction fetch is not an atomic 4-byte load: it decodes
+/// from aligned 16-byte fetch windows, and a branch whose opcode sits at the
+/// end of one window with its displacement in the next can pair a stale opcode
+/// fetch with a fresh displacement fetch (or half of each) — a spliced branch
+/// that lands mid-instruction. Keeping the field off 16-byte boundaries puts
+/// the whole instruction — opcode (1 or 2 bytes, so field offsets 4, 8, and 12
+/// all work) plus displacement — inside one fetch window, so any single fetch
+/// observes the branch either entirely old or entirely new.
 fn pad_rel32_alignment(out: &mut Vec<u8>, term_pc: usize, opcode_len: usize) {
-    while !(term_pc + out.len() + opcode_len).is_multiple_of(4) {
+    loop {
+        let rel = term_pc + out.len() + opcode_len;
+        if rel.is_multiple_of(4) && !rel.is_multiple_of(16) {
+            break;
+        }
         out.push(0x90); // nop
     }
 }
@@ -1832,26 +1810,38 @@ mod tests {
     use super::*;
 
     /// Every patchable `rel32` field of a linked terminator must land on a
-    /// 4-byte boundary, whatever address the terminator is emitted at, so the
-    /// dispatcher can back-patch it with one aligned atomic store. Check all
-    /// eight residues of `term_pc` mod 4 so the padding is exercised for every
+    /// 4-byte boundary — but off 16-byte ones, so the whole branch instruction
+    /// sits inside one aligned 16-byte fetch window — whatever address the
+    /// terminator is emitted at, so the dispatcher can back-patch it with one
+    /// store that is atomic for a sibling's instruction fetch too. Check every
+    /// residue of `term_pc` mod 16 so the padding is exercised for every
     /// starting alignment.
     fn assert_edges_aligned(link: &LinkTerm) {
-        for term_pc in 0..8usize {
+        for term_pc in 0..16usize {
             // block_start 0: every target here is a forward edge (no safepoint
             // poll), exercising the bare linked-terminator alignment.
             let (bytes, edges) = build_linked_terminator(link, 0xdead_beef, 0, term_pc);
             assert!(!edges.is_empty(), "a linked terminator must expose an edge");
-            for (off, _target) in edges {
+            for (off, stub, _target) in edges {
                 assert!(
                     off + 4 <= bytes.len(),
                     "rel32 field at off={off} runs past the {} terminator bytes",
+                    bytes.len(),
+                );
+                assert!(
+                    stub <= bytes.len(),
+                    "stub at off={stub} lies past the {} terminator bytes",
                     bytes.len(),
                 );
                 assert_eq!(
                     (term_pc + off) % 4,
                     0,
                     "rel32 field at term_pc={term_pc}, off={off} is not 4-byte aligned",
+                );
+                assert_ne!(
+                    (term_pc + off) % 16,
+                    0,
+                    "rel32 field at term_pc={term_pc}, off={off} straddles a fetch window",
                 );
             }
         }
