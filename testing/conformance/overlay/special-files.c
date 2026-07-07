@@ -1,4 +1,4 @@
-// RUN: %cc %s -o %t && rm -rf %t.delta %t.fifo && CHIMERA_COW=%t.delta %runner %t check %t.fifo
+// RUN: %cc %s -o %t && rm -rf %t.delta %t.fifo && CHIMERA_WORKSPACE=%t.delta %runner %t check %t.fifo
 // RUN: %t verify %t.delta %t.fifo
 //
 // Special files under the overlay: opening a device passes through to the

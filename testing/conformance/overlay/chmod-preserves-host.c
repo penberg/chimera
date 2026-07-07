@@ -1,5 +1,5 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
-// RUN: CHIMERA_COW=%t.fixture/delta %runner %t check %t.fixture
+// RUN: CHIMERA_WORKSPACE=%t.fixture/delta %runner %t check %t.fixture
 // RUN: %t verify %t.fixture
 //
 // Attribute changes route through the overlay: chmod and utimensat of a

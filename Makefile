@@ -24,9 +24,8 @@ conformance-native:
 	python3 testing/lit.py --runner ""
 .PHONY: conformance-native
 
-# The whole suite under the copy-on-write overlay bring-up toggle: each test
-# gets a fresh delta, and the overlay over nothing must be indistinguishable
-# from the host (OVERLAYFS.md task 3).
-conformance-cow: build
-	python3 testing/lit.py --runner "$(RUNNER)" --cow
-.PHONY: conformance-cow
+# The suite with the workspace overlay bypassed: the guest mutates the host
+# directly, so this pins the passthrough path the overlay normally shields.
+conformance-unsafe: build
+	python3 testing/lit.py --runner "$(RUNNER) --unsafe"
+.PHONY: conformance-unsafe

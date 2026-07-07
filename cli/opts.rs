@@ -27,8 +27,17 @@ pub struct RunCmd {
     #[argh(option)]
     pub code_cache_size: Option<usize>,
 
-    /// grant the guest read-write access to the host filesystem (default:
-    /// read-only)
+    /// attach to an existing workspace: an id from a kept run, or a path to
+    /// a workspace directory (env: CHIMERA_WORKSPACE)
+    #[argh(option, short = 'w')]
+    pub workspace: Option<String>,
+
+    /// discard the workspace on exit instead of keeping it
+    #[argh(switch)]
+    pub rm: bool,
+
+    /// bypass the workspace overlay: the guest mutates the host filesystem
+    /// directly
     #[argh(switch, long = "unsafe")]
     pub unsafe_: bool,
 

@@ -1,5 +1,5 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
-// RUN: CHIMERA_COW=%t.fixture/delta %runner %t check %t.fixture
+// RUN: CHIMERA_WORKSPACE=%t.fixture/delta %runner %t check %t.fixture
 // RUN: %t verify %t.fixture
 //
 // The write path: a guest write-open of a lower file copies it up and the

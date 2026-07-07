@@ -64,18 +64,17 @@ class Result:
     detail: str = ""
 
 
-def run_test(source: Path, *, cc: str, runner: str, timeout: float, cow: bool) -> Result:
+def run_test(source: Path, *, cc: str, runner: str, timeout: float) -> Result:
     runs = parse_runs(source)
     if not runs:
         return Result("skip", "no RUN directives")
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td) / source.stem
-        env = None
-        if cow:
-            # Bring-up toggle: run the whole suite under the copy-on-write
-            # overlay with a fresh per-test delta (see OVERLAYFS.md task 3).
-            env = dict(os.environ)
-            env["CHIMERA_COW"] = str(Path(td) / "cow-delta")
+        # Fresh workspaces land under $XDG_STATE_HOME/chimera/workspaces;
+        # point that at the per-test directory so every run's workspace is
+        # born and dies with the test.
+        env = dict(os.environ)
+        env["XDG_STATE_HOME"] = str(Path(td) / "state")
         for cmd in runs:
             full = substitute(cmd, source=source, tmp=tmp, cc=cc, runner=runner)
             try:
@@ -118,12 +117,6 @@ def main() -> int:
         help="command prefix to substitute for %%runner (env: RUNNER, default: empty)",
     )
     p.add_argument(
-        "--cow",
-        action="store_true",
-        default=os.environ.get("LIT_COW", "") != "",
-        help="set CHIMERA_COW to a fresh per-test delta directory (env: LIT_COW)",
-    )
-    p.add_argument(
         "--timeout",
         type=float,
         default=float(os.environ.get("LIT_TIMEOUT", "120")),
@@ -157,7 +150,7 @@ def main() -> int:
     passed = failed = skipped = 0
     for t in tests:
         rel = t.relative_to(REPO_ROOT)
-        res = run_test(t, cc=args.cc, runner=args.runner, timeout=args.timeout, cow=args.cow)
+        res = run_test(t, cc=args.cc, runner=args.runner, timeout=args.timeout)
         if res.status == "pass":
             passed += 1
             print(f"{GREEN('PASS')}  {rel}")

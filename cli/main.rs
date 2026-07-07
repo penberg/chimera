@@ -1,4 +1,5 @@
 mod opts;
+mod workspace;
 
 use std::{
     env,
@@ -61,53 +62,80 @@ fn run(cmd: RunCmd) -> ExitCode {
         sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
     }
 
-    // Route the guest's filesystem syscalls through a userspace VFS: a host
-    // passthrough mounted at `/`, so the guest sees the real tree but every
-    // operation crosses the Vfs seam. The mount is read-only by default — the
-    // guest can read the host but not change it — and `--unsafe` opts into
-    // read-write. The root must exist, so this construction cannot fail.
+    // Route the guest's filesystem syscalls through a userspace VFS mounted
+    // at `/`. Copy-on-write is the default: every run mounts an overlay
+    // whose upper layer is a workspace's delta, so the guest works against
+    // what looks like the live host while every mutation lands in the
+    // workspace. Only `--unsafe` touches the host directly. The host root
+    // must exist, so its construction cannot fail.
     let host = Arc::new(HostFs::new("/").expect("host root / is a directory"));
-    // Bring-up toggle for the copy-on-write overlay: CHIMERA_COW=<delta>
-    // mounts the overlay at `/`, writable — the overlay itself confines every
-    // mutation to the delta, so the host stays untouched. Deleted when the
-    // overlay becomes the default (task 9 of the overlay plan).
-    let (root, flags): (Arc<dyn Vfs>, MountFlags) = match env::var_os("CHIMERA_COW") {
-        Some(delta) => match OverlayFs::new(host, PathBuf::from(&delta)) {
-            Ok(overlay) => (Arc::new(overlay), MountFlags::NONE),
+    let selector = cmd
+        .workspace
+        .clone()
+        .map(OsString::from)
+        .or_else(|| env::var_os("CHIMERA_WORKSPACE"));
+    let (root, ws): (Arc<dyn Vfs>, Option<workspace::Workspace>) = if cmd.unsafe_ {
+        // The explicit flags contradict --unsafe; the ambient environment
+        // variable is merely inert, like any other env a script exports.
+        if cmd.workspace.is_some() || cmd.rm {
+            eprintln!("chimera: --unsafe runs without a workspace");
+            return ExitCode::FAILURE;
+        }
+        (host, None)
+    } else {
+        let ws = match &selector {
+            Some(sel) => workspace::attach(sel),
+            None => workspace::create(&describe(&program)),
+        };
+        let ws = match ws {
+            Ok(ws) => ws,
+            Err(err) => {
+                eprintln!("chimera: cannot open workspace: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match OverlayFs::new(host, &ws.root) {
+            Ok(overlay) => (Arc::new(overlay), Some(ws)),
             Err(err) => {
                 let err = io::Error::from_raw_os_error(err.raw());
                 let hint = if err.kind() == io::ErrorKind::Unsupported {
-                    " (the delta needs a filesystem with user xattrs)"
+                    " (the workspace needs a filesystem with user xattrs)"
                 } else {
                     ""
                 };
                 eprintln!(
-                    "chimera: cannot open CHIMERA_COW delta {}: {err}{hint}",
-                    Path::new(&delta).display(),
+                    "chimera: cannot open workspace {}: {err}{hint}",
+                    ws.root.display(),
                 );
                 return ExitCode::FAILURE;
             }
-        },
-        None => {
-            let flags = if cmd.unsafe_ {
-                MountFlags::NONE
-            } else {
-                MountFlags::RDONLY
-            };
-            (host, flags)
         }
     };
-    let personality = Personality::new(Namespace::with_root(root, flags));
+    let personality = Personality::new(Namespace::with_root(root, MountFlags::NONE));
     personality.set_exe(&program.exec);
     sandbox.system_calls(personality);
 
-    match sandbox.args(&program.args).run() {
+    let result = sandbox.args(&program.args).run();
+    if let Some(ws) = ws {
+        ws.finish(cmd.rm);
+    }
+    match result {
         Ok(status) => ExitCode::from(status.code() as u8),
         Err(err) => {
             eprintln!("chimera: {err}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// The command line a workspace's provenance records.
+fn describe(program: &Program) -> String {
+    let mut s = program.exec.display().to_string();
+    for arg in &program.args {
+        s.push(' ');
+        s.push_str(&arg.to_string_lossy());
+    }
+    s
 }
 
 struct Program {

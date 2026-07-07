@@ -1,9 +1,9 @@
-// RUN: %cc %s -o %t && rm -rf %t.delta && CHIMERA_COW=%t.delta %runner %t
+// RUN: %cc %s -o %t && rm -rf %t.delta && CHIMERA_WORKSPACE=%t.delta %runner %t
 //
 // The overlay over nothing is indistinguishable from the host: with a fresh,
 // empty delta the guest must see the lower tree — read its own binary, stat
 // directories, and list the directory it lives in. Every assertion is plain
-// Linux semantics, so the test also passes natively (where CHIMERA_COW is
+// Linux semantics, so the test also passes natively (where CHIMERA_WORKSPACE is
 // just an ignored environment variable).
 
 #include <dirent.h>
