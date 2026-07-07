@@ -1026,6 +1026,14 @@ impl Signals {
     /// their default, ignored ones stay ignored, the blocked mask is preserved,
     /// and the alternate stack is dropped.
     pub fn on_execve(&mut self) {
+        self.clear_sighand();
+        self.altstack = None;
+    }
+
+    /// Revert every caught disposition to its default, leaving `SIG_IGN` and
+    /// the blocked mask alone — the kernel's `flush_signal_handlers`, the
+    /// shared core of `execve`'s reset and `clone3`'s `CLONE_CLEAR_SIGHAND`.
+    pub fn clear_sighand(&mut self) {
         let mut table = self.table.lock().unwrap();
         for i in 0..NSIG {
             let h = table[i].handler;
@@ -1034,8 +1042,6 @@ impl Signals {
                 install_host(i + 1, SIG_DFL);
             }
         }
-        drop(table);
-        self.altstack = None;
     }
 
     /// Build a signal frame on the guest stack and redirect `state` to the

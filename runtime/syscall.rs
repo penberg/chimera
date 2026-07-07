@@ -527,11 +527,15 @@ mod host {
                         // the authoritative EFAULT by forwarding the original.
                         forked(thread, call, handler, 0);
                     } else {
-                        let stripped = cargs[0] & !((libc::CLONE_VM | libc::CLONE_VFORK) as u64);
+                        let stripped = cargs[0]
+                            & !((libc::CLONE_VM | libc::CLONE_VFORK) as u64 | CLONE_CLEAR_SIGHAND);
                         buf[0..8].copy_from_slice(&stripped.to_ne_bytes());
                         buf[40..56].fill(0); // stack, stack_size
                         call.args[0] = buf.as_ptr() as u64;
                         spawned(thread, call, handler, guest_stack_top);
+                        if cargs[0] & CLONE_CLEAR_SIGHAND != 0 && call.return_value() == 0 {
+                            thread.signals_mut().clear_sighand();
+                        }
                     }
                 }
                 // A separate shared-memory process (no `CLONE_VFORK`): refused,
@@ -541,6 +545,23 @@ mod host {
                         && cargs[0] & libc::CLONE_THREAD as u64 == 0 =>
                 {
                     call.set_result(SyscallResult::Error(libc::EPERM));
+                }
+                // A fork-shaped `clone3` can carry `CLONE_CLEAR_SIGHAND` too:
+                // strip it from a forwarded private copy, as in the spawn arm.
+                Some(cargs) if cargs[0] & CLONE_CLEAR_SIGHAND != 0 => {
+                    let size = call.args[1] as usize;
+                    let mut buf = [0u8; CLONE_ARGS_SIZE_MAX as usize];
+                    if !copy_from_guest(call.args[0], &mut buf[..size]) {
+                        forked(thread, call, handler, 0);
+                    } else {
+                        let stripped = cargs[0] & !CLONE_CLEAR_SIGHAND;
+                        buf[0..8].copy_from_slice(&stripped.to_ne_bytes());
+                        call.args[0] = buf.as_ptr() as u64;
+                        forked(thread, call, handler, 0);
+                        if call.return_value() == 0 {
+                            thread.signals_mut().clear_sighand();
+                        }
+                    }
                 }
                 _ => forked(thread, call, handler, 0),
             },
@@ -715,6 +736,17 @@ mod host {
         };
         handler.post_syscall(call);
     }
+
+    /// `clone3`'s reset-the-child's-signal-dispositions flag (bit 32; `libc`'s
+    /// `c_int` constant truncates it to 0). Only `clone3` accepts it — the
+    /// legacy `clone` entry keeps just the low 32 flag bits. It must never
+    /// reach the host `clone3`: the kernel would flush *Chimera's* handlers —
+    /// the syscall interrupt, the guest-signal catcher — out of the child's
+    /// slots, and the first exit-time interrupt would then kill the child
+    /// with the runtime's reserved signal. It is stripped from the forwarded
+    /// call and applied to the child's virtual table instead
+    /// ([`crate::sys::linux::signal::Signals::clear_sighand`]).
+    const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
 
     /// Whether clone flags describe a new thread of the calling process. The
     /// kernel demands the full shape — `CLONE_THREAD` requires `CLONE_SIGHAND`,
