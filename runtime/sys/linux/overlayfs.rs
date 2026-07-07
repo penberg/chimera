@@ -537,6 +537,17 @@ impl Vfs for OverlayFs {
         }
     }
 
+    fn resolve_fast(&self, path: &Path) -> Option<Stat> {
+        // Only a pure-lower path can skip the merge. The upper walk stops at
+        // the first missing component — one lstat on the common no-shadow
+        // prefix — and the lower then proves no symlink participates, which
+        // makes the lexical path identical to the merged resolution.
+        match self.inner.visibility(path) {
+            Ok(Visibility::Lower) => self.inner.lower.resolve_fast(path),
+            _ => None,
+        }
+    }
+
     fn host_path(&self, path: &Path) -> Option<PathBuf> {
         match self.inner.visibility(path).ok()? {
             // The serving layer answers, so an execve of a modified binary
@@ -1314,6 +1325,50 @@ mod tests {
             fs.stat(Path::new("/v"), true).unwrap().file_type,
             FileType::Directory
         );
+    }
+
+    #[test]
+    fn resolve_fast_proves_or_declines() {
+        use super::super::namespace::{MountFlags, Namespace};
+
+        let scratch = Scratch::new();
+        let Some((fs, delta)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::create_dir_all(scratch.join("lower/d")).unwrap();
+        std::fs::write(scratch.join("lower/d/f"), b"x").unwrap();
+        std::fs::create_dir_all(scratch.join("lower/real")).unwrap();
+        std::fs::write(scratch.join("lower/real/g"), b"lower-g").unwrap();
+        std::os::unix::fs::symlink("real", scratch.join("lower/link")).unwrap();
+
+        // A symlink-free, unshadowed path resolves in one step.
+        let st = fs.resolve_fast(Path::new("/d/f")).expect("pure lower");
+        assert_eq!(st.file_type, FileType::Regular);
+
+        // A symlink in the chain, a shadowed path, and a missing file all
+        // decline to the walk.
+        assert!(fs.resolve_fast(Path::new("/link/g")).is_none());
+        delta
+            .copy_up(&scratch.join("lower/d/f"), Path::new("/d/f"))
+            .unwrap();
+        assert!(fs.resolve_fast(Path::new("/d/f")).is_none());
+        assert!(fs.resolve_fast(Path::new("/absent")).is_none());
+
+        // End to end: the walk the fast path declines to must see an upper
+        // override through a lower symlink — the case the no-symlink proof
+        // exists for.
+        std::fs::create_dir_all(delta.data_path(Path::new("/real"))).unwrap();
+        std::fs::write(delta.data_path(Path::new("/real/g")), b"upper-g").unwrap();
+        let ns = Namespace::with_root(
+            Arc::new(OverlayFs {
+                inner: Arc::clone(&fs.inner),
+            }),
+            MountFlags::NONE,
+        );
+        let via_link = ns.stat_path(Path::new("/link/g"), true).unwrap();
+        let direct = ns.stat_path(Path::new("/real/g"), true).unwrap();
+        assert_eq!(via_link.ino, direct.ino);
+        assert_eq!(via_link.size, 7); // "upper-g", not "lower-g"'s identity
     }
 
     #[test]

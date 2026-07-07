@@ -114,6 +114,16 @@ pub trait Vfs: Send + Sync {
     /// Report filesystem-wide statistics for `statfs` by path.
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno>;
 
+    /// Resolve a lexically normalized path to its final object in one step,
+    /// when the filesystem can prove the per-component walk would agree —
+    /// which means no symlink participates anywhere in the chain and the
+    /// object exists. `None` sends the caller to the walk, the correctness
+    /// path; this is only ever an optimization, so any doubt (a symlink, a
+    /// missing component, an unusual error) answers `None`.
+    fn resolve_fast(&self, _path: &Path) -> Option<Stat> {
+        None
+    }
+
     /// The host path backing a mount-relative path, if this filesystem is host
     /// passthrough. The runtime uses it to load an `execve` target through its
     /// ELF loader without reaching back through this trait byte by byte; a

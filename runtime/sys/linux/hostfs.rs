@@ -72,8 +72,12 @@ struct RawStatFs {
 
 /// `resolve` flags for `openat2` (`<linux/openat2.h>`; libc has no binding).
 /// `RESOLVE_IN_ROOT` scopes the whole walk — `..` and absolute symlinks
-/// included — to the dirfd, which is exactly the namespace's confinement model.
+/// included — to the dirfd, which is exactly the namespace's confinement
+/// model. `RESOLVE_NO_SYMLINKS` refuses any symlink in the chain (final
+/// component included) with ELOOP, which is how [`Vfs::resolve_fast`] proves
+/// a lexical path is also the physical one.
 const RESOLVE_IN_ROOT: u64 = 0x10;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 
 /// `struct open_how` for `openat2`.
 #[repr(C)]
@@ -130,11 +134,21 @@ impl HostFs {
     /// is the raw open-flag set; the kernel scopes resolution with
     /// `RESOLVE_IN_ROOT`, so symlinks and `..` cannot escape.
     fn open_in_root(&self, path: &Path, flags: libc::c_int, mode: u32) -> Result<OwnedFd, Errno> {
+        self.open_resolved(path, flags, mode, RESOLVE_IN_ROOT)
+    }
+
+    fn open_resolved(
+        &self,
+        path: &Path,
+        flags: libc::c_int,
+        mode: u32,
+        resolve: u64,
+    ) -> Result<OwnedFd, Errno> {
         let crel = crel(path)?;
         let how = OpenHow {
             flags: flags as u64,
             mode: mode as u64,
-            resolve: RESOLVE_IN_ROOT,
+            resolve,
         };
         let fd = unsafe {
             libc::syscall(
@@ -355,6 +369,22 @@ impl Vfs for HostFs {
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno> {
         let fd = self.open_in_root(path, libc::O_PATH, 0)?;
         Ok(statfs_to_statfs(&raw_fstatfs(fd.as_raw_fd())?))
+    }
+
+    fn resolve_fast(&self, path: &Path) -> Option<Stat> {
+        // One openat2 answers both questions: RESOLVE_NO_SYMLINKS proves no
+        // symlink participates (ELOOP otherwise), and the O_PATH handle is
+        // the object itself. Every failure falls back to the walk.
+        let fd = self
+            .open_resolved(path, libc::O_PATH, 0, RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS)
+            .ok()?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let r =
+            unsafe { libc::fstatat(fd.as_raw_fd(), c"".as_ptr(), &mut st, libc::AT_EMPTY_PATH) };
+        if r < 0 {
+            return None;
+        }
+        Some(stat_to_stat(&st))
     }
 
     fn host_path(&self, path: &Path) -> Option<PathBuf> {

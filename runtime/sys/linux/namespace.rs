@@ -96,15 +96,32 @@ impl Namespace {
         // unnecessary. Hand it the raw path; the kernel does the resolution the
         // walk would otherwise do one stat at a time. The mount is at `/`, so the
         // mount-relative path is the path itself.
-        if self.mounts.len() == 1 && self.mounts[0].fs.confines() {
+        if self.mounts.len() == 1 {
             let m = &self.mounts[0];
-            return Ok(Resolved {
-                fs: Arc::clone(&m.fs),
-                rel: path.to_path_buf(),
-                writable: !m.flags.rdonly,
-                abs: normalize(path),
-                stat: None,
-            });
+            if m.fs.confines() {
+                return Ok(Resolved {
+                    fs: Arc::clone(&m.fs),
+                    rel: path.to_path_buf(),
+                    writable: !m.flags.rdonly,
+                    abs: normalize(path),
+                    stat: None,
+                });
+            }
+            // Optimistic fast path for a non-confining mount (the overlay):
+            // when the filesystem proves the lexical path resolves without a
+            // walk, the normalized path is the canonical one. Anything the
+            // proof cannot cover — a symlink, a missing component, a
+            // shadowed prefix — walks below.
+            let norm = normalize(path);
+            if let Some(st) = m.fs.resolve_fast(&norm) {
+                return Ok(Resolved {
+                    fs: Arc::clone(&m.fs),
+                    rel: norm.clone(),
+                    writable: !m.flags.rdonly,
+                    abs: norm,
+                    stat: Some(st),
+                });
+            }
         }
 
         let mut pending: VecDeque<Part> = parts(path).into();
@@ -167,8 +184,16 @@ impl Namespace {
     /// raw path goes straight to the filesystem — no owned `rel`/`abs` buffers —
     /// and on the walked path the stat the walk already took is reused.
     pub fn stat_path(&self, path: &Path, follow: bool) -> Result<Stat, Errno> {
-        if self.mounts.len() == 1 && self.mounts[0].fs.confines() {
-            return self.mounts[0].fs.stat(path, follow);
+        if self.mounts.len() == 1 {
+            let m = &self.mounts[0];
+            if m.fs.confines() {
+                return m.fs.stat(path, follow);
+            }
+            // The follow flag is moot on the fast path: it proved no symlink
+            // participates, final component included.
+            if let Some(st) = m.fs.resolve_fast(&normalize(path)) {
+                return Ok(st);
+            }
         }
         let r = self.resolve(path, follow)?;
         match r.stat {
