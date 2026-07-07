@@ -31,6 +31,13 @@ pub struct Workspace {
     /// Created fresh by this run — eligible for empty-delta removal and the
     /// kept notice. An attached workspace is the user's to manage.
     fresh: bool,
+    /// The session root's pid. Guest fork is a host fork, so every guest
+    /// child's host process carries a copy of this struct and returns
+    /// through the CLI when its guest exits — but end-of-session
+    /// disposition belongs to the root alone, or the first short-lived
+    /// child would garbage-collect the live workspace out from under the
+    /// session.
+    owner: u32,
 }
 
 /// Where workspaces live: `$XDG_STATE_HOME/chimera/workspaces`, defaulting
@@ -61,6 +68,7 @@ pub fn create(command: &str) -> io::Result<Workspace> {
                     id,
                     root,
                     fresh: true,
+                    owner: std::process::id(),
                 });
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -81,6 +89,7 @@ pub fn attach(selector: &OsStr) -> io::Result<Workspace> {
             id: selector.to_string_lossy().into_owned(),
             root,
             fresh: false,
+            owner: std::process::id(),
         });
     }
     let root = workspaces_dir().join(selector);
@@ -98,6 +107,7 @@ pub fn attach(selector: &OsStr) -> io::Result<Workspace> {
         id: selector.to_string_lossy().into_owned(),
         root,
         fresh: false,
+        owner: std::process::id(),
     })
 }
 
@@ -108,6 +118,9 @@ impl Workspace {
     /// its one-line notice. Attached workspaces are left exactly as they
     /// are.
     pub fn finish(self, discard: bool) {
+        if std::process::id() != self.owner {
+            return;
+        }
         if discard {
             let _ = fs::remove_dir_all(&self.root);
             return;
