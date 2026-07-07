@@ -375,6 +375,7 @@ mod host {
                 // the `pthread_exit` / thread-return path.
                 thread.exit_code = call.args[0] as i32;
                 thread.running = false;
+                thread.report_spawn_exit();
             }
             libc::SYS_exit_group => {
                 // Process-wide: terminate the whole thread group, from any
@@ -387,6 +388,7 @@ mod host {
                 thread.process().request_exit_group(code, &thread.state);
                 thread.exit_code = code;
                 thread.running = false;
+                thread.report_spawn_exit();
             }
             libc::SYS_execve | libc::SYS_execveat => {
                 // Intercepted, never forwarded to the host kernel: forwarding would
@@ -794,12 +796,16 @@ mod host {
     /// Fork emulation for the `vfork`/`posix_spawn` case ([`forked`] plus the
     /// `CLONE_VFORK` semantics its callers rely on). A pipe carries the child's
     /// `execve` outcome back to the parent, which blocks on it exactly as
-    /// `CLONE_VFORK` blocks until the child execs or exits: the child's `execve`
-    /// closes the pipe on success (parent reads EOF → returns the child PID) or
-    /// writes the errno on failure (parent reads it → returns `-errno`). That is
-    /// the same negative-clone-return path glibc's `posix_spawn` reports an exec
-    /// error through, so a missing or unloadable program fails the call
-    /// synchronously rather than only surfacing via the child's exit status.
+    /// `CLONE_VFORK` blocks until the child execs or exits: a committed `execve`
+    /// closes the pipe (parent reads EOF → returns the child PID), and a child
+    /// that exits without one writes the errno of its last failed attempt, if
+    /// any (parent reads it → returns `-errno`). That is the same
+    /// negative-clone-return path glibc's `posix_spawn` reports an exec error
+    /// through, so a missing or unloadable program fails the call synchronously
+    /// rather than only surfacing via the child's exit status. Reporting waits
+    /// for the exit, not the first failed `execve`, because `posix_spawnp`
+    /// walks `$PATH` inside the child — one `execve` per candidate — and an
+    /// early failure is routinely followed by one that succeeds.
     fn spawned(
         thread: &mut Thread,
         call: &mut SystemCall,
