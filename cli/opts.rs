@@ -17,6 +17,60 @@ pub struct Opts {
 pub enum Command {
     Run(RunCmd),
     Version(VersionCmd),
+    Workspace(WorkspaceCmd),
+}
+
+/// Manage workspaces: the change-sets kept runs leave behind.
+#[derive(FromArgs)]
+#[argh(subcommand, name = "workspace")]
+pub struct WorkspaceCmd {
+    #[argh(subcommand)]
+    pub action: WorkspaceAction,
+}
+
+/// Workspace subcommands.
+#[derive(FromArgs)]
+#[argh(subcommand)]
+pub enum WorkspaceAction {
+    List(WsListCmd),
+    Diff(WsDiffCmd),
+    Apply(WsApplyCmd),
+    Rm(WsRmCmd),
+}
+
+/// List kept workspaces.
+#[derive(FromArgs)]
+#[argh(subcommand, name = "list")]
+pub struct WsListCmd {}
+
+/// Show what a workspace changed, relative to the live host: A added,
+/// M modified, D deleted.
+#[derive(FromArgs)]
+#[argh(subcommand, name = "diff")]
+pub struct WsDiffCmd {
+    /// workspace id or path
+    #[argh(positional)]
+    pub workspace: String,
+}
+
+/// Copy a workspace's changes onto the host — the adopt step. A file whose
+/// host copy changed since the workspace copied it up is refused, not
+/// clobbered.
+#[derive(FromArgs)]
+#[argh(subcommand, name = "apply")]
+pub struct WsApplyCmd {
+    /// workspace id or path
+    #[argh(positional)]
+    pub workspace: String,
+}
+
+/// Remove workspaces.
+#[derive(FromArgs)]
+#[argh(subcommand, name = "rm")]
+pub struct WsRmCmd {
+    /// workspace ids or paths
+    #[argh(positional)]
+    pub workspaces: Vec<String>,
 }
 
 /// Run a program.

@@ -21,6 +21,15 @@ pub use sys::linux::{
     Personality, RenameFlags, Stat, StatFs, Timespec, Vfs, WriteResult,
 };
 
+/// The read side of the workspace delta format, for tooling that inspects a
+/// delta from outside a sandbox: marker predicates and the origin record a
+/// copy-up leaves behind. The format itself is owned by this crate; the CLI's
+/// `chimera workspace` subcommands consume these rather than reimplementing
+/// the on-disk knowledge.
+pub mod delta {
+    pub use crate::sys::linux::{Origin, is_opaque, is_whiteout, origin};
+}
+
 /// Default capacity of the translated-code cache, in bytes. One cache is
 /// shared by every guest thread, so a multithreaded guest translates more
 /// blocks into it than a single-threaded one and runs a higher risk of

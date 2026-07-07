@@ -58,6 +58,7 @@ version = "0.0.1"
 dependencies = [
  "argh",
  "chimera-runtime",
+ "libc",
  "mimalloc",
  "shlex",
 ]

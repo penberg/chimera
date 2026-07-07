@@ -18,10 +18,6 @@
 //! user xattrs (ext4, XFS, btrfs, tmpfs); [`Delta::open`] probes for them and
 //! refuses at startup rather than failing at the first unlink.
 
-// Scaffolding: the OverlayFs that drives this does not exist yet. Drop this
-// once it is wired in.
-#![allow(dead_code)]
-
 use std::{
     ffi::{CStr, CString},
     os::{
