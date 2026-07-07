@@ -102,7 +102,68 @@ pub trait SystemCalls: Send + Sync {
 
     /// Observe a guest syscall after its final result is known, if any.
     fn post_syscall(&self, _call: &SystemCall) {}
+
+    /// Map a guest file descriptor to the host descriptor that backs it, for
+    /// the runtime-owned `mmap`. A handler that virtualizes descriptors (an fd
+    /// table over a userspace filesystem) returns the real host fd a file-backed
+    /// `mmap` must use; the default leaves the descriptor untouched, since with
+    /// [`Passthrough`] a guest fd already *is* a host fd.
+    ///
+    /// Only consulted for a file-backed `mmap` (one whose `fd` is not `-1`).
+    fn resolve_fd(&self, _guest_fd: i32) -> Option<std::os::fd::RawFd> {
+        None
+    }
+
+    /// Resolve an `execve`/`execveat` target to the host path the runtime's ELF
+    /// loader should read, applying the handler's namespace and confinement.
+    /// `dirfd` is the `execveat` directory fd (`AT_FDCWD` for `execve`), `path`
+    /// the raw guest pathname, `flags` the `execveat` flags.
+    ///
+    /// `Some(Ok(path))` names a host file to load; `Some(Err(errno))` fails the
+    /// exec with that errno; `None` defers to the runtime's default handling of
+    /// the raw path, which is what [`Passthrough`] wants.
+    fn resolve_exec(
+        &self,
+        _dirfd: i32,
+        _path: &[u8],
+        _flags: i32,
+    ) -> Option<Result<std::path::PathBuf, i32>> {
+        None
+    }
+
+    /// The guest committed an `execve`: drop whatever close-on-exec state the
+    /// handler virtualizes, before the runtime's own sweep applies host-side
+    /// `FD_CLOEXEC` (see `close_cloexec_fds` in `crate::sys::linux::exec`). A
+    /// handler that owns a descriptor table closes its close-on-exec entries
+    /// here — their close-on-exec flag lives in the table, not on a host fd,
+    /// so the runtime's sweep cannot see it. The default does nothing, since
+    /// with [`Passthrough`] every guest fd is a host fd and the sweep alone is
+    /// exact. `path` names the replacement image, so a handler that
+    /// virtualizes `/proc/self/exe` can track what the link now points at.
+    fn on_execve(&self, _path: &std::path::Path) {}
+
+    /// Take every lock the handler owns, to be held across a forwarded `fork`
+    /// — the `pthread_atfork` discipline the runtime already applies to its
+    /// own locks (see `Process::lock_for_fork` in `crate::process`). fork
+    /// copies the whole address space: a handler mutex a *sibling* thread
+    /// holds at the copy is locked forever in the child, and handler state
+    /// paired with kernel state — a descriptor table and the host fds backing
+    /// it — is torn if the copy lands between the two halves of an update.
+    /// Held by the forking thread instead, the snapshot is consistent and
+    /// both processes' copies of the guards unlock on drop. The returned
+    /// bundle is opaque; the runtime only holds it across the fork and drops
+    /// it. The default holds nothing, since [`Passthrough`] has no state.
+    fn lock_for_fork(&self) -> Box<dyn ForkHold + '_> {
+        Box::new(())
+    }
 }
+
+/// Opaque bundle of handler locks held across a forwarded `fork`; see
+/// [`SystemCalls::lock_for_fork`]. Blanket-implemented so a handler returns a
+/// plain struct of its `MutexGuard`s.
+pub trait ForkHold {}
+
+impl<T: ?Sized> ForkHold for T {}
 
 /// The default system-call handler: forwards every delegated guest syscall to
 /// the host kernel verbatim.
@@ -242,6 +303,15 @@ mod host {
                 if prot & libc::PROT_EXEC != 0 {
                     call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
                 }
+                // A file-backed mapping names a guest fd that the handler may be
+                // virtualizing; swap in the real host fd it resolves to before
+                // forwarding, so the kernel maps the right file.
+                let fd = call.args[4] as i32;
+                if fd >= 0
+                    && let Some(host_fd) = handler.resolve_fd(fd)
+                {
+                    call.args[4] = host_fd as u64;
+                }
                 let result = host_syscall(call);
                 if let SyscallResult::Ok(addr) = result {
                     let mut space = thread.addr_space();
@@ -332,7 +402,7 @@ mod host {
                 // new image is installed, whichever thread called exec), and the
                 // main host thread waits out the stragglers, tears down the old
                 // image, and enters the new one (see `crate::sys::linux::exec`).
-                match prepare_exec(call.number, &call.args) {
+                match prepare_exec(call.number, &call.args, handler) {
                     Ok(prepared) => {
                         // A spawn child reaching a loadable image is a successful
                         // spawn: unblock the parent (see `spawned`) so it returns
@@ -676,7 +746,9 @@ mod host {
         guest_stack_top: u64,
     ) {
         let fork_locks = thread.process().lock_for_fork();
+        let handler_locks = handler.lock_for_fork();
         handler.do_syscall(call);
+        drop(handler_locks);
         drop(fork_locks);
         if call.return_value() == 0 {
             thread.signals_mut().reset_pending_after_fork();
@@ -721,8 +793,10 @@ mod host {
 
         let is_child = {
             let fork_locks = thread.process().lock_for_fork();
+            let handler_locks = handler.lock_for_fork();
             handler.do_syscall(call);
             let is_child = call.return_value() == 0;
+            drop(handler_locks);
             drop(fork_locks);
             is_child
         };

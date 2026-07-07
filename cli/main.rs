@@ -6,9 +6,10 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::Arc,
 };
 
-use chimera::Sandbox;
+use chimera::{HostFs, MountFlags, Namespace, Personality, Sandbox};
 use mimalloc::MiMalloc;
 
 use opts::{Command, Opts, RunCmd};
@@ -45,6 +46,22 @@ fn run(cmd: RunCmd) -> ExitCode {
     if let Some(mib) = cmd.code_cache_size {
         sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
     }
+
+    // Route the guest's filesystem syscalls through a userspace VFS: a host
+    // passthrough mounted at `/`, so the guest sees the real tree but every
+    // operation crosses the Vfs seam. The mount is read-only by default — the
+    // guest can read the host but not change it — and `--unsafe` opts into
+    // read-write. The root must exist, so this construction cannot fail.
+    let flags = if cmd.unsafe_ {
+        MountFlags::NONE
+    } else {
+        MountFlags::RDONLY
+    };
+    let root = HostFs::new("/").expect("host root / is a directory");
+    let personality = Personality::new(Namespace::with_root(Arc::new(root), flags));
+    personality.set_exe(&program.exec);
+    sandbox.system_calls(personality);
+
     match sandbox.args(&program.args).run() {
         Ok(status) => ExitCode::from(status.code() as u8),
         Err(err) => {

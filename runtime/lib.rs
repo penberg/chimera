@@ -12,9 +12,14 @@ mod process;
 mod sys;
 mod syscall;
 
-pub use syscall::{Passthrough, SyscallResult, SystemCall, SystemCalls};
+pub use syscall::{ForkHold, Passthrough, SyscallResult, SystemCall, SystemCalls};
 
 pub use sys::linux::syscall::host_syscall;
+
+pub use sys::linux::{
+    DirEntry, Errno, File, FileType, HostFs, Mode, MountFlags, Namespace, OpenFlags, Personality,
+    RenameFlags, Stat, StatFs, Timespec, Vfs, WriteResult,
+};
 
 /// Default capacity of the translated-code cache, in bytes. One cache is
 /// shared by every guest thread, so a multithreaded guest translates more

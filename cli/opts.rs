@@ -26,6 +26,11 @@ pub struct RunCmd {
     #[argh(option)]
     pub code_cache_size: Option<usize>,
 
+    /// grant the guest read-write access to the host filesystem (default:
+    /// read-only)
+    #[argh(switch, long = "unsafe")]
+    pub unsafe_: bool,
+
     /// path to the program
     #[argh(positional)]
     pub program: PathBuf,
