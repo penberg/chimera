@@ -2,6 +2,7 @@
 //! initial stack), and the entry point that hands the guest off to the
 //! dispatcher.
 
+mod delta;
 pub mod elf;
 pub mod exec;
 pub mod fault;
