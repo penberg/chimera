@@ -30,6 +30,7 @@ use std::{
 use crate::{ForkHold, SyscallResult, SystemCall, SystemCalls, host_syscall};
 
 use super::{
+    delta::XATTR_NAMESPACE,
     hostfs::BACKING_FLOOR,
     namespace::{Namespace, Resolved, normalize},
     vfs::{DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec},
@@ -444,14 +445,28 @@ impl SystemCalls for Personality {
             // Xattr reads carry no write policy, but the path must still
             // resolve through the namespace: the file may live only in an
             // overlay's delta, and the host kernel then serves the backing
-            // path. (Fd forms need nothing: a virtual fd is a kernel alias
-            // of its backing file.)
-            libc::SYS_getxattr | libc::SYS_listxattr => {
-                self.xattr_read_path(call, true);
+            // path. (A virtual fd is a kernel alias of its backing file, so
+            // the fd forms forward as-is.) The overlay's own bookkeeping
+            // namespace is invisible throughout: a marker name reads as
+            // absent, and marker entries vanish from listings.
+            libc::SYS_getxattr | libc::SYS_lgetxattr => {
+                let result = if marker_name(a[1]) {
+                    SyscallResult::Error(libc::ENODATA)
+                } else {
+                    self.xattr_read_path(call, nr == libc::SYS_getxattr)
+                };
+                call.set_result(result);
                 return;
             }
-            libc::SYS_lgetxattr | libc::SYS_llistxattr => {
-                self.xattr_read_path(call, false);
+            libc::SYS_listxattr | libc::SYS_llistxattr => {
+                let result = self.xattr_read_path(call, nr == libc::SYS_listxattr);
+                call.set_result(strip_marker_names(result, a[1], a[2] as usize));
+                return;
+            }
+            libc::SYS_fgetxattr if marker_name(a[1]) => Err(Errno(libc::ENODATA)),
+            libc::SYS_flistxattr => {
+                let result = host_syscall(call);
+                call.set_result(strip_marker_names(result, a[1], a[2] as usize));
                 return;
             }
             libc::SYS_fallocate if self.is_virtual(a[0] as i32) => {
@@ -1385,6 +1400,9 @@ impl Personality {
         flags: i32,
         follow: bool,
     ) -> Result<i64, Errno> {
+        if marker_name(nameptr) {
+            return Err(Errno(libc::EPERM));
+        }
         let r = self.resolve_write(libc::AT_FDCWD, pathptr, follow)?;
         let name = unsafe { read_cstr(nameptr) };
         r.fs.setxattr(
@@ -1405,6 +1423,9 @@ impl Personality {
         len: usize,
         flags: i32,
     ) -> Result<i64, Errno> {
+        if marker_name(nameptr) {
+            return Err(Errno(libc::EPERM));
+        }
         let desc = self.writable_desc(fd)?;
         let name = unsafe { read_cstr(nameptr) };
         desc.file
@@ -1413,6 +1434,9 @@ impl Personality {
     }
 
     fn removexattr_path(&self, pathptr: u64, nameptr: u64, follow: bool) -> Result<i64, Errno> {
+        if marker_name(nameptr) {
+            return Err(Errno(libc::EPERM));
+        }
         let r = self.resolve_write(libc::AT_FDCWD, pathptr, follow)?;
         let name = unsafe { read_cstr(nameptr) };
         r.fs.removexattr(&r.rel, follow, OsStr::from_bytes(&name))?;
@@ -1420,6 +1444,9 @@ impl Personality {
     }
 
     fn fremovexattr(&self, fd: i32, nameptr: u64) -> Result<i64, Errno> {
+        if marker_name(nameptr) {
+            return Err(Errno(libc::EPERM));
+        }
         let desc = self.writable_desc(fd)?;
         let name = unsafe { read_cstr(nameptr) };
         desc.file.fremovexattr(OsStr::from_bytes(&name))?;
@@ -1434,7 +1461,7 @@ impl Personality {
     /// Forward a path-keyed xattr read (`getxattr`, `listxattr`, and their
     /// `l`-variants) to the host against the backing host path the namespace
     /// resolves to.
-    fn xattr_read_path(&self, call: &mut SystemCall, follow: bool) {
+    fn xattr_read_path(&self, call: &mut SystemCall, follow: bool) -> SyscallResult {
         let host = (|| -> Result<CString, Errno> {
             let raw = unsafe { read_cstr(call.args[0]) };
             let abs = self.abs_path(libc::AT_FDCWD, &raw)?;
@@ -1448,11 +1475,45 @@ impl Personality {
                 call.args[0] = host.as_ptr() as u64;
                 let result = host_syscall(call);
                 call.args[0] = saved;
-                call.set_result(result);
+                result
             }
-            Err(e) => call.set_result(SyscallResult::Error(e.raw())),
+            Err(e) => SyscallResult::Error(e.raw()),
         }
     }
+}
+
+/// `true` when the guest names an attribute inside the overlay's bookkeeping
+/// namespace, which it may neither read nor forge.
+fn marker_name(nameptr: u64) -> bool {
+    unsafe { read_cstr(nameptr) }.starts_with(XATTR_NAMESPACE)
+}
+
+/// Drop bookkeeping names from a successful `listxattr`-family result: the
+/// guest buffer holds NUL-terminated names, compacted in place. A pure size
+/// query (`size == 0`) passes through and may over-report by the hidden
+/// names — callers treat it as an allocation hint, not a promise.
+fn strip_marker_names(result: SyscallResult, buf: u64, size: usize) -> SyscallResult {
+    let SyscallResult::Ok(len) = result else {
+        return result;
+    };
+    if size == 0 || len <= 0 {
+        return result;
+    }
+    let names = guest_mut(buf, (len as usize).min(size));
+    let mut out = 0;
+    let mut i = 0;
+    while i < names.len() {
+        let end = match names[i..].iter().position(|&b| b == 0) {
+            Some(p) => i + p + 1,
+            None => names.len(),
+        };
+        if !names[i..end].starts_with(XATTR_NAMESPACE) {
+            names.copy_within(i..end, out);
+            out += end - i;
+        }
+        i = end;
+    }
+    SyscallResult::Ok(out as i64)
 }
 
 /// Write a `SyscallResult` into `call` from a `Result<i64, Errno>`.
