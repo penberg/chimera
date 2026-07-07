@@ -34,6 +34,12 @@ use super::{
     },
 };
 
+/// `true` for the kernel's virtual trees, whose files are interfaces rather
+/// than content and never participate in copy-up.
+fn kernel_virtual(rel: &Path) -> bool {
+    rel.starts_with("/proc") || rel.starts_with("/sys")
+}
+
 /// How the upper layer answers for a path.
 enum Visibility {
     /// An upper entry serves the path. `lower_masked` reports an opaque
@@ -234,6 +240,14 @@ impl Vfs for OverlayFs {
                 }))
             }
             Visibility::Lower => {
+                // /proc and /sys are kernel interfaces, not filesystem
+                // content: a write there is a control operation aimed at the
+                // kernel (an oom score, a sysctl), and copying the file up
+                // would turn it into a silent no-op against a stale snapshot.
+                // Their files pass through whole.
+                if kernel_virtual(path) {
+                    return inner.lower.open(path, flags, mode);
+                }
                 // Copy-up is eager, at write intent: a write-capable handle
                 // always points at an upper file, which is what makes a
                 // writable MAP_SHARED mapping trivially correct.
