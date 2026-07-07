@@ -156,11 +156,12 @@ impl Vfs for HostFs {
     fn open(&self, path: &Path, flags: OpenFlags, mode: Mode) -> Result<Box<dyn File>, Errno> {
         // The guest runs the same OS and ISA, so its O_* flag bits are the
         // host's; forward them verbatim. The kernel confines resolution to the
-        // root, and honors O_NOFOLLOW on the final component.
+        // root, and honors O_NOFOLLOW on the final component. The handle keeps
+        // the low fd the kernel handed out: the Personality detaches it as the
+        // guest-visible reservation (`detach_reservation`), relocating the
+        // backing high only then.
         let fd = self.open_in_root(path, flags.raw(), mode.0)?;
-        Ok(Box::new(HostFile {
-            fd: relocate_high(fd),
-        }))
+        Ok(Box::new(HostFile { fd }))
     }
 
     fn stat(&self, path: &Path, follow: bool) -> Result<Stat, Errno> {
@@ -387,6 +388,20 @@ impl File for HostFile {
 
     fn host_fd(&self) -> Option<libc::c_int> {
         Some(self.fd.as_raw_fd())
+    }
+
+    fn detach_reservation(&mut self) -> Option<OwnedFd> {
+        // The relocation dup is deliberately not FD_CLOEXEC; see
+        // `relocate_high`. On dup failure keep the low backing — the caller
+        // reserves off it as before, costing numbering fidelity, not
+        // correctness.
+        let high = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD, BACKING_FLOOR) };
+        if high < 0 {
+            return None;
+        }
+        Some(std::mem::replace(&mut self.fd, unsafe {
+            OwnedFd::from_raw_fd(high)
+        }))
     }
 
     fn getdents(&self) -> Result<Vec<DirEntry>, Errno> {

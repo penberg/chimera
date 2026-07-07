@@ -149,6 +149,17 @@ pub trait File: Send + Sync {
     fn host_fd(&self) -> Option<std::os::fd::RawFd> {
         None
     }
+
+    /// Detach this file's kernel-allocated descriptor number so the caller can
+    /// use it as the guest-visible reservation, moving the file's own backing
+    /// out of the low fd space first. The number a passthrough open receives
+    /// from the kernel is already the lowest available — exactly what
+    /// `reserve_fd` would claim — so handing it over saves the close + re-dup
+    /// round trip. `None` when there is no detachable number (no host backing,
+    /// or the relocation failed); the caller falls back to `reserve_fd`.
+    fn detach_reservation(&mut self) -> Option<std::os::fd::OwnedFd> {
+        None
+    }
 }
 
 /// The outcome of one write-like operation that advances a file position.

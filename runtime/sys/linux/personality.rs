@@ -18,7 +18,10 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     ffi::{CStr, OsStr, OsString},
-    os::{fd::RawFd, unix::ffi::OsStrExt},
+    os::{
+        fd::{IntoRawFd, RawFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
     ptr, slice,
     sync::{Arc, Mutex},
@@ -664,11 +667,23 @@ impl Personality {
                 return Err(Errno::EROFS);
             }
         }
-        let file: Arc<dyn File> = Arc::from(r.fs.open(&r.rel, OpenFlags(flags), Mode(mode))?);
+        // The host open must not carry O_CLOEXEC: the fd it returns becomes the
+        // guest-visible reservation, and a reservation with host FD_CLOEXEC
+        // would be swept at the next emulated exec (see [`reserve_fd`]). The
+        // guest's close-on-exec flag lives in the fd table instead.
+        let mut file: Box<dyn File> =
+            r.fs.open(&r.rel, OpenFlags(flags & !libc::O_CLOEXEC), Mode(mode))?;
         // Reservation and insert under one hold of the lock; see
         // [`Personality::dup`] for why the pair is atomic.
         let mut fds = self.fds.lock().unwrap();
-        let guest_fd = reserve_fd(file.host_fd())?;
+        // The kernel already handed the open the lowest available number —
+        // detach it as the reservation rather than closing it and dup'ing the
+        // same number back.
+        let guest_fd = match file.detach_reservation() {
+            Some(low) => low.into_raw_fd(),
+            None => reserve_fd(file.host_fd())?,
+        };
+        let file: Arc<dyn File> = Arc::from(file);
         let desc = Arc::new(OpenFileDescription {
             file,
             path: r.abs,
