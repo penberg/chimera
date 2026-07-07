@@ -23,7 +23,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::{SyscallResult, SystemCall, SystemCalls, host_syscall};
+use crate::{ForkHold, SyscallResult, SystemCall, SystemCalls, host_syscall};
 
 use super::{
     hostfs::BACKING_FLOOR,
@@ -294,9 +294,12 @@ impl SystemCalls for Personality {
             // table would keep intercepting a number that is now a plain
             // host fd.
             libc::SYS_dup2 | libc::SYS_dup3 if self.is_virtual(a[1] as i32) => {
+                // Kernel replacement and table removal under one hold of the
+                // lock; see [`Personality::dup`] for why the pair is atomic.
+                let mut fds = self.fds.lock().unwrap();
                 let result = host_syscall(call);
                 if let SyscallResult::Ok(_) = result {
-                    self.fds.lock().unwrap().map.remove(&(a[1] as i32));
+                    fds.map.remove(&(a[1] as i32));
                 }
                 call.set_result(result);
                 return;
@@ -466,6 +469,22 @@ impl SystemCalls for Personality {
         for fd in doomed {
             let _ = fds.close(fd);
         }
+    }
+
+    fn lock_for_fork(&self) -> Box<dyn ForkHold + '_> {
+        // The descriptor table pairs memory state with kernel state (the
+        // reserved numbers and backing fds), so a fork's copy must not land
+        // mid-update; cwd and exe just must not be copied mid-write.
+        struct Held<'a> {
+            _fds: std::sync::MutexGuard<'a, FdTable>,
+            _cwd: std::sync::MutexGuard<'a, PathBuf>,
+            _exe: std::sync::MutexGuard<'a, Option<PathBuf>>,
+        }
+        Box::new(Held {
+            _fds: self.fds.lock().unwrap(),
+            _cwd: self.cwd.lock().unwrap(),
+            _exe: self.exe.lock().unwrap(),
+        })
     }
 
     fn resolve_exec(&self, dirfd: i32, path: &[u8], flags: i32) -> Option<Result<PathBuf, i32>> {
@@ -640,6 +659,9 @@ impl Personality {
             }
         }
         let file: Arc<dyn File> = Arc::from(r.fs.open(&r.rel, OpenFlags(flags), Mode(mode))?);
+        // Reservation and insert under one hold of the lock; see
+        // [`Personality::dup`] for why the pair is atomic.
+        let mut fds = self.fds.lock().unwrap();
         let guest_fd = reserve_fd(file.host_fd())?;
         let desc = Arc::new(OpenFileDescription {
             file,
@@ -651,7 +673,7 @@ impl Personality {
             }),
         });
         let cloexec = flags & libc::O_CLOEXEC != 0;
-        self.fds.lock().unwrap().insert_at(guest_fd, desc, cloexec);
+        fds.insert_at(guest_fd, desc, cloexec);
         Ok(guest_fd as i64)
     }
 
@@ -1013,15 +1035,26 @@ impl Personality {
     /// `dup`/`F_DUPFD`: the guest fd is itself the reserved kernel number, so
     /// duplicating it hands the kernel the numbering (lowest free at or above
     /// `minfd`, exactly the contract) and keeps the new number reserved.
+    ///
+    /// Here and in [`Personality::dup2`], the kernel call runs under the same
+    /// hold of the table lock as the map update. The pair is one compound
+    /// state change: another thread's table op (or a fork snapshot, which
+    /// takes this lock — see `SystemCalls::lock_for_fork`) landing between
+    /// the halves would see a number the kernel has already reassigned still
+    /// tracked, or an allocated number untracked — and a stale close-on-exec
+    /// entry, closed at the next emulated exec, takes down whatever innocent
+    /// descriptor has since been handed that number.
     fn dup(&self, fd: i32, minfd: i32, cloexec: bool) -> Result<i64, Errno> {
-        let desc = self.desc(fd)?;
+        let mut fds = self.fds.lock().unwrap();
+        let desc = Arc::clone(&fds.get(fd).ok_or(Errno::EBADF)?.desc);
         let newfd = check_host(unsafe { libc::fcntl(fd, libc::F_DUPFD, minfd) })? as i32;
-        self.fds.lock().unwrap().insert_at(newfd, desc, cloexec);
+        fds.insert_at(newfd, desc, cloexec);
         Ok(newfd as i64)
     }
 
     fn dup2(&self, oldfd: i32, newfd: i32, flags: i32) -> Result<i64, Errno> {
-        let desc = self.desc(oldfd)?;
+        let mut fds = self.fds.lock().unwrap();
+        let desc = Arc::clone(&fds.get(oldfd).ok_or(Errno::EBADF)?.desc);
         if oldfd == newfd {
             return Ok(newfd as i64); // dup2 no-op; dup3 would EINVAL, but is rare
         }
@@ -1031,11 +1064,7 @@ impl Personality {
         // stdout) — exactly the dup2 the guest asked for.
         check_host(unsafe { libc::dup2(oldfd, newfd) })?;
         let cloexec = flags & libc::O_CLOEXEC != 0;
-        self.fds
-            .lock()
-            .unwrap()
-            .map
-            .insert(newfd, Fd { desc, cloexec });
+        fds.map.insert(newfd, Fd { desc, cloexec });
         Ok(newfd as i64)
     }
 

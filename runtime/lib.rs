@@ -12,7 +12,7 @@ mod process;
 mod sys;
 mod syscall;
 
-pub use syscall::{Passthrough, SyscallResult, SystemCall, SystemCalls};
+pub use syscall::{ForkHold, Passthrough, SyscallResult, SystemCall, SystemCalls};
 
 pub use sys::linux::syscall::host_syscall;
 

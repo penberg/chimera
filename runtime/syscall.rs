@@ -141,7 +141,29 @@ pub trait SystemCalls: Send + Sync {
     /// exact. `path` names the replacement image, so a handler that
     /// virtualizes `/proc/self/exe` can track what the link now points at.
     fn on_execve(&self, _path: &std::path::Path) {}
+
+    /// Take every lock the handler owns, to be held across a forwarded `fork`
+    /// — the `pthread_atfork` discipline the runtime already applies to its
+    /// own locks (see `Process::lock_for_fork` in `crate::process`). fork
+    /// copies the whole address space: a handler mutex a *sibling* thread
+    /// holds at the copy is locked forever in the child, and handler state
+    /// paired with kernel state — a descriptor table and the host fds backing
+    /// it — is torn if the copy lands between the two halves of an update.
+    /// Held by the forking thread instead, the snapshot is consistent and
+    /// both processes' copies of the guards unlock on drop. The returned
+    /// bundle is opaque; the runtime only holds it across the fork and drops
+    /// it. The default holds nothing, since [`Passthrough`] has no state.
+    fn lock_for_fork(&self) -> Box<dyn ForkHold + '_> {
+        Box::new(())
+    }
 }
+
+/// Opaque bundle of handler locks held across a forwarded `fork`; see
+/// [`SystemCalls::lock_for_fork`]. Blanket-implemented so a handler returns a
+/// plain struct of its `MutexGuard`s.
+pub trait ForkHold {}
+
+impl<T: ?Sized> ForkHold for T {}
 
 /// The default system-call handler: forwards every delegated guest syscall to
 /// the host kernel verbatim.
@@ -724,7 +746,9 @@ mod host {
         guest_stack_top: u64,
     ) {
         let fork_locks = thread.process().lock_for_fork();
+        let handler_locks = handler.lock_for_fork();
         handler.do_syscall(call);
+        drop(handler_locks);
         drop(fork_locks);
         if call.return_value() == 0 {
             thread.signals_mut().reset_pending_after_fork();
@@ -769,8 +793,10 @@ mod host {
 
         let is_child = {
             let fork_locks = thread.process().lock_for_fork();
+            let handler_locks = handler.lock_for_fork();
             handler.do_syscall(call);
             let is_child = call.return_value() == 0;
+            drop(handler_locks);
             drop(fork_locks);
             is_child
         };
