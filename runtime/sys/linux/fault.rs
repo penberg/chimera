@@ -13,12 +13,16 @@
 //! It owns the host `SIGSEGV`/`SIGBUS` disposition. The guest's own handlers for
 //! those are recorded in the disposition table but never installed on the host
 //! slot ([`super::signal`]), so this handler always runs first and can classify
-//! the fault. A fault that is not an SMC write — a genuine guest fault, or one
-//! taken in Chimera's own code — prints a crash report ([`report_fault`]) in the
-//! style of a kernel OOPS (cause, faulting addresses, the full guest register
-//! file, the faulting instruction's bytes, and a slice of the stack) and is then
-//! left to terminate the process with the faithful signal; precise delivery into
-//! a guest fault handler is not modeled.
+//! the fault. Besides SMC writes it recognizes one other recoverable fault, in
+//! the style of a kernel exception table: a fault whose rip lies inside the
+//! `chimera_fetch_copy` primitive — the translator probing an untrusted guest
+//! address for its decode window — resumes at the primitive's fixup label,
+//! which reports the readable prefix. A fault that is neither — a genuine guest
+//! fault, or one taken in Chimera's own code — prints a crash report
+//! ([`report_fault`]) in the style of a kernel OOPS (cause, faulting addresses,
+//! the full guest register file, the faulting instruction's bytes, and a slice
+//! of the stack) and is then left to terminate the process with the faithful
+//! signal; precise delivery into a guest fault handler is not modeled.
 //!
 //! The handler is async-signal-safe: it touches only atomics, a `Mutex` and
 //! `HashMap` whose operations never allocate, and `mprotect`. It must not call
@@ -33,7 +37,10 @@ use std::{
     },
 };
 
-use crate::{arch::x86::translate::code_cache_contains, process::Process};
+use crate::{
+    arch::x86::{trampoline::fetch_copy_span, translate::code_cache_contains},
+    process::Process,
+};
 
 /// The running guest's shared process state, published by [`set_process`] so
 /// the fault handler can reach the shared address space. A raw pointer because
@@ -82,6 +89,22 @@ extern "C" fn chimera_fault(
             libc::sigaction(signo, &sa, ptr::null_mut());
             libc::raise(signo);
         }
+        return;
+    }
+
+    // A memory fault inside the guarded guest-fetch span: the translator
+    // probed an unreadable guest address through `chimera_fetch_copy` — a
+    // wild jump, a decode window straddling into an unmapped page (SIGSEGV),
+    // or one reaching past the end of a truncated file-backed mapping
+    // (SIGBUS). Resume at the fixup label, which returns the readable prefix
+    // length to the translator. This must stay below the kill-raised check
+    // above (those must terminate regardless of the interrupted rip) and is
+    // a compare against Chimera's own .text, disjoint from the code cache
+    // and from guest pages, so it can never claim an SMC trap or a guest
+    // fault, and it needs no per-thread state.
+    let (fetch_start, fetch_fixup) = fetch_copy_span();
+    if (fetch_start..fetch_fixup).contains(&rip) {
+        set_fault_rip(ucontext, fetch_fixup);
         return;
     }
 
@@ -334,4 +357,14 @@ fn fault_rip(ucontext: *mut libc::c_void) -> usize {
     }
     let uc = ucontext as *const libc::ucontext_t;
     unsafe { (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as usize }
+}
+
+/// Write a new instruction pointer into the signal's `ucontext`; `sigreturn`
+/// resumes the interrupted thread there.
+fn set_fault_rip(ucontext: *mut libc::c_void, rip: usize) {
+    if ucontext.is_null() {
+        return;
+    }
+    let uc = ucontext as *mut libc::ucontext_t;
+    unsafe { (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] = rip as libc::greg_t };
 }

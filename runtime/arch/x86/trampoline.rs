@@ -15,6 +15,11 @@
 //! `trampoline.S` resolves to an `offset_of!` against `ThreadState`. Update
 //! the struct and the asm picks up the new offsets at compile time — no
 //! magic numbers to keep in sync.
+//!
+//! `trampoline.S` also defines `chimera_fetch_copy`, the fault-guarded copy
+//! behind [`fetch_copy`]: the translator's per-block decode-window fetch,
+//! which must tolerate an unreadable guest address (a wild jump) without
+//! faulting the runtime.
 
 use std::{arch::global_asm, mem::offset_of};
 
@@ -59,4 +64,76 @@ unsafe extern "C" {
     pub fn exit_block();
     pub fn exit_syscall();
     pub fn exit_trap();
+    fn chimera_fetch_copy(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    fn chimera_fetch_copy_start();
+    fn chimera_fetch_fixup();
+}
+
+/// Copy up to `buf.len()` bytes of guest memory at `src` into `buf` without
+/// trusting the address. A direct `rep movsb` whose fault the handler fixes
+/// up ([`fetch_copy_span`]), so the common case — every byte readable — costs
+/// a memcpy, not a syscall. Returns the byte-exact readable prefix length:
+/// `buf.len()` on a full copy, 0 when `src` itself is unreadable. Callers run
+/// only after [`crate::sys::linux::fault::install`]; without the handler an
+/// unreadable byte is a fatal fault.
+pub fn fetch_copy(src: u64, buf: &mut [u8]) -> usize {
+    unsafe { chimera_fetch_copy(buf.as_mut_ptr(), src as *const u8, buf.len()) }
+}
+
+/// Host-rip bounds `[start, fixup)` of `chimera_fetch_copy`'s faultable span.
+/// A `SIGSEGV`/`SIGBUS` whose rip lies inside resumes at `fixup`, which
+/// returns the partial count.
+pub fn fetch_copy_span() -> (usize, usize) {
+    (
+        chimera_fetch_copy_start as *const () as usize,
+        chimera_fetch_fixup as *const () as usize,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ptr;
+
+    use super::*;
+
+    const PAGE: usize = 4096;
+
+    #[test]
+    fn fetch_copy_returns_readable_prefix() {
+        crate::sys::linux::fault::install();
+
+        // A readable page followed by a PROT_NONE page, so a copy can start
+        // readable and fault partway through.
+        let map = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                PAGE * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED);
+        let base = map as usize;
+        unsafe {
+            ptr::write_bytes(map as *mut u8, 0xab, PAGE);
+            let ret = libc::mprotect((base + PAGE) as *mut libc::c_void, PAGE, libc::PROT_NONE);
+            assert_eq!(ret, 0);
+        }
+
+        let mut buf = [0u8; 64];
+        assert_eq!(fetch_copy(base as u64, &mut buf), buf.len());
+        assert!(buf.iter().all(|&b| b == 0xab));
+
+        let mut buf = [0u8; 64];
+        assert_eq!(fetch_copy((base + PAGE - 24) as u64, &mut buf), 24);
+        assert!(buf[..24].iter().all(|&b| b == 0xab));
+        assert!(buf[24..].iter().all(|&b| b == 0));
+
+        let mut buf = [0u8; 64];
+        assert_eq!(fetch_copy((base + PAGE) as u64, &mut buf), 0);
+
+        unsafe { libc::munmap(map, PAGE * 2) };
+    }
 }
