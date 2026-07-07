@@ -130,16 +130,7 @@ impl HostFs {
     /// is the raw open-flag set; the kernel scopes resolution with
     /// `RESOLVE_IN_ROOT`, so symlinks and `..` cannot escape.
     fn open_in_root(&self, path: &Path, flags: libc::c_int, mode: u32) -> Result<OwnedFd, Errno> {
-        // `openat2` is relative to root_fd; strip the leading `/`, and name the
-        // root itself as ".".
-        let rel = path.strip_prefix("/").unwrap_or(path);
-        let bytes = rel.as_os_str().as_bytes();
-        let crel = CString::new(if bytes.is_empty() {
-            b"." as &[u8]
-        } else {
-            bytes
-        })
-        .map_err(|_| Errno::EINVAL)?;
+        let crel = crel(path)?;
         let how = OpenHow {
             flags: flags as u64,
             mode: mode as u64,
@@ -173,12 +164,26 @@ impl Vfs for HostFs {
     }
 
     fn stat(&self, path: &Path, follow: bool) -> Result<Stat, Errno> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // Confining to the host's own root is vacuous — there is nothing above
+        // `/` for a symlink or `..` to escape to — so a plain fstatat against
+        // root_fd resolves identically, in one syscall instead of the
+        // openat2 + fstat + close triple.
+        if self.root.as_os_str() == "/" {
+            let crel = crel(path)?;
+            let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+            let r =
+                unsafe { libc::fstatat(self.root_fd.as_raw_fd(), crel.as_ptr(), &mut st, flags) };
+            if r < 0 {
+                return Err(last_errno());
+            }
+            return Ok(stat_to_stat(&st));
+        }
         // Resolve to an O_PATH handle confined to the root, then stat the
         // handle. O_NOFOLLOW makes the handle name a final symlink itself
         // (lstat); without it the final symlink is followed (stat).
         let oflags = libc::O_PATH | if follow { 0 } else { libc::O_NOFOLLOW };
         let fd = self.open_in_root(path, oflags, 0)?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let r =
             unsafe { libc::fstatat(fd.as_raw_fd(), c"".as_ptr(), &mut st, libc::AT_EMPTY_PATH) };
         if r < 0 {
@@ -460,6 +465,19 @@ fn cpath(path: &Path) -> Result<CString, Errno> {
     CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)
 }
 
+/// A mount-relative path as a `root_fd`-relative C string: strip the leading
+/// `/`, and name the root itself as ".".
+fn crel(path: &Path) -> Result<CString, Errno> {
+    let rel = path.strip_prefix("/").unwrap_or(path);
+    let bytes = rel.as_os_str().as_bytes();
+    CString::new(if bytes.is_empty() {
+        b"." as &[u8]
+    } else {
+        bytes
+    })
+    .map_err(|_| Errno::EINVAL)
+}
+
 /// Map a libc return of `-1` to the current errno, anything else to `Ok`.
 fn check(ret: libc::c_int) -> Result<(), Errno> {
     if ret < 0 { Err(last_errno()) } else { Ok(()) }
@@ -652,6 +670,37 @@ mod tests {
             .open(Path::new("f"), OpenFlags(libc::O_RDONLY), Mode(0))
             .unwrap();
         assert_eq!(file.fstat().unwrap().ino, st.ino);
+    }
+
+    /// A `/`-rooted mount takes the single-fstatat fast path; it must agree
+    /// with the host's own view on identity and honor `follow` on a final
+    /// symlink.
+    #[test]
+    fn host_root_stat_fast_path() {
+        use std::os::unix::fs::MetadataExt;
+
+        let scratch = Scratch::new();
+        let base = scratch.path.canonicalize().unwrap();
+        std::fs::write(base.join("f"), b"x").unwrap();
+        std::os::unix::fs::symlink("f", base.join("link")).unwrap();
+
+        let fs = HostFs::new("/").unwrap();
+        let st = fs.stat(&base.join("f"), true).unwrap();
+        let meta = std::fs::metadata(base.join("f")).unwrap();
+        assert_eq!(st.ino, meta.ino());
+        assert_eq!(st.dev, meta.dev());
+
+        let link = base.join("link");
+        assert_eq!(fs.stat(&link, false).unwrap().file_type, FileType::Symlink);
+        assert_eq!(fs.stat(&link, true).unwrap().file_type, FileType::Regular);
+        assert_eq!(
+            fs.stat(Path::new("/"), true).unwrap().file_type,
+            FileType::Directory
+        );
+        assert_eq!(
+            fs.stat(&base.join("nope"), true).unwrap_err(),
+            Errno::ENOENT
+        );
     }
 
     #[test]
