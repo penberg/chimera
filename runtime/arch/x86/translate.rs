@@ -542,6 +542,28 @@ pub fn translate(
 
     rewrite_rip_relative_leas(&mut instrs)?;
 
+    // A 66 operand-size prefix on a near `ret` truncates the popped rip to 16
+    // bits on Intel hardware, but iced decodes the prefixed form to the same
+    // `Retnq`/`Retnq_imm16` code as the plain one, so the return lowering in
+    // `emit_terminator` cannot see it. Catch it here, where the raw bytes are
+    // still at hand: everything before the `C3`/`C2 imm16` opcode tail is a
+    // prefix, and no legitimate 64-bit code emits a 16-bit return — reject it
+    // rather than silently lower it as a 64-bit return.
+    if matches!(term.code(), Code::Retnq | Code::Retnq_imm16) {
+        let off = (term.ip() - guest_pc) as usize;
+        let tail = if term.code() == Code::Retnq_imm16 {
+            3
+        } else {
+            1
+        };
+        if guest_bytes[off..off + term.len() - tail].contains(&0x66) {
+            return Err(Error::Translate(format!(
+                "unhandled 16-bit near return at {:#x}",
+                term.ip(),
+            )));
+        }
+    }
+
     // A block that touches FP/SIMD state or reads guest TLS (`fs:`) opens with
     // a lazy-install prologue: `dispatch` installs neither the guest's FP state
     // nor its FS base on entry, so the first block of a residency that needs
@@ -1442,8 +1464,31 @@ fn emit_terminator(
             emit_load_rax_from_gs(instrs, RBX_SLOT)?;
         }
         FlowControl::Return => {
+            // Far returns (`retf`) also pop CS; no 64-bit userspace code uses
+            // them, so reject them rather than silently mis-execute. (The
+            // 66-prefixed near forms decode to the same near-return codes and
+            // are rejected from the raw bytes in `translate`.)
+            if !matches!(t.code(), Code::Retnq | Code::Retnq_imm16) {
+                return Err(Error::Translate(format!(
+                    "unhandled return form at {:#x}: {:?}",
+                    t.ip(),
+                    t.code(),
+                )));
+            }
             emit_save_rax(instrs)?;
             emit_pop_rax(instrs)?;
+            // `ret imm16` releases imm16 more bytes of stack after popping the
+            // return address — callee-popped arguments (V8 builtins use this
+            // form). Drop them with `lea`, which, like `ret`, leaves the
+            // arithmetic flags untouched.
+            if t.code() == Code::Retnq_imm16 {
+                let imm = t.immediate16() as i64;
+                instrs.push(mkinstr(Instruction::with2(
+                    Code::Lea_r64_m,
+                    Register::RSP,
+                    MemoryOperand::with_base_displ(Register::RSP, imm),
+                ))?);
+            }
         }
         other => {
             return Err(Error::Translate(format!(
