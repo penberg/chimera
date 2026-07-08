@@ -74,6 +74,18 @@ impl AddressSpace {
         Ok(host_pc)
     }
 
+    pub fn code_contains_range(&self, start: usize, len: usize) -> bool {
+        self.code.code_contains_range(start, len)
+    }
+
+    pub fn code_allow_writes(&self) {
+        self.code.code_allow_writes()
+    }
+
+    pub fn code_deny_writes(&self) {
+        self.code.code_deny_writes()
+    }
+
     /// A fresh `mmap` reset the host protection of `[start, start+len)`: clear
     /// any stale armed bits and translations left by a previous mapping that
     /// used these addresses, so the new mapping arms and translates from a clean
@@ -111,7 +123,9 @@ impl AddressSpace {
             // write to this same page (re-run the store); otherwise not ours.
             return self.granted.contains(&page);
         }
+        self.code.code_allow_writes();
         self.code.invalidate_page(page as u64);
+        self.code.code_deny_writes();
         self.granted.insert(page);
         // Restore the guest's writable mapping (never executable on the host).
         unsafe {

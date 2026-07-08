@@ -591,8 +591,12 @@ impl Thread {
             };
             unsafe {
                 (*ts_ptr).exit_kind = EXIT_KIND_BLOCK;
+            }
+            self.process.addr_space.lock().unwrap().code_deny_writes();
+            unsafe {
                 dispatch(ts_ptr, host_pc);
             }
+            self.process.addr_space.lock().unwrap().code_allow_writes();
             match unsafe { (*ts_ptr).exit_kind } {
                 EXIT_KIND_SYSCALL => {
                     if let Some(reason) = self.handle_syscall() {
