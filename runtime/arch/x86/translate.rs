@@ -55,6 +55,9 @@ const PKEY_DISABLE_ACCESS: u32 = 0x1;
 const PKEY_DISABLE_WRITE: u32 = 0x2;
 const PKEY_UNINIT: i32 = -1;
 const PKEY_ALLOCATING: i32 = -2;
+/// Probed and found absent: no CPU PKU, no `CONFIG_PKEYS`, or the key pool is
+/// exhausted. The cache then runs unguarded rather than refusing to start.
+const PKEY_UNSUPPORTED: i32 = -3;
 
 /// `gs:[]` displacement of the guest's rbx slot (`regs[1]`). Terminators that
 /// need a scratch memory slot borrow it: `exit_block` re-saves the live rbx
@@ -98,7 +101,7 @@ const CACHE_GUARD: usize = 64 * 1024 * 1024;
 pub struct CodeCache {
     base: *mut u8,
     size: usize,
-    pkey: i32,
+    pkey: Option<i32>,
     /// Base and length of the whole reservation (`CACHE_GUARD` + `size` +
     /// `CACHE_GUARD`), unmapped on drop; `base` points `CACHE_GUARD` into it.
     map_base: *mut u8,
@@ -151,14 +154,12 @@ impl CodeCache {
             unsafe { libc::munmap(region, map_size) };
             return Err(err);
         }
-        let pkey = match acquire_pkey() {
-            Ok(pkey) => pkey,
-            Err(err) => {
-                unsafe { libc::munmap(region, map_size) };
-                return Err(err);
-            }
-        };
-        if let Err(err) = pkey_mprotect(p, size, cache_prot, pkey) {
+        // A host without protection-key support runs the cache RWX and unguarded
+        // rather than refusing to start; the tag only matters when a key exists.
+        let pkey = acquire_pkey();
+        if let Some(pkey) = pkey
+            && let Err(err) = pkey_mprotect(p, size, cache_prot, pkey)
+        {
             unsafe { libc::munmap(region, map_size) };
             return Err(err);
         }
@@ -219,11 +220,15 @@ impl CodeCache {
     }
 
     pub fn allow_writes(&self) {
-        set_pkey_write_disabled(self.pkey, false);
+        if let Some(pkey) = self.pkey {
+            set_pkey_write_disabled(pkey, false);
+        }
     }
 
     pub fn deny_writes(&self) {
-        set_pkey_write_disabled(self.pkey, true);
+        if let Some(pkey) = self.pkey {
+            set_pkey_write_disabled(pkey, true);
+        }
     }
 
     /// Record a guest-PC -> host-PC mapping in the inline lookup table. Direct
@@ -430,10 +435,14 @@ impl Drop for CodeCache {
     }
 }
 
-fn acquire_pkey() -> Result<i32, Error> {
+/// Resolve the process-global code-cache protection key, probing kernel support
+/// exactly once. `None` means protection keys are unavailable, and the caller
+/// leaves the cache unguarded rather than failing to start.
+fn acquire_pkey() -> Option<i32> {
     loop {
         match CODE_CACHE_PKEY.load(Ordering::Acquire) {
-            pkey if pkey >= 0 => return Ok(pkey),
+            pkey if pkey >= 0 => return Some(pkey),
+            PKEY_UNSUPPORTED => return None,
             PKEY_UNINIT => {
                 if CODE_CACHE_PKEY
                     .compare_exchange(
@@ -448,17 +457,30 @@ fn acquire_pkey() -> Result<i32, Error> {
                 }
                 let raw = unsafe { libc::syscall(libc::SYS_pkey_alloc, 0, 0) };
                 if raw < 0 {
-                    CODE_CACHE_PKEY.store(PKEY_UNINIT, Ordering::Release);
-                    return Err(Error::last_os_error("code cache pkey_alloc"));
+                    CODE_CACHE_PKEY.store(PKEY_UNSUPPORTED, Ordering::Release);
+                    warn_code_cache_unguarded();
+                    return None;
                 }
                 let pkey = raw as i32;
                 CODE_CACHE_PKEY.store(pkey, Ordering::Release);
-                return Ok(pkey);
+                return Some(pkey);
             }
             PKEY_ALLOCATING => std::hint::spin_loop(),
             _ => unreachable!("invalid code cache pkey state"),
         }
     }
+}
+
+/// Emitted once, on the first cache built without a protection key: a guest can
+/// then rewrite already-translated code and smuggle raw host syscalls past the
+/// embedder, so the operator must know the code-cache guard is off.
+fn warn_code_cache_unguarded() {
+    eprintln!(
+        "chimera: warning: no memory protection keys on this host \
+         (no CPU PKU or CONFIG_PKEYS); the translated-code cache runs \
+         writable to the guest and the sandbox cannot stop a guest from \
+         rewriting it to bypass syscall filtering"
+    );
 }
 
 fn pkey_mprotect(
