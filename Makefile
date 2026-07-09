@@ -23,7 +23,3 @@ conformance: build
 conformance-native:
 	python3 testing/lit.py --runner ""
 .PHONY: conformance-native
-
-jailbreak:
-	cc -Wall -Wextra -o testing/jailbreak testing/jailbreak.c
-	cargo run --example sandbox -- --allow mprotect --allow set_robust_list --allow rseq --allow read --allow access --allow brk --allow openat --allow fstat --allow close ./testing/jailbreak
