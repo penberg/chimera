@@ -204,6 +204,12 @@ mod host {
         },
     };
 
+    fn overlaps_code_cache(thread: &Thread, start: u64, len: u64) -> bool {
+        thread
+            .addr_space()
+            .code_contains_range(start as usize, len as usize)
+    }
+
     /// Drive one guest syscall. Runtime-owned syscalls are serviced inline
     /// here, the way a kernel's syscall table services its own; delegated
     /// syscalls go to the embedder hook.
@@ -282,7 +288,9 @@ mod host {
     /// reason again: it hands a userspace monitor the bytes that back a page on
     /// its first fault (via `UFFDIO_COPY`/`UFFDIO_CONTINUE`), so the guest could
     /// supply different code at an already-translated PC, and the resolving
-    /// thread runs outside the translator entirely.
+    /// thread runs outside the translator entirely. `pkey_alloc` and
+    /// `pkey_free` are refused because Chimera uses a protection key to keep the
+    /// code cache writable to the runtime but not to guest-translated code.
     ///
     /// `personality` is the exception that is filtered rather than refused
     /// wholesale, like `clone`'s `CLONE_VM` check. Its `READ_IMPLIES_EXEC`
@@ -302,6 +310,14 @@ mod host {
                 let prot = call.args[2] as libc::c_int;
                 if prot & libc::PROT_EXEC != 0 {
                     call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
+                }
+                let flags = call.args[3] as libc::c_int;
+                if flags & (libc::MAP_FIXED | libc::MAP_FIXED_NOREPLACE) != 0
+                    && overlaps_code_cache(thread, call.args[0], call.args[1])
+                {
+                    call.set_result(SyscallResult::Error(libc::EPERM));
+                    handler.post_syscall(call);
+                    return;
                 }
                 // A file-backed mapping names a guest fd that the handler may be
                 // virtualizing; swap in the real host fd it resolves to before
@@ -323,6 +339,11 @@ mod host {
                 call.set_result(result);
             }
             libc::SYS_mprotect | libc::SYS_pkey_mprotect => {
+                if overlaps_code_cache(thread, call.args[0], call.args[1]) {
+                    call.set_result(SyscallResult::Error(libc::EPERM));
+                    handler.post_syscall(call);
+                    return;
+                }
                 // Not runtime-owned: strip PROT_EXEC from the requested
                 // protection, then hand off to the embedder unchanged.
                 let prot = call.args[2] as libc::c_int;
@@ -339,7 +360,15 @@ mod host {
                         .note_prot(call.args[0] as usize, call.args[1] as usize);
                 }
             }
+            libc::SYS_pkey_alloc | libc::SYS_pkey_free => {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            }
             libc::SYS_munmap => {
+                if overlaps_code_cache(thread, call.args[0], call.args[1]) {
+                    call.set_result(SyscallResult::Error(libc::EPERM));
+                    handler.post_syscall(call);
+                    return;
+                }
                 let result = host_syscall(call);
                 if matches!(result, SyscallResult::Ok(_)) {
                     let mut space = thread.addr_space();
@@ -349,6 +378,15 @@ mod host {
                 call.set_result(result);
             }
             libc::SYS_mremap => {
+                let flags = call.args[3] as libc::c_int;
+                if overlaps_code_cache(thread, call.args[0], call.args[1])
+                    || (flags & libc::MREMAP_FIXED != 0
+                        && overlaps_code_cache(thread, call.args[4], call.args[2]))
+                {
+                    call.set_result(SyscallResult::Error(libc::EPERM));
+                    handler.post_syscall(call);
+                    return;
+                }
                 let result = host_syscall(call);
                 if let SyscallResult::Ok(new_start) = result {
                     let flags = call.args[3] as libc::c_int;

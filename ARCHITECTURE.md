@@ -52,7 +52,7 @@ On Darwin, the frame layout reflects `LC_MAIN` semantics. There is no `argc` cel
 
 ### Address space layout
 
-After all of the above, the Chimera process holds the runtime's own image, the guest's executable image (and its dynamic interpreter on Linux), every shared library the loader has brought in, the code cache that holds translated instructions, and two stacks. There is no kernel boundary between any of these regions: everything is one Linux or Darwin process and one virtual address space. The regions are kept disjoint by construction. Chimera's own text and data live where the host kernel placed the PIE Rust executable. The guest's executable lives where its load address (or `MAP_FIXED_NOREPLACE` reservation) put it. The dynamic interpreter, on Linux, lives at a base Chimera picks well clear of both. Every shared library the interpreter (Linux) or the in-process linker (Darwin) brings in goes through anonymous `mmap` and ends up in the conventional mmap region the host kernel hands out to ordinary anonymous mappings. The code cache is a separate 16 MB anonymous `mmap` with read, write, and execute permission, allocated when the dispatcher first starts. On Darwin the cache mapping carries `MAP_JIT` and writes go through `pthread_jit_write_protect_np` toggles.
+After all of the above, the Chimera process holds the runtime's own image, the guest's executable image (and its dynamic interpreter on Linux), every shared library the loader has brought in, the code cache that holds translated instructions, and two stacks. There is no kernel boundary between any of these regions: everything is one Linux or Darwin process and one virtual address space. The regions are kept disjoint by construction. Chimera's own text and data live where the host kernel placed the PIE Rust executable. The guest's executable lives where its load address (or `MAP_FIXED_NOREPLACE` reservation) put it. The dynamic interpreter, on Linux, lives at a base Chimera picks well clear of both. Every shared library the interpreter (Linux) or the in-process linker (Darwin) brings in goes through anonymous `mmap` and ends up in the conventional mmap region the host kernel hands out to ordinary anonymous mappings. The code cache is a separate 16 MB anonymous `mmap`, allocated when the dispatcher first starts. On Linux x86-64 its page-table permission remains read, write, and execute so the runtime can patch translated branches and self-modifying-code deopts, but the mapping is assigned an x86 protection key and every guest-running thread enters the cache with that key write-disabled in PKRU. The runtime clears the write-disable bit only while it is back on the runtime side emitting or patching code. On Darwin the cache mapping carries `MAP_JIT` and writes go through `pthread_jit_write_protect_np` toggles.
 
 ```
 high address  ──────────────────────────────────────────────────
@@ -63,7 +63,7 @@ high address  ──────────────────────
                                           by Chimera's in-process
                                           linker on Darwin)
                 guest interpreter       (Linux only)
-                code cache              (mmap RWX, owned by Chimera)
+                code cache              (mmap RWX, pkey write-disabled in guest)
                 Chimera runtime heap
                 other anonymous mappings
               ...

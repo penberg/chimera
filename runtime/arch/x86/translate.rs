@@ -4,9 +4,10 @@
 //! "compute next guest PC, then exit to the dispatcher" sequence.
 
 use std::{
+    arch::asm,
     mem::offset_of,
     ptr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicI32, AtomicUsize, Ordering},
 };
 
 use iced_x86::{
@@ -50,6 +51,13 @@ const IB_HASH_MULT: u64 = 0x9e37_79b9_7f4a_7c15;
 /// canonical or not — so [`CodeCache::clear_ib_table`] additionally repairs
 /// the one slot the all-`0xff` key hashes to (see [`ib_unmatchable`]).
 const IB_EMPTY: u8 = 0xff;
+const PKEY_DISABLE_ACCESS: u32 = 0x1;
+const PKEY_DISABLE_WRITE: u32 = 0x2;
+const PKEY_UNINIT: i32 = -1;
+const PKEY_ALLOCATING: i32 = -2;
+/// Probed and found absent: no CPU PKU, no `CONFIG_PKEYS`, or the key pool is
+/// exhausted. The cache then runs unguarded rather than refusing to start.
+const PKEY_UNSUPPORTED: i32 = -3;
 
 /// `gs:[]` displacement of the guest's rbx slot (`regs[1]`). Terminators that
 /// need a scratch memory slot borrow it: `exit_block` re-saves the live rbx
@@ -60,6 +68,10 @@ const RBX_SLOT: i64 = 8;
 /// mapped and read by the synchronous fault handler to classify a fault.
 static CODE_CACHE_LO: AtomicUsize = AtomicUsize::new(0);
 static CODE_CACHE_HI: AtomicUsize = AtomicUsize::new(0);
+/// A protection key is process-global and can label every code-cache mapping;
+/// keeping one until process exit avoids both pkey-pool churn and cache Drop
+/// racing a concurrent cache construction.
+static CODE_CACHE_PKEY: AtomicI32 = AtomicI32::new(PKEY_UNINIT);
 
 /// Whether `addr` is a host PC inside the translated-code buffer. The fault
 /// handler uses this to tell a self-modifying-code write — a guest store that
@@ -89,6 +101,7 @@ const CACHE_GUARD: usize = 64 * 1024 * 1024;
 pub struct CodeCache {
     base: *mut u8,
     size: usize,
+    pkey: Option<i32>,
     /// Base and length of the whole reservation (`CACHE_GUARD` + `size` +
     /// `CACHE_GUARD`), unmapped on drop; `base` points `CACHE_GUARD` into it.
     map_base: *mut u8,
@@ -104,7 +117,8 @@ pub struct CodeCache {
 }
 
 impl CodeCache {
-    /// Create a code cache backed by a `size`-byte RWX region. The region is
+    /// Create a code cache backed by a `size`-byte RWX region, with guest
+    /// writes denied per thread through an x86 protection key. The region is
     /// `mmap`'d lazily, so unused capacity costs virtual address space, not
     /// resident memory. `size` must stay under 2 GiB so every intra-cache
     /// `rel32` branch displacement fits in an `i32` (see `patch_site` in the
@@ -134,15 +148,18 @@ impl CodeCache {
             return Err(Error::last_os_error("code cache reservation"));
         }
         let p = unsafe { (region as *mut u8).add(CACHE_GUARD) as *mut libc::c_void };
-        if unsafe {
-            libc::mprotect(
-                p,
-                size,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-            )
-        } != 0
-        {
+        let cache_prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+        if unsafe { libc::mprotect(p, size, cache_prot) } != 0 {
             let err = Error::last_os_error("code cache mprotect");
+            unsafe { libc::munmap(region, map_size) };
+            return Err(err);
+        }
+        // A host without protection-key support runs the cache RWX and unguarded
+        // rather than refusing to start; the tag only matters when a key exists.
+        let pkey = acquire_pkey();
+        if let Some(pkey) = pkey
+            && let Err(err) = pkey_mprotect(p, size, cache_prot, pkey)
+        {
             unsafe { libc::munmap(region, map_size) };
             return Err(err);
         }
@@ -164,6 +181,7 @@ impl CodeCache {
         let cache = Self {
             base: p as *mut u8,
             size,
+            pkey,
             map_base: region as *mut u8,
             map_size,
             used: 0,
@@ -192,6 +210,25 @@ impl CodeCache {
         }
         self.used += bytes.len();
         Ok(())
+    }
+
+    pub fn contains_range(&self, start: usize, len: usize) -> bool {
+        let end = start.saturating_add(len);
+        let lo = self.base as usize;
+        let hi = lo + self.size;
+        start < hi && end > lo
+    }
+
+    pub fn allow_writes(&self) {
+        if let Some(pkey) = self.pkey {
+            set_pkey_write_disabled(pkey, false);
+        }
+    }
+
+    pub fn deny_writes(&self) {
+        if let Some(pkey) = self.pkey {
+            set_pkey_write_disabled(pkey, true);
+        }
     }
 
     /// Record a guest-PC -> host-PC mapping in the inline lookup table. Direct
@@ -398,6 +435,105 @@ impl Drop for CodeCache {
     }
 }
 
+/// Resolve the process-global code-cache protection key, probing kernel support
+/// exactly once. `None` means protection keys are unavailable, and the caller
+/// leaves the cache unguarded rather than failing to start.
+fn acquire_pkey() -> Option<i32> {
+    loop {
+        match CODE_CACHE_PKEY.load(Ordering::Acquire) {
+            pkey if pkey >= 0 => return Some(pkey),
+            PKEY_UNSUPPORTED => return None,
+            PKEY_UNINIT => {
+                if CODE_CACHE_PKEY
+                    .compare_exchange(
+                        PKEY_UNINIT,
+                        PKEY_ALLOCATING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                let raw = unsafe { libc::syscall(libc::SYS_pkey_alloc, 0, 0) };
+                if raw < 0 {
+                    CODE_CACHE_PKEY.store(PKEY_UNSUPPORTED, Ordering::Release);
+                    warn_code_cache_unguarded();
+                    return None;
+                }
+                let pkey = raw as i32;
+                CODE_CACHE_PKEY.store(pkey, Ordering::Release);
+                return Some(pkey);
+            }
+            PKEY_ALLOCATING => std::hint::spin_loop(),
+            _ => unreachable!("invalid code cache pkey state"),
+        }
+    }
+}
+
+/// Emitted once, on the first cache built without a protection key: a guest can
+/// then rewrite already-translated code and smuggle raw host syscalls past the
+/// embedder, so the operator must know the code-cache guard is off.
+fn warn_code_cache_unguarded() {
+    eprintln!(
+        "chimera: warning: no memory protection keys on this host \
+         (no CPU PKU or CONFIG_PKEYS); the translated-code cache runs \
+         writable to the guest and the sandbox cannot stop a guest from \
+         rewriting it to bypass syscall filtering"
+    );
+}
+
+fn pkey_mprotect(
+    addr: *mut libc::c_void,
+    len: usize,
+    prot: libc::c_int,
+    pkey: i32,
+) -> Result<(), Error> {
+    let ret = unsafe { libc::syscall(libc::SYS_pkey_mprotect, addr, len, prot, pkey) };
+    if ret != 0 {
+        return Err(Error::last_os_error("code cache pkey_mprotect"));
+    }
+    Ok(())
+}
+
+fn set_pkey_write_disabled(pkey: i32, disabled: bool) {
+    let shift = (pkey as u32) * 2;
+    let mask = (PKEY_DISABLE_ACCESS | PKEY_DISABLE_WRITE) << shift;
+    let write = PKEY_DISABLE_WRITE << shift;
+    let mut pkru = read_pkru() & !mask;
+    if disabled {
+        pkru |= write;
+    }
+    write_pkru(pkru);
+}
+
+fn read_pkru() -> u32 {
+    let eax: u32;
+    let edx: u32;
+    unsafe {
+        asm!(
+            "rdpkru",
+            in("ecx") 0_u32,
+            lateout("eax") eax,
+            lateout("edx") edx,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    ((edx as u64) << 32 | eax as u64) as u32
+}
+
+fn write_pkru(pkru: u32) {
+    unsafe {
+        asm!(
+            "wrpkru",
+            in("eax") pkru,
+            in("ecx") 0_u32,
+            in("edx") 0_u32,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
 /// Map a guest PC to its direct-mapped slot index in the indirect-branch table.
 /// Must stay in lockstep with the hash the inline lookup routine computes in
 /// [`CodeCache::ensure_ib_lookup`].
@@ -467,6 +603,21 @@ fn read_guest_window(guest_pc: u64, buf: &mut [u8]) -> usize {
     fetch_copy(guest_pc, buf)
 }
 
+fn reject_guest_control_instruction(instr: &Instruction) -> Result<(), Error> {
+    match instr.code() {
+        Code::Wrpkru => Err(Error::Translate(format!(
+            "guest WRPKRU is not supported at {:#x}",
+            instr.ip()
+        ))),
+        Code::Sysenter | Code::Sysexitd | Code::Sysexitq => Err(Error::Translate(format!(
+            "guest {:?} is not supported at {:#x}",
+            instr.mnemonic(),
+            instr.ip()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Translate one basic block starting at `guest_pc`. Returns the host PC at
 /// which the translated block begins, together with the block's statically
 /// known outgoing edges (empty for blocks ending in an indirect branch,
@@ -532,6 +683,7 @@ pub fn translate(
         if instr.is_invalid() && decoder.last_error() == DecoderError::NoMoreBytes {
             return Err(Error::BadAccess(window_end));
         }
+        reject_guest_control_instruction(&instr)?;
         if matches!(instr.flow_control(), FlowControl::Next) {
             instrs.push(instr);
             continue;

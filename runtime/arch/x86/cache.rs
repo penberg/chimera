@@ -180,6 +180,18 @@ impl BlockCache {
         self.cache.ensure_ib_lookup(block_exit)
     }
 
+    pub fn code_contains_range(&self, start: usize, len: usize) -> bool {
+        self.cache.contains_range(start, len)
+    }
+
+    pub fn code_allow_writes(&self) {
+        self.cache.allow_writes()
+    }
+
+    pub fn code_deny_writes(&self) {
+        self.cache.deny_writes()
+    }
+
     /// Flush every translated block and its link bookkeeping. The backing code
     /// buffer is rewound; the guest-PC map, page index, and pending links are
     /// cleared.
