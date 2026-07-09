@@ -89,6 +89,11 @@ Worked examples live under [`runtime/examples/`](runtime/examples):
 
 See [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## Publications
+
+- Pekka Enberg and Ashwin Rao (2026). Towards Sandboxing Untrusted Agents in
+  Userspace. _Tech report._ [[PDF](https://penberg.org/papers/penberg-chimera.pdf)]
+
 ## License
 
 This project is licensed under the [MIT license].
