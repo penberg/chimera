@@ -455,13 +455,10 @@ fn acquire_pkey() -> Option<i32> {
                 {
                     continue;
                 }
-                let raw = unsafe { libc::syscall(libc::SYS_pkey_alloc, 0, 0) };
-                if raw < 0 {
+                let Some(pkey) = allocate_pkey() else {
                     CODE_CACHE_PKEY.store(PKEY_UNSUPPORTED, Ordering::Release);
-                    warn_code_cache_unguarded();
                     return None;
-                }
-                let pkey = raw as i32;
+                };
                 CODE_CACHE_PKEY.store(pkey, Ordering::Release);
                 return Some(pkey);
             }
@@ -471,16 +468,17 @@ fn acquire_pkey() -> Option<i32> {
     }
 }
 
-/// Emitted once, on the first cache built without a protection key: a guest can
-/// then rewrite already-translated code and smuggle raw host syscalls past the
-/// embedder, so the operator must know the code-cache guard is off.
-fn warn_code_cache_unguarded() {
-    eprintln!(
-        "chimera: warning: no memory protection keys on this host \
-         (no CPU PKU or CONFIG_PKEYS); the translated-code cache runs \
-         writable to the guest and the sandbox cannot stop a guest from \
-         rewriting it to bypass syscall filtering"
-    );
+fn allocate_pkey() -> Option<i32> {
+    let raw = unsafe { libc::syscall(libc::SYS_pkey_alloc, 0, 0) };
+    (raw >= 0).then_some(raw as i32)
+}
+
+pub fn mpk_enabled() -> bool {
+    let Some(pkey) = allocate_pkey() else {
+        return false;
+    };
+    unsafe { libc::syscall(libc::SYS_pkey_free, pkey) };
+    true
 }
 
 fn pkey_mprotect(

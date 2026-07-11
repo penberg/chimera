@@ -16,6 +16,7 @@ pub struct Opts {
 #[argh(subcommand)]
 pub enum Command {
     Run(RunCmd),
+    Version(VersionCmd),
 }
 
 /// Run a program.
@@ -39,3 +40,8 @@ pub struct RunCmd {
     #[argh(positional)]
     pub args: Vec<String>,
 }
+
+/// Print version information.
+#[derive(FromArgs)]
+#[argh(subcommand, name = "version")]
+pub struct VersionCmd {}

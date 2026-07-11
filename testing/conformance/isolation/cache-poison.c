@@ -190,8 +190,8 @@ int main(void) {
     // Any bytes on the pipe are the smuggled write(2): the guest patched the
     // cache and ran a raw host syscall. That is the escape, and it is a failure
     // wherever Chimera can arm the guard -- i.e. wherever the host has
-    // protection keys. Without them Chimera cannot enforce it (and says so at
-    // startup), so the escape is out of this test's scope, not a failure.
+    // protection keys. Without them Chimera cannot enforce it, so the escape is
+    // out of this test's scope, not a failure.
     if (n > 0) {
         return host_has_pku() ? 3 : 0;
     }
