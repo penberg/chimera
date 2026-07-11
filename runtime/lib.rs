@@ -35,6 +35,12 @@ pub const DEFAULT_CODE_CACHE_SIZE: usize = 256 * 1024 * 1024;
 /// the cache must stay under 2 GiB for the displacement to fit in an `i32`.
 pub const MAX_CODE_CACHE_SIZE: usize = i32::MAX as usize;
 
+/// Whether the host supports memory protection keys for the translated-code
+/// cache.
+pub fn mpk_enabled() -> bool {
+    arch::mpk_enabled()
+}
+
 /// A sandboxed guest program, configured but not yet running.
 pub struct Sandbox {
     program: PathBuf,

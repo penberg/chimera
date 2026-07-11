@@ -25,7 +25,21 @@ fn main() -> ExitCode {
     let opts: Opts = argh::from_env();
     match opts.command {
         Command::Run(cmd) => run(cmd),
+        Command::Version(_) => version(),
     }
+}
+
+fn version() -> ExitCode {
+    println!(
+        "chimera version {} linux x86-64 {}",
+        env!("CARGO_PKG_VERSION"),
+        if chimera::mpk_enabled() {
+            "mpk"
+        } else {
+            "nompk"
+        }
+    );
+    ExitCode::SUCCESS
 }
 
 fn run(cmd: RunCmd) -> ExitCode {

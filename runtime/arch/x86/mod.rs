@@ -13,6 +13,8 @@ pub mod dispatch;
 pub mod trampoline;
 pub mod translate;
 
+pub use translate::mpk_enabled;
+
 pub fn init() -> Result<(), Error> {
     static INIT: OnceLock<Result<(), &'static str>> = OnceLock::new();
 
