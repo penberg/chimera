@@ -133,6 +133,9 @@ struct OpenFileDescription {
     /// Open status flags (`O_APPEND`, `O_NONBLOCK`, …); the access mode lives
     /// here too. Shared across `dup`, mutable via `fcntl(F_SETFL)`.
     state: Mutex<DescState>,
+    /// Mount writability at open time. Fd operations target the open inode, so
+    /// this cannot be recovered by resolving `path` after a rename or unlink.
+    writable: bool,
 }
 
 struct DescState {
@@ -571,14 +574,13 @@ impl Personality {
         }
     }
 
-    /// The same check for an fd mutator: a virtual fd's writability comes from
-    /// its mount; a host fd is not ours to police.
+    /// The same check for an fd mutator, using the mount policy captured when
+    /// the open file description was created; a host fd is not ours to police.
     fn guard_write_fd(&self, fd: i32) -> Result<(), Errno> {
         if !self.is_virtual(fd) {
             return Ok(());
         }
-        let path = self.desc(fd)?.path.clone();
-        if self.ns.resolve(&path, true)?.writable {
+        if self.desc(fd)?.writable {
             Ok(())
         } else {
             Err(Errno::EROFS)
@@ -687,6 +689,7 @@ impl Personality {
         let desc = Arc::new(OpenFileDescription {
             file,
             path: r.abs,
+            writable: r.writable,
             state: Mutex::new(DescState {
                 offset: 0,
                 status: flags,
@@ -1362,5 +1365,89 @@ fn dirent_type(t: FileType) -> u8 {
         FileType::BlockDevice => libc::DT_BLK,
         FileType::Fifo => libc::DT_FIFO,
         FileType::Socket => libc::DT_SOCK,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    };
+
+    use super::*;
+    use crate::sys::linux::{HostFs, MountFlags};
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("chimera-personality-{}-{n}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn personality(&self, flags: MountFlags) -> Personality {
+            let root = Arc::new(HostFs::new(&self.0).unwrap());
+            Personality::new(Namespace::with_root(root, flags))
+        }
+
+        fn open(&self, personality: &Personality, path: &std::ffi::CStr, flags: i32) -> i32 {
+            personality
+                .open(libc::AT_FDCWD, path.as_ptr() as u64, flags, 0)
+                .unwrap() as i32
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn fd_write_guard_survives_rename() {
+        let scratch = Scratch::new();
+        let personality = scratch.personality(MountFlags::NONE);
+        std::fs::write(scratch.0.join("target"), b"x").unwrap();
+
+        let fd = scratch.open(&personality, c"/target", libc::O_RDONLY);
+        std::fs::rename(scratch.0.join("target"), scratch.0.join("moved")).unwrap();
+
+        assert_eq!(personality.guard_write_fd(fd), Ok(()));
+    }
+
+    #[test]
+    fn fd_write_guard_survives_unlink() {
+        let scratch = Scratch::new();
+        let personality = scratch.personality(MountFlags::NONE);
+        std::fs::write(scratch.0.join("target"), b"x").unwrap();
+
+        let fd = scratch.open(&personality, c"/target", libc::O_RDONLY);
+        std::fs::remove_file(scratch.0.join("target")).unwrap();
+
+        assert_eq!(personality.guard_write_fd(fd), Ok(()));
+    }
+
+    #[test]
+    fn fd_write_guard_denies_read_only_mount() {
+        let scratch = Scratch::new();
+        std::fs::write(scratch.0.join("target"), b"x").unwrap();
+        let personality = scratch.personality(MountFlags::RDONLY);
+
+        let fd = scratch.open(&personality, c"/target", libc::O_RDONLY);
+
+        assert_eq!(personality.guard_write_fd(fd), Err(Errno::EROFS));
+    }
+
+    #[test]
+    fn fd_write_guard_ignores_host_fds() {
+        let scratch = Scratch::new();
+        let personality = scratch.personality(MountFlags::RDONLY);
+
+        assert_eq!(personality.guard_write_fd(libc::STDIN_FILENO), Ok(()));
     }
 }
