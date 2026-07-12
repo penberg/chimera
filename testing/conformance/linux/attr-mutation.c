@@ -1,0 +1,107 @@
+// RUN: %cc %s -o %t && %runner %t
+//
+// Attribute mutators must route through the VFS. The test discovers which
+// world it runs in by trying to create a scratch file: in a writable world
+// (native, or a read-write sandbox) every mutator succeeds and stat observes
+// the change; on Chimera's read-only mount the create fails with EROFS and
+// every mutator must then return EROFS too, leaving the file untouched — a
+// mutator slipping past the VFS to the host is exactly the bug this guards
+// against. Currently covers the chmod family; each mutator family grows a
+// section here as it moves onto the Vfs trait.
+
+#define _GNU_SOURCE
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#ifndef SYS_fchmodat2
+#define SYS_fchmodat2 452
+#endif
+
+static char scratch[4096];
+
+// Argument decoding must be answered by Chimera itself, identically in both
+// worlds, before any mount policy applies.
+static int rejected_arguments(const char *self) {
+    struct stat before, after;
+    if (stat(self, &before) != 0) return 1;
+
+    if (chmod("", 0600) == 0 || errno != ENOENT) return 2;
+    if (syscall(SYS_chmod, NULL, 0600) == 0 || errno != EFAULT) return 3;
+    // AT_REMOVEDIR is not a chmod flag; a pre-6.6 native kernel answers the
+    // unknown syscall with ENOSYS instead.
+    errno = 0;
+    if (syscall(SYS_fchmodat2, AT_FDCWD, self, 0600, AT_REMOVEDIR) == 0 ||
+        (errno != EINVAL && errno != ENOSYS))
+        return 4;
+
+    if (stat(self, &after) != 0) return 5;
+    if (before.st_mode != after.st_mode) return 6;
+    return 0;
+}
+
+static int read_only_world(const char *self) {
+    struct stat before, after;
+    if (stat(self, &before) != 0) return 11;
+
+    // Path forms: each must be denied with EROFS, not forwarded.
+    if (chmod(self, 0600) == 0 || errno != EROFS) return 12;
+
+    // Fd forms on a read-only open of the same file.
+    int fd = open(self, O_RDONLY);
+    if (fd < 0) return 13;
+    if (fchmod(fd, 0600) == 0 || errno != EROFS) return 14;
+    close(fd);
+
+    // Nothing leaked through to the host.
+    if (stat(self, &after) != 0) return 15;
+    if (after.st_mode != before.st_mode) return 16;
+    return 0;
+}
+
+static int writable_world(int fd) {
+    struct stat st;
+
+    // Fd forms, observed through fstat on the same descriptor.
+    if (fchmod(fd, 0640) != 0) return 31;
+    if (fstat(fd, &st) != 0 || (st.st_mode & 07777) != 0640) return 32;
+
+    // Path forms, observed through stat by path.
+    if (chmod(scratch, 0600) != 0) return 33;
+    if (stat(scratch, &st) != 0 || (st.st_mode & 07777) != 0600) return 34;
+
+    // No-follow chmod of a symlink answers EOPNOTSUPP the way the kernel
+    // does, leaving the target alone (ENOSYS: pre-6.6 native kernel).
+    char link[sizeof(scratch) + 8];
+    snprintf(link, sizeof(link), "%s.link", scratch);
+    unlink(link);
+    if (symlink(scratch, link) != 0) return 35;
+    errno = 0;
+    if (syscall(SYS_fchmodat2, AT_FDCWD, link, 0400, AT_SYMLINK_NOFOLLOW) ==
+            0 ||
+        (errno != EOPNOTSUPP && errno != ENOSYS))
+        return 36;
+    if (stat(scratch, &st) != 0 || (st.st_mode & 07777) != 0600) return 37;
+    unlink(link);
+
+    close(fd);
+    unlink(scratch);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    (void)argc;
+    int rejected = rejected_arguments(argv[0]);
+    if (rejected != 0) return rejected;
+    snprintf(scratch, sizeof(scratch), "%s.scratch", argv[0]);
+    int fd = open(scratch, O_CREAT | O_RDWR, 0644);
+    if (fd < 0) {
+        if (errno != EROFS) return 10;
+        return read_only_world(argv[0]);
+    }
+    return writable_world(fd);
+}

@@ -31,7 +31,7 @@ use crate::{ForkHold, SyscallResult, SystemCall, SystemCalls, host_syscall};
 
 use super::{
     hostfs::BACKING_FLOOR,
-    namespace::{Namespace, normalize},
+    namespace::{Namespace, Resolved, normalize},
     vfs::{DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec},
 };
 
@@ -391,7 +391,16 @@ impl SystemCalls for Personality {
             libc::SYS_chdir => self.chdir(a[0]),
             libc::SYS_fchdir if self.is_virtual(a[0] as i32) => self.fchdir(a[0] as i32),
 
-            // --- metadata mutators ---
+            // --- attribute mutators (path forms; fd forms virtual only) ---
+            libc::SYS_chmod => self.chmod_path(libc::AT_FDCWD, a[0], a[1] as u32, 0),
+            // The raw fchmodat syscall has no flags argument; fchmodat2 adds it.
+            libc::SYS_fchmodat => self.chmod_path(a[0] as i32, a[1], a[2] as u32, 0),
+            libc::SYS_fchmodat2 => self.chmod_path(a[0] as i32, a[1], a[2] as u32, a[3] as i32),
+            libc::SYS_fchmod if self.is_virtual(a[0] as i32) => {
+                self.fchmod(a[0] as i32, a[1] as u32)
+            }
+
+            // --- metadata mutators not yet on the Vfs trait ---
             //
             // These change a file's attributes rather than its path or contents.
             // The Vfs trait has no methods for them yet, but they must still
@@ -399,8 +408,7 @@ impl SystemCalls for Personality {
             // and otherwise let the host serve them (the only mount today is the
             // host root, so the guest path is the host path). Left unhandled they
             // would fall through to the host and mutate it under `--readonly`.
-            libc::SYS_chmod
-            | libc::SYS_chown
+            libc::SYS_chown
             | libc::SYS_lchown
             | libc::SYS_utime
             | libc::SYS_utimes
@@ -413,18 +421,13 @@ impl SystemCalls for Personality {
                 self.deny_ro_or_passthrough(call, guard, None);
                 return;
             }
-            libc::SYS_fchmodat
-            | libc::SYS_fchmodat2
-            | libc::SYS_fchownat
-            | libc::SYS_mknodat
-            | libc::SYS_futimesat => {
+            libc::SYS_fchownat | libc::SYS_mknodat | libc::SYS_futimesat => {
                 let guard = self.guard_write_path(a[0] as i32, a[1]);
                 // Translate the dirfd if it is one of ours before forwarding.
                 self.deny_ro_or_passthrough(call, guard, Some(0));
                 return;
             }
-            libc::SYS_fchmod
-            | libc::SYS_fchown
+            libc::SYS_fchown
             | libc::SYS_fsetxattr
             | libc::SYS_fremovexattr
             | libc::SYS_fallocate => {
@@ -564,14 +567,21 @@ impl Personality {
     /// Resolve a path mutator's target and reject it with `EROFS` if it lands on
     /// a read-only mount. Path-resolution errors (`ENOENT`, `ELOOP`, …) carry
     /// through unchanged.
+    fn resolve_write_raw(&self, dirfd: i32, raw: &[u8], follow: bool) -> Result<Resolved, Errno> {
+        let abs = self.abs_path(dirfd, raw)?;
+        let r = self.ns.resolve(&abs, follow)?;
+        if !r.writable {
+            return Err(Errno::EROFS);
+        }
+        Ok(r)
+    }
+
+    /// [`resolve_write`] for the passthrough arms, which need only the verdict.
+    ///
+    /// [`resolve_write`]: Self::resolve_write
     fn guard_write_path(&self, dirfd: i32, pathptr: u64) -> Result<(), Errno> {
         let raw = unsafe { read_cstr(pathptr) };
-        let abs = self.abs_path(dirfd, &raw)?;
-        if self.ns.resolve(&abs, true)?.writable {
-            Ok(())
-        } else {
-            Err(Errno::EROFS)
-        }
+        self.resolve_write_raw(dirfd, &raw, true).map(|_| ())
     }
 
     /// The same check for an fd mutator, using the mount policy captured when
@@ -1183,6 +1193,37 @@ impl Personality {
         *self.cwd.lock().unwrap() = path;
         Ok(0)
     }
+
+    fn chmod_path(&self, dirfd: i32, pathptr: u64, mode: u32, flags: i32) -> Result<i64, Errno> {
+        const ALLOWED: i32 = libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW;
+        if flags & !ALLOWED != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if pathptr == 0 {
+            return Err(Errno(libc::EFAULT));
+        }
+        let raw = unsafe { read_cstr(pathptr) };
+        if raw.is_empty() {
+            if flags & libc::AT_EMPTY_PATH == 0 {
+                return Err(Errno::ENOENT);
+            }
+            if self.is_virtual(dirfd) {
+                self.guard_write_fd(dirfd)?;
+                self.desc(dirfd)?.file.fchmodat_empty(Mode(mode))?;
+                return Ok(0);
+            }
+        }
+        let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
+        let r = self.resolve_write_raw(dirfd, &raw, follow)?;
+        r.fs.chmod(&r.rel, follow, Mode(mode))?;
+        Ok(0)
+    }
+
+    fn fchmod(&self, fd: i32, mode: u32) -> Result<i64, Errno> {
+        self.guard_write_fd(fd)?;
+        self.desc(fd)?.file.fchmod(Mode(mode))?;
+        Ok(0)
+    }
 }
 
 /// Write a `SyscallResult` into `call` from a `Result<i64, Errno>`.
@@ -1370,9 +1411,12 @@ fn dirent_type(t: FileType) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{
+            Arc,
+            atomic::{AtomicU32, Ordering},
+        },
     };
 
     use super::*;
@@ -1441,6 +1485,48 @@ mod tests {
         let fd = scratch.open(&personality, c"/target", libc::O_RDONLY);
 
         assert_eq!(personality.guard_write_fd(fd), Err(Errno::EROFS));
+    }
+
+    /// `fchmodat2(fd, "", mode, AT_EMPTY_PATH)` targets the open inode, so it
+    /// must land on the file the descriptor was opened on even after the path
+    /// is renamed away and replaced — not on the path's new occupant.
+    #[test]
+    fn empty_path_chmod_targets_opath_file_after_replacement() {
+        let scratch = Scratch::new();
+        let personality = scratch.personality(MountFlags::NONE);
+        let target = scratch.0.join("target");
+        let moved = scratch.0.join("moved");
+        std::fs::write(&target, b"old").unwrap();
+
+        let fd = scratch.open(&personality, c"/target", libc::O_PATH);
+        std::fs::rename(&target, &moved).unwrap();
+        std::fs::write(&target, b"replacement").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        personality
+            .chmod_path(fd, c"".as_ptr() as u64, 0o640, libc::AT_EMPTY_PATH)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&moved).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn chmod_by_path_is_erofs_on_read_only_mount() {
+        let scratch = Scratch::new();
+        std::fs::write(scratch.0.join("target"), b"x").unwrap();
+        let personality = scratch.personality(MountFlags::RDONLY);
+
+        assert_eq!(
+            personality.chmod_path(libc::AT_FDCWD, c"/target".as_ptr() as u64, 0o600, 0),
+            Err(Errno::EROFS)
+        );
     }
 
     #[test]

@@ -269,6 +269,24 @@ impl Vfs for HostFs {
         check(r)
     }
 
+    fn chmod(&self, path: &Path, follow: bool, mode: Mode) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        let r = if follow {
+            unsafe { libc::chmod(cpath.as_ptr(), mode.0 as libc::mode_t) }
+        } else {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_fchmodat2,
+                    libc::AT_FDCWD,
+                    cpath.as_ptr(),
+                    mode.0 as libc::mode_t,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                ) as libc::c_int
+            }
+        };
+        check(r)
+    }
+
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno> {
         let fd = self.open_in_root(path, libc::O_PATH, 0)?;
         Ok(statfs_to_statfs(&raw_fstatfs(fd.as_raw_fd())?))
@@ -384,6 +402,22 @@ impl File for HostFile {
 
     fn fsync(&self) -> Result<(), Errno> {
         check(unsafe { libc::fsync(self.fd.as_raw_fd()) })
+    }
+
+    fn fchmod(&self, mode: Mode) -> Result<(), Errno> {
+        check(unsafe { libc::fchmod(self.fd.as_raw_fd(), mode.0 as libc::mode_t) })
+    }
+
+    fn fchmodat_empty(&self, mode: Mode) -> Result<(), Errno> {
+        check(unsafe {
+            libc::syscall(
+                libc::SYS_fchmodat2,
+                self.fd.as_raw_fd(),
+                c"".as_ptr(),
+                mode.0 as libc::mode_t,
+                libc::AT_EMPTY_PATH,
+            ) as libc::c_int
+        })
     }
 
     fn host_fd(&self) -> Option<libc::c_int> {
@@ -592,7 +626,10 @@ fn raw_statfs(path: &CStr) -> Result<RawStatFs, Errno> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::atomic::{AtomicU32, Ordering},
+    };
 
     use super::*;
 
@@ -813,6 +850,54 @@ mod tests {
         let b = fs.stat(Path::new("alias"), true).unwrap();
         assert_eq!(a.ino, b.ino);
         assert_eq!(b.nlink, 2);
+    }
+
+    #[test]
+    fn chmod_applies_permission_bits() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+
+        let file = fs
+            .open(
+                Path::new("f"),
+                OpenFlags(libc::O_CREAT | libc::O_RDWR),
+                Mode(0o644),
+            )
+            .unwrap();
+        fs.chmod(Path::new("f"), true, Mode(0o600)).unwrap();
+        assert_eq!(
+            fs.stat(Path::new("f"), true).unwrap().mode.0 & 0o7777,
+            0o600
+        );
+
+        file.fchmod(Mode(0o640)).unwrap();
+        assert_eq!(file.fstat().unwrap().mode.0 & 0o7777, 0o640);
+    }
+
+    #[test]
+    fn chmod_nofollow_refuses_symlink_without_changing_target() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+        std::fs::write(scratch.path.join("target"), b"").unwrap();
+        std::fs::set_permissions(
+            scratch.path.join("target"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("target", scratch.path.join("link")).unwrap();
+
+        assert_eq!(
+            fs.chmod(Path::new("link"), false, Mode(0o600)),
+            Err(Errno(libc::EOPNOTSUPP))
+        );
+        assert_eq!(
+            std::fs::metadata(scratch.path.join("target"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o640
+        );
     }
 
     #[test]

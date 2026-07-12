@@ -77,6 +77,10 @@ pub trait Vfs: Send + Sync {
     /// `EXDEV` and handled above.
     fn rename(&self, from: &Path, to: &Path, flags: RenameFlags) -> Result<(), Errno>;
 
+    /// Change a file's permission bits. `follow == false` atomically refuses a
+    /// final symlink with `EOPNOTSUPP`, as `fchmodat2(AT_SYMLINK_NOFOLLOW)` does.
+    fn chmod(&self, path: &Path, follow: bool, mode: Mode) -> Result<(), Errno>;
+
     /// Report filesystem-wide statistics for `statfs` by path.
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno>;
 
@@ -131,6 +135,15 @@ pub trait File: Send + Sync {
 
     /// Flush the file to durable storage.
     fn fsync(&self) -> Result<(), Errno>;
+
+    /// `chmod` through the open handle (`fchmod`).
+    fn fchmod(&self, mode: Mode) -> Result<(), Errno>;
+
+    /// `fchmodat2(fd, "", mode, AT_EMPTY_PATH)`, which also accepts an
+    /// `O_PATH` handle.
+    fn fchmodat_empty(&self, mode: Mode) -> Result<(), Errno> {
+        self.fchmod(mode)
+    }
 
     /// Snapshot of a directory's entries, backing `getdents64` on a dirfd. The
     /// Personality encodes the snapshot into `linux_dirent64` records and keeps
