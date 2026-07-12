@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 use std::{
-    ffi::{CStr, CString, OsString},
+    ffi::{CStr, CString, OsStr, OsString},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::{OsStrExt, OsStringExt},
@@ -315,6 +315,32 @@ impl Vfs for HostFs {
         check(unsafe { libc::mknod(cpath.as_ptr(), mode.0 as libc::mode_t, dev as libc::dev_t) })
     }
 
+    fn setxattr(
+        &self,
+        path: &Path,
+        follow: bool,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+    ) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        let cname = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let f = if follow {
+            libc::setxattr
+        } else {
+            libc::lsetxattr
+        };
+        check(unsafe {
+            f(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                flags,
+            )
+        })
+    }
+
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno> {
         let fd = self.open_in_root(path, libc::O_PATH, 0)?;
         Ok(statfs_to_statfs(&raw_fstatfs(fd.as_raw_fd())?))
@@ -475,6 +501,19 @@ impl File for HostFile {
         let tp = ts.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
         check(unsafe {
             libc::utimensat(self.fd.as_raw_fd(), c"".as_ptr(), tp, libc::AT_EMPTY_PATH)
+        })
+    }
+
+    fn fsetxattr(&self, name: &OsStr, value: &[u8], flags: i32) -> Result<(), Errno> {
+        let cname = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        check(unsafe {
+            libc::fsetxattr(
+                self.fd.as_raw_fd(),
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                flags,
+            )
         })
     }
 
@@ -1046,6 +1085,52 @@ mod tests {
         assert_eq!(
             fs.stat(Path::new("plain"), true).unwrap().file_type,
             FileType::Regular
+        );
+    }
+
+    /// Read back an xattr with the host getxattr, bypassing the Vfs.
+    fn host_getxattr(path: &Path, name: &CStr) -> Option<Vec<u8>> {
+        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut buf = [0u8; 64];
+        let n = unsafe {
+            libc::getxattr(
+                cpath.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        (n >= 0).then(|| buf[..n as usize].to_vec())
+    }
+
+    #[test]
+    fn setxattr_applies_value() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+
+        let file = fs
+            .open(
+                Path::new("f"),
+                OpenFlags(libc::O_CREAT | libc::O_RDWR),
+                Mode(0o644),
+            )
+            .unwrap();
+        let name = OsStr::new("user.chimera-test");
+        match fs.setxattr(Path::new("f"), true, name, b"v", 0) {
+            // A scratch filesystem without user xattrs cannot exercise this.
+            Err(e) if e == Errno(libc::ENOTSUP) => return,
+            r => r.unwrap(),
+        }
+        let host = scratch.path.join("f");
+        assert_eq!(
+            host_getxattr(&host, c"user.chimera-test").as_deref(),
+            Some(&b"v"[..])
+        );
+
+        file.fsetxattr(name, b"w", 0).unwrap();
+        assert_eq!(
+            host_getxattr(&host, c"user.chimera-test").as_deref(),
+            Some(&b"w"[..])
         );
     }
 

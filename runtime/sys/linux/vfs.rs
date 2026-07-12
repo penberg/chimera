@@ -29,7 +29,7 @@
 #![allow(dead_code)]
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
 };
 
@@ -96,6 +96,17 @@ pub trait Vfs: Send + Sync {
     /// `mknod(2)` takes them (zero type bits create a regular file); `dev` is
     /// meaningful only for device nodes.
     fn mknod(&self, path: &Path, mode: Mode, dev: u64) -> Result<(), Errno>;
+
+    /// Set an extended attribute. `flags` carries `XATTR_CREATE`/
+    /// `XATTR_REPLACE`.
+    fn setxattr(
+        &self,
+        path: &Path,
+        follow: bool,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+    ) -> Result<(), Errno>;
 
     /// Report filesystem-wide statistics for `statfs` by path.
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno>;
@@ -178,6 +189,9 @@ pub trait File: Send + Sync {
     fn utimensat_empty(&self, times: Option<[Timespec; 2]>) -> Result<(), Errno> {
         self.futimens(times)
     }
+
+    /// Set an extended attribute through the open handle (`fsetxattr`).
+    fn fsetxattr(&self, name: &OsStr, value: &[u8], flags: i32) -> Result<(), Errno>;
 
     /// Snapshot of a directory's entries, backing `getdents64` on a dirfd. The
     /// Personality encodes the snapshot into `linux_dirent64` records and keeps

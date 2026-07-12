@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #ifndef SYS_fchmodat2
@@ -54,6 +55,9 @@ static int rejected_arguments(const char *self) {
 
     if (mknod("", S_IFIFO | 0644, 0) == 0 || errno != ENOENT) return 10;
 
+    if (setxattr("", "user.chimera-test", "v", 1, 0) == 0 || errno != ENOENT)
+        return 93;
+
     if (stat(self, &after) != 0) return 91;
     if (before.st_mode != after.st_mode) return 92;
     return 0;
@@ -70,6 +74,8 @@ static int read_only_world(const char *self) {
     struct timespec ts[2] = {{12345, 0}, {54321, 0}};
     if (utimensat(AT_FDCWD, self, ts, 0) == 0 || errno != EROFS) return 15;
     if (mknod(scratch, S_IFIFO | 0644, 0) == 0 || errno != EROFS) return 23;
+    if (setxattr(self, "user.chimera-test", "v", 1, 0) == 0 || errno != EROFS)
+        return 24;
 
     // Fd forms on a read-only open of the same file.
     int fd = open(self, O_RDONLY);
@@ -77,6 +83,8 @@ static int read_only_world(const char *self) {
     if (fchmod(fd, 0600) == 0 || errno != EROFS) return 17;
     if (fchown(fd, (uid_t)-1, (gid_t)-1) == 0 || errno != EROFS) return 18;
     if (futimens(fd, ts) == 0 || errno != EROFS) return 19;
+    if (fsetxattr(fd, "user.chimera-test", "v", 1, 0) == 0 || errno != EROFS)
+        return 25;
     close(fd);
 
     // Nothing leaked through to the host.
@@ -132,6 +140,25 @@ static int writable_world(int fd) {
     unlink(dangling);
     if (symlink("nope", dangling) != 0) return 40;
     if (lchown(dangling, (uid_t)-1, (gid_t)-1) != 0) return 41;
+
+    // Xattrs roundtrip where the filesystem supports them. The user
+    // namespace is denied on a symlink with EPERM — not ENOENT, which
+    // proves the no-follow resolution reached the dangling link itself.
+    if (setxattr(scratch, "user.chimera-test", "v", 1, 0) == 0) {
+        char buf[8];
+        if (getxattr(scratch, "user.chimera-test", buf, sizeof(buf)) != 1 ||
+            buf[0] != 'v')
+            return 60;
+        if (fsetxattr(fd, "user.chimera-test", "w", 1, 0) != 0) return 61;
+        if (getxattr(scratch, "user.chimera-test", buf, sizeof(buf)) != 1 ||
+            buf[0] != 'w')
+            return 62;
+        if (lsetxattr(dangling, "user.chimera-test", "v", 1, 0) == 0 ||
+            errno != EPERM)
+            return 63;
+    } else if (errno != ENOTSUP) {
+        return 64;
+    }
 
     // mknod creates a FIFO the filesystem then reports as one; through a
     // trailing symlink — even a dangling one — it answers EEXIST instead.

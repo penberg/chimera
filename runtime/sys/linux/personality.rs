@@ -427,6 +427,15 @@ impl SystemCalls for Personality {
             }
             libc::SYS_mknod => self.mknod(libc::AT_FDCWD, a[0], a[1] as u32, a[2]),
             libc::SYS_mknodat => self.mknod(a[0] as i32, a[1], a[2] as u32, a[3]),
+            libc::SYS_setxattr => {
+                self.setxattr_path(a[0], a[1], a[2], a[3] as usize, a[4] as i32, true)
+            }
+            libc::SYS_lsetxattr => {
+                self.setxattr_path(a[0], a[1], a[2], a[3] as usize, a[4] as i32, false)
+            }
+            libc::SYS_fsetxattr if self.is_virtual(a[0] as i32) => {
+                self.fsetxattr(a[0] as i32, a[1], a[2], a[3] as usize, a[4] as i32)
+            }
 
             // --- metadata mutators not yet on the Vfs trait ---
             //
@@ -436,15 +445,12 @@ impl SystemCalls for Personality {
             // and otherwise let the host serve them (the only mount today is the
             // host root, so the guest path is the host path). Left unhandled they
             // would fall through to the host and mutate it under `--readonly`.
-            libc::SYS_setxattr
-            | libc::SYS_lsetxattr
-            | libc::SYS_removexattr
-            | libc::SYS_lremovexattr => {
+            libc::SYS_removexattr | libc::SYS_lremovexattr => {
                 let guard = self.guard_write_path(libc::AT_FDCWD, a[0]);
                 self.deny_ro_or_passthrough(call, guard, None);
                 return;
             }
-            libc::SYS_fsetxattr | libc::SYS_fremovexattr | libc::SYS_fallocate => {
+            libc::SYS_fremovexattr | libc::SYS_fallocate => {
                 let guard = self.guard_write_fd(a[0] as i32);
                 self.deny_ro_or_passthrough(call, guard, Some(0));
                 return;
@@ -1363,6 +1369,43 @@ impl Personality {
         // never follow the final component.
         let r = self.resolve_write(dirfd, pathptr, false)?;
         r.fs.mknod(&r.rel, Mode(mode), dev)?;
+        Ok(0)
+    }
+
+    fn setxattr_path(
+        &self,
+        pathptr: u64,
+        nameptr: u64,
+        valptr: u64,
+        len: usize,
+        flags: i32,
+        follow: bool,
+    ) -> Result<i64, Errno> {
+        let r = self.resolve_write(libc::AT_FDCWD, pathptr, follow)?;
+        let name = unsafe { read_cstr(nameptr) };
+        r.fs.setxattr(
+            &r.rel,
+            follow,
+            OsStr::from_bytes(&name),
+            guest(valptr, len),
+            flags,
+        )?;
+        Ok(0)
+    }
+
+    fn fsetxattr(
+        &self,
+        fd: i32,
+        nameptr: u64,
+        valptr: u64,
+        len: usize,
+        flags: i32,
+    ) -> Result<i64, Errno> {
+        self.guard_write_fd(fd)?;
+        let name = unsafe { read_cstr(nameptr) };
+        self.desc(fd)?
+            .file
+            .fsetxattr(OsStr::from_bytes(&name), guest(valptr, len), flags)?;
         Ok(0)
     }
 }
