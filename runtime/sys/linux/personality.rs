@@ -399,6 +399,20 @@ impl SystemCalls for Personality {
             libc::SYS_fchmod if self.is_virtual(a[0] as i32) => {
                 self.fchmod(a[0] as i32, a[1] as u32)
             }
+            libc::SYS_chown => self.chown_path(libc::AT_FDCWD, a[0], a[1] as u32, a[2] as u32, 0),
+            libc::SYS_lchown => self.chown_path(
+                libc::AT_FDCWD,
+                a[0],
+                a[1] as u32,
+                a[2] as u32,
+                libc::AT_SYMLINK_NOFOLLOW,
+            ),
+            libc::SYS_fchownat => {
+                self.chown_path(a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4] as i32)
+            }
+            libc::SYS_fchown if self.is_virtual(a[0] as i32) => {
+                self.fchown(a[0] as i32, a[1] as u32, a[2] as u32)
+            }
 
             // --- metadata mutators not yet on the Vfs trait ---
             //
@@ -408,9 +422,7 @@ impl SystemCalls for Personality {
             // and otherwise let the host serve them (the only mount today is the
             // host root, so the guest path is the host path). Left unhandled they
             // would fall through to the host and mutate it under `--readonly`.
-            libc::SYS_chown
-            | libc::SYS_lchown
-            | libc::SYS_utime
+            libc::SYS_utime
             | libc::SYS_utimes
             | libc::SYS_mknod
             | libc::SYS_setxattr
@@ -421,16 +433,13 @@ impl SystemCalls for Personality {
                 self.deny_ro_or_passthrough(call, guard, None);
                 return;
             }
-            libc::SYS_fchownat | libc::SYS_mknodat | libc::SYS_futimesat => {
+            libc::SYS_mknodat | libc::SYS_futimesat => {
                 let guard = self.guard_write_path(a[0] as i32, a[1]);
                 // Translate the dirfd if it is one of ours before forwarding.
                 self.deny_ro_or_passthrough(call, guard, Some(0));
                 return;
             }
-            libc::SYS_fchown
-            | libc::SYS_fsetxattr
-            | libc::SYS_fremovexattr
-            | libc::SYS_fallocate => {
+            libc::SYS_fsetxattr | libc::SYS_fremovexattr | libc::SYS_fallocate => {
                 let guard = self.guard_write_fd(a[0] as i32);
                 self.deny_ro_or_passthrough(call, guard, Some(0));
                 return;
@@ -1224,6 +1233,43 @@ impl Personality {
         self.desc(fd)?.file.fchmod(Mode(mode))?;
         Ok(0)
     }
+
+    fn chown_path(
+        &self,
+        dirfd: i32,
+        pathptr: u64,
+        uid: u32,
+        gid: u32,
+        flags: i32,
+    ) -> Result<i64, Errno> {
+        const ALLOWED: i32 = libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW;
+        if flags & !ALLOWED != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if pathptr == 0 {
+            return Err(Errno(libc::EFAULT));
+        }
+        let raw = unsafe { read_cstr(pathptr) };
+        // fchownat(fd, "", AT_EMPTY_PATH, …) targets the descriptor itself.
+        if flags & libc::AT_EMPTY_PATH != 0 && raw.is_empty() && self.is_virtual(dirfd) {
+            self.guard_write_fd(dirfd)?;
+            self.desc(dirfd)?.file.fchownat_empty(uid, gid)?;
+            return Ok(0);
+        }
+        if raw.is_empty() && flags & libc::AT_EMPTY_PATH == 0 {
+            return Err(Errno::ENOENT);
+        }
+        let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
+        let r = self.resolve_write_raw(dirfd, &raw, follow)?;
+        r.fs.chown(&r.rel, follow, uid, gid)?;
+        Ok(0)
+    }
+
+    fn fchown(&self, fd: i32, uid: u32, gid: u32) -> Result<i64, Errno> {
+        self.guard_write_fd(fd)?;
+        self.desc(fd)?.file.fchown(uid, gid)?;
+        Ok(0)
+    }
 }
 
 /// Write a `SyscallResult` into `call` from a `Result<i64, Errno>`.
@@ -1487,11 +1533,11 @@ mod tests {
         assert_eq!(personality.guard_write_fd(fd), Err(Errno::EROFS));
     }
 
-    /// `fchmodat2(fd, "", mode, AT_EMPTY_PATH)` targets the open inode, so it
-    /// must land on the file the descriptor was opened on even after the path
-    /// is renamed away and replaced — not on the path's new occupant.
+    /// The `AT_EMPTY_PATH` forms target the open inode, so they must land on
+    /// the file the descriptor was opened on even after the path is renamed
+    /// away and replaced — not on the path's new occupant.
     #[test]
-    fn empty_path_chmod_targets_opath_file_after_replacement() {
+    fn empty_path_operations_target_opath_file_after_replacement() {
         let scratch = Scratch::new();
         let personality = scratch.personality(MountFlags::NONE);
         let target = scratch.0.join("target");
@@ -1505,6 +1551,15 @@ mod tests {
 
         personality
             .chmod_path(fd, c"".as_ptr() as u64, 0o640, libc::AT_EMPTY_PATH)
+            .unwrap();
+        personality
+            .chown_path(
+                fd,
+                c"".as_ptr() as u64,
+                u32::MAX,
+                u32::MAX,
+                libc::AT_EMPTY_PATH,
+            )
             .unwrap();
 
         assert_eq!(

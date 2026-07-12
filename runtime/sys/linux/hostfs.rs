@@ -287,6 +287,16 @@ impl Vfs for HostFs {
         check(r)
     }
 
+    fn chown(&self, path: &Path, follow: bool, uid: u32, gid: u32) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        let r = if follow {
+            unsafe { libc::chown(cpath.as_ptr(), uid, gid) }
+        } else {
+            unsafe { libc::lchown(cpath.as_ptr(), uid, gid) }
+        };
+        check(r)
+    }
+
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno> {
         let fd = self.open_in_root(path, libc::O_PATH, 0)?;
         Ok(statfs_to_statfs(&raw_fstatfs(fd.as_raw_fd())?))
@@ -417,6 +427,22 @@ impl File for HostFile {
                 mode.0 as libc::mode_t,
                 libc::AT_EMPTY_PATH,
             ) as libc::c_int
+        })
+    }
+
+    fn fchown(&self, uid: u32, gid: u32) -> Result<(), Errno> {
+        check(unsafe { libc::fchown(self.fd.as_raw_fd(), uid, gid) })
+    }
+
+    fn fchownat_empty(&self, uid: u32, gid: u32) -> Result<(), Errno> {
+        check(unsafe {
+            libc::fchownat(
+                self.fd.as_raw_fd(),
+                c"".as_ptr(),
+                uid,
+                gid,
+                libc::AT_EMPTY_PATH,
+            )
         })
     }
 
@@ -898,6 +924,30 @@ mod tests {
                 & 0o7777,
             0o640
         );
+    }
+
+    /// `-1`/`-1` (leave both ids unchanged) must succeed for an unprivileged
+    /// owner — it is the only chown an unprivileged test can rely on.
+    #[test]
+    fn chown_unchanged_ids_is_permitted() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+
+        let file = fs
+            .open(
+                Path::new("f"),
+                OpenFlags(libc::O_CREAT | libc::O_WRONLY),
+                Mode(0o644),
+            )
+            .unwrap();
+        fs.chown(Path::new("f"), true, u32::MAX, u32::MAX).unwrap();
+        file.fchown(u32::MAX, u32::MAX).unwrap();
+
+        // The no-follow form names a dangling symlink itself.
+        fs.symlink(Path::new("nope"), Path::new("dangling"))
+            .unwrap();
+        fs.chown(Path::new("dangling"), false, u32::MAX, u32::MAX)
+            .unwrap();
     }
 
     #[test]

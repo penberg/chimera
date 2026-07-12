@@ -39,8 +39,13 @@ static int rejected_arguments(const char *self) {
         (errno != EINVAL && errno != ENOSYS))
         return 4;
 
-    if (stat(self, &after) != 0) return 5;
-    if (before.st_mode != after.st_mode) return 6;
+    if (chown("", (uid_t)-1, (gid_t)-1) == 0 || errno != ENOENT) return 5;
+    if (syscall(SYS_fchownat, AT_FDCWD, self, -1, -1, AT_REMOVEDIR) == 0 ||
+        errno != EINVAL)
+        return 6;
+
+    if (stat(self, &after) != 0) return 7;
+    if (before.st_mode != after.st_mode) return 8;
     return 0;
 }
 
@@ -50,16 +55,19 @@ static int read_only_world(const char *self) {
 
     // Path forms: each must be denied with EROFS, not forwarded.
     if (chmod(self, 0600) == 0 || errno != EROFS) return 12;
+    if (chown(self, (uid_t)-1, (gid_t)-1) == 0 || errno != EROFS) return 13;
+    if (lchown(self, (uid_t)-1, (gid_t)-1) == 0 || errno != EROFS) return 14;
 
     // Fd forms on a read-only open of the same file.
     int fd = open(self, O_RDONLY);
-    if (fd < 0) return 13;
-    if (fchmod(fd, 0600) == 0 || errno != EROFS) return 14;
+    if (fd < 0) return 15;
+    if (fchmod(fd, 0600) == 0 || errno != EROFS) return 16;
+    if (fchown(fd, (uid_t)-1, (gid_t)-1) == 0 || errno != EROFS) return 17;
     close(fd);
 
     // Nothing leaked through to the host.
-    if (stat(self, &after) != 0) return 15;
-    if (after.st_mode != before.st_mode) return 16;
+    if (stat(self, &after) != 0) return 18;
+    if (after.st_mode != before.st_mode) return 19;
     return 0;
 }
 
@@ -69,24 +77,35 @@ static int writable_world(int fd) {
     // Fd forms, observed through fstat on the same descriptor.
     if (fchmod(fd, 0640) != 0) return 31;
     if (fstat(fd, &st) != 0 || (st.st_mode & 07777) != 0640) return 32;
+    if (fchown(fd, (uid_t)-1, (gid_t)-1) != 0) return 33;
 
     // Path forms, observed through stat by path.
-    if (chmod(scratch, 0600) != 0) return 33;
-    if (stat(scratch, &st) != 0 || (st.st_mode & 07777) != 0600) return 34;
+    if (chmod(scratch, 0600) != 0) return 34;
+    if (stat(scratch, &st) != 0 || (st.st_mode & 07777) != 0600) return 35;
+    if (chown(scratch, (uid_t)-1, (gid_t)-1) != 0) return 36;
 
     // No-follow chmod of a symlink answers EOPNOTSUPP the way the kernel
     // does, leaving the target alone (ENOSYS: pre-6.6 native kernel).
     char link[sizeof(scratch) + 8];
     snprintf(link, sizeof(link), "%s.link", scratch);
     unlink(link);
-    if (symlink(scratch, link) != 0) return 35;
+    if (symlink(scratch, link) != 0) return 37;
     errno = 0;
     if (syscall(SYS_fchmodat2, AT_FDCWD, link, 0400, AT_SYMLINK_NOFOLLOW) ==
             0 ||
         (errno != EOPNOTSUPP && errno != ENOSYS))
-        return 36;
-    if (stat(scratch, &st) != 0 || (st.st_mode & 07777) != 0600) return 37;
+        return 38;
+    if (stat(scratch, &st) != 0 || (st.st_mode & 07777) != 0600) return 39;
     unlink(link);
+
+    // The l-variants name a final symlink itself, so they work even on a
+    // dangling one.
+    char dangling[sizeof(scratch) + 12];
+    snprintf(dangling, sizeof(dangling), "%s.dangling", scratch);
+    unlink(dangling);
+    if (symlink("nope", dangling) != 0) return 40;
+    if (lchown(dangling, (uid_t)-1, (gid_t)-1) != 0) return 41;
+    unlink(dangling);
 
     close(fd);
     unlink(scratch);

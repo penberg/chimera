@@ -81,6 +81,10 @@ pub trait Vfs: Send + Sync {
     /// final symlink with `EOPNOTSUPP`, as `fchmodat2(AT_SYMLINK_NOFOLLOW)` does.
     fn chmod(&self, path: &Path, follow: bool, mode: Mode) -> Result<(), Errno>;
 
+    /// Change a file's ownership. `follow == false` is `lchown` semantics. An
+    /// id of `u32::MAX` (the kernel's `-1`) leaves that id unchanged.
+    fn chown(&self, path: &Path, follow: bool, uid: u32, gid: u32) -> Result<(), Errno>;
+
     /// Report filesystem-wide statistics for `statfs` by path.
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno>;
 
@@ -143,6 +147,15 @@ pub trait File: Send + Sync {
     /// `O_PATH` handle.
     fn fchmodat_empty(&self, mode: Mode) -> Result<(), Errno> {
         self.fchmod(mode)
+    }
+
+    /// `chown` through the open handle (`fchown`). `u32::MAX` leaves an id
+    /// unchanged, as in [`Vfs::chown`].
+    fn fchown(&self, uid: u32, gid: u32) -> Result<(), Errno>;
+
+    /// `fchownat(fd, "", uid, gid, AT_EMPTY_PATH)`, including `O_PATH`.
+    fn fchownat_empty(&self, uid: u32, gid: u32) -> Result<(), Errno> {
+        self.fchown(uid, gid)
     }
 
     /// Snapshot of a directory's entries, backing `getdents64` on a dirfd. The
