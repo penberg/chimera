@@ -436,21 +436,16 @@ impl SystemCalls for Personality {
             libc::SYS_fsetxattr if self.is_virtual(a[0] as i32) => {
                 self.fsetxattr(a[0] as i32, a[1], a[2], a[3] as usize, a[4] as i32)
             }
-
-            // --- metadata mutators not yet on the Vfs trait ---
-            //
-            // These change a file's attributes rather than its path or contents.
-            // The Vfs trait has no methods for them yet, but they must still
-            // honor the read-only mount: deny on a read-only mount with EROFS,
-            // and otherwise let the host serve them (the only mount today is the
-            // host root, so the guest path is the host path). Left unhandled they
-            // would fall through to the host and mutate it under `--readonly`.
-            libc::SYS_removexattr | libc::SYS_lremovexattr => {
-                let guard = self.guard_write_path(libc::AT_FDCWD, a[0]);
-                self.deny_ro_or_passthrough(call, guard, None);
-                return;
+            libc::SYS_removexattr => self.removexattr_path(a[0], a[1], true),
+            libc::SYS_lremovexattr => self.removexattr_path(a[0], a[1], false),
+            libc::SYS_fremovexattr if self.is_virtual(a[0] as i32) => {
+                self.fremovexattr(a[0] as i32, a[1])
             }
-            libc::SYS_fremovexattr | libc::SYS_fallocate => {
+
+            // fallocate is the last attribute mutator not yet on the Vfs
+            // trait; it must still honor the read-only mount before the host
+            // serves it.
+            libc::SYS_fallocate => {
                 let guard = self.guard_write_fd(a[0] as i32);
                 self.deny_ro_or_passthrough(call, guard, Some(0));
                 return;
@@ -595,14 +590,6 @@ impl Personality {
             return Err(Errno::EROFS);
         }
         Ok(r)
-    }
-
-    /// [`resolve_write`] for the passthrough arms, which need only the verdict.
-    ///
-    /// [`resolve_write`]: Self::resolve_write
-    fn guard_write_path(&self, dirfd: i32, pathptr: u64) -> Result<(), Errno> {
-        let raw = unsafe { read_cstr(pathptr) };
-        self.resolve_write_raw(dirfd, &raw, true).map(|_| ())
     }
 
     /// The same check for an fd mutator, using the mount policy captured when
@@ -1406,6 +1393,20 @@ impl Personality {
         self.desc(fd)?
             .file
             .fsetxattr(OsStr::from_bytes(&name), guest(valptr, len), flags)?;
+        Ok(0)
+    }
+
+    fn removexattr_path(&self, pathptr: u64, nameptr: u64, follow: bool) -> Result<i64, Errno> {
+        let r = self.resolve_write(libc::AT_FDCWD, pathptr, follow)?;
+        let name = unsafe { read_cstr(nameptr) };
+        r.fs.removexattr(&r.rel, follow, OsStr::from_bytes(&name))?;
+        Ok(0)
+    }
+
+    fn fremovexattr(&self, fd: i32, nameptr: u64) -> Result<i64, Errno> {
+        self.guard_write_fd(fd)?;
+        let name = unsafe { read_cstr(nameptr) };
+        self.desc(fd)?.file.fremovexattr(OsStr::from_bytes(&name))?;
         Ok(0)
     }
 }

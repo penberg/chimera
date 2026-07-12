@@ -108,6 +108,9 @@ pub trait Vfs: Send + Sync {
         flags: i32,
     ) -> Result<(), Errno>;
 
+    /// Remove an extended attribute.
+    fn removexattr(&self, path: &Path, follow: bool, name: &OsStr) -> Result<(), Errno>;
+
     /// Report filesystem-wide statistics for `statfs` by path.
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno>;
 
@@ -192,6 +195,9 @@ pub trait File: Send + Sync {
 
     /// Set an extended attribute through the open handle (`fsetxattr`).
     fn fsetxattr(&self, name: &OsStr, value: &[u8], flags: i32) -> Result<(), Errno>;
+
+    /// Remove an extended attribute through the open handle (`fremovexattr`).
+    fn fremovexattr(&self, name: &OsStr) -> Result<(), Errno>;
 
     /// Snapshot of a directory's entries, backing `getdents64` on a dirfd. The
     /// Personality encodes the snapshot into `linux_dirent64` records and keeps

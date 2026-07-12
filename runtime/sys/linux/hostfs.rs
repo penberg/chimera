@@ -341,6 +341,17 @@ impl Vfs for HostFs {
         })
     }
 
+    fn removexattr(&self, path: &Path, follow: bool, name: &OsStr) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        let cname = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let f = if follow {
+            libc::removexattr
+        } else {
+            libc::lremovexattr
+        };
+        check(unsafe { f(cpath.as_ptr(), cname.as_ptr()) })
+    }
+
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno> {
         let fd = self.open_in_root(path, libc::O_PATH, 0)?;
         Ok(statfs_to_statfs(&raw_fstatfs(fd.as_raw_fd())?))
@@ -515,6 +526,11 @@ impl File for HostFile {
                 flags,
             )
         })
+    }
+
+    fn fremovexattr(&self, name: &OsStr) -> Result<(), Errno> {
+        let cname = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        check(unsafe { libc::fremovexattr(self.fd.as_raw_fd(), cname.as_ptr()) })
     }
 
     fn host_fd(&self) -> Option<libc::c_int> {
@@ -1104,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn setxattr_applies_value() {
+    fn xattr_roundtrip() {
         let scratch = Scratch::new();
         let fs = fs(&scratch);
 
@@ -1132,6 +1148,17 @@ mod tests {
             host_getxattr(&host, c"user.chimera-test").as_deref(),
             Some(&b"w"[..])
         );
+
+        fs.removexattr(Path::new("f"), true, name).unwrap();
+        assert_eq!(host_getxattr(&host, c"user.chimera-test"), None);
+        assert_eq!(
+            fs.removexattr(Path::new("f"), true, name).unwrap_err(),
+            Errno(libc::ENODATA)
+        );
+
+        file.fsetxattr(name, b"x", 0).unwrap();
+        file.fremovexattr(name).unwrap();
+        assert_eq!(file.fremovexattr(name).unwrap_err(), Errno(libc::ENODATA));
     }
 
     #[test]

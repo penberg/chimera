@@ -76,6 +76,8 @@ static int read_only_world(const char *self) {
     if (mknod(scratch, S_IFIFO | 0644, 0) == 0 || errno != EROFS) return 23;
     if (setxattr(self, "user.chimera-test", "v", 1, 0) == 0 || errno != EROFS)
         return 24;
+    if (removexattr(self, "user.chimera-test") == 0 || errno != EROFS)
+        return 26;
 
     // Fd forms on a read-only open of the same file.
     int fd = open(self, O_RDONLY);
@@ -85,6 +87,8 @@ static int read_only_world(const char *self) {
     if (futimens(fd, ts) == 0 || errno != EROFS) return 19;
     if (fsetxattr(fd, "user.chimera-test", "v", 1, 0) == 0 || errno != EROFS)
         return 25;
+    if (fremovexattr(fd, "user.chimera-test") == 0 || errno != EROFS)
+        return 27;
     close(fd);
 
     // Nothing leaked through to the host.
@@ -156,6 +160,12 @@ static int writable_world(int fd) {
         if (lsetxattr(dangling, "user.chimera-test", "v", 1, 0) == 0 ||
             errno != EPERM)
             return 63;
+        if (removexattr(scratch, "user.chimera-test") != 0) return 65;
+        if (removexattr(scratch, "user.chimera-test") == 0 ||
+            errno != ENODATA)
+            return 66;
+        if (fsetxattr(fd, "user.chimera-test", "x", 1, 0) != 0) return 67;
+        if (fremovexattr(fd, "user.chimera-test") != 0) return 68;
     } else if (errno != ENOTSUP) {
         return 64;
     }
