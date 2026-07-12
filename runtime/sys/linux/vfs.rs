@@ -143,6 +143,14 @@ pub trait Vfs: Send + Sync {
     fn confines(&self) -> bool {
         false
     }
+
+    /// Re-resolve any host state this filesystem anchored at construction.
+    /// A guest with mount privileges (a user namespace) reshapes its kernel
+    /// view — bwrap mounts a tmpfs and `pivot_root`s into it — and a root
+    /// handle pinned before that reshaping keeps serving the old view. The
+    /// Personality calls this after every mount-table-changing passthrough
+    /// syscall succeeds. Default: nothing anchored, nothing to do.
+    fn reanchor(&self) {}
 }
 
 /// One open file or directory. Positional: there is no internal cursor, so the
