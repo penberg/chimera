@@ -85,6 +85,13 @@ pub trait Vfs: Send + Sync {
     /// id of `u32::MAX` (the kernel's `-1`) leaves that id unchanged.
     fn chown(&self, path: &Path, follow: bool, uid: u32, gid: u32) -> Result<(), Errno>;
 
+    /// Set access and modification times. `None` sets both to now; otherwise
+    /// the pair is `[atime, mtime]`, whose `nsec` fields may carry the
+    /// kernel's `UTIME_NOW`/`UTIME_OMIT` specials, honored as `utimensat(2)`
+    /// does. `follow == false` names a final symlink itself.
+    fn utimens(&self, path: &Path, follow: bool, times: Option<[Timespec; 2]>)
+    -> Result<(), Errno>;
+
     /// Report filesystem-wide statistics for `statfs` by path.
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno>;
 
@@ -156,6 +163,15 @@ pub trait File: Send + Sync {
     /// `fchownat(fd, "", uid, gid, AT_EMPTY_PATH)`, including `O_PATH`.
     fn fchownat_empty(&self, uid: u32, gid: u32) -> Result<(), Errno> {
         self.fchown(uid, gid)
+    }
+
+    /// Set times through the open handle (`futimens`); `times` as in
+    /// [`Vfs::utimens`].
+    fn futimens(&self, times: Option<[Timespec; 2]>) -> Result<(), Errno>;
+
+    /// `utimensat(fd, "", times, AT_EMPTY_PATH)`, including `O_PATH`.
+    fn utimensat_empty(&self, times: Option<[Timespec; 2]>) -> Result<(), Errno> {
+        self.futimens(times)
     }
 
     /// Snapshot of a directory's entries, backing `getdents64` on a dirfd. The

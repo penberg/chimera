@@ -413,6 +413,18 @@ impl SystemCalls for Personality {
             libc::SYS_fchown if self.is_virtual(a[0] as i32) => {
                 self.fchown(a[0] as i32, a[1] as u32, a[2] as u32)
             }
+            libc::SYS_utime => self.utime(a[0], a[1]),
+            libc::SYS_utimes => self.utimes(libc::AT_FDCWD, a[0], a[1]),
+            // futimesat(fd, NULL, …) targets the descriptor itself; that form
+            // on a host fd falls through to the host below.
+            libc::SYS_futimesat if a[1] != 0 || self.is_virtual(a[0] as i32) => {
+                self.utimes(a[0] as i32, a[1], a[2])
+            }
+            // utimensat(fd, NULL, …) targets the descriptor itself; that form
+            // on a host fd falls through to the host below.
+            libc::SYS_utimensat if a[1] != 0 || self.is_virtual(a[0] as i32) => {
+                self.utimensat(a[0] as i32, a[1], a[2], a[3] as i32)
+            }
 
             // --- metadata mutators not yet on the Vfs trait ---
             //
@@ -422,9 +434,7 @@ impl SystemCalls for Personality {
             // and otherwise let the host serve them (the only mount today is the
             // host root, so the guest path is the host path). Left unhandled they
             // would fall through to the host and mutate it under `--readonly`.
-            libc::SYS_utime
-            | libc::SYS_utimes
-            | libc::SYS_mknod
+            libc::SYS_mknod
             | libc::SYS_setxattr
             | libc::SYS_lsetxattr
             | libc::SYS_removexattr
@@ -433,7 +443,7 @@ impl SystemCalls for Personality {
                 self.deny_ro_or_passthrough(call, guard, None);
                 return;
             }
-            libc::SYS_mknodat | libc::SYS_futimesat => {
+            libc::SYS_mknodat => {
                 let guard = self.guard_write_path(a[0] as i32, a[1]);
                 // Translate the dirfd if it is one of ours before forwarding.
                 self.deny_ro_or_passthrough(call, guard, Some(0));
@@ -442,16 +452,6 @@ impl SystemCalls for Personality {
             libc::SYS_fsetxattr | libc::SYS_fremovexattr | libc::SYS_fallocate => {
                 let guard = self.guard_write_fd(a[0] as i32);
                 self.deny_ro_or_passthrough(call, guard, Some(0));
-                return;
-            }
-            libc::SYS_utimensat => {
-                // utimensat(dirfd, NULL, …) targets the dirfd itself.
-                let (guard, fd_arg) = if a[1] == 0 {
-                    (self.guard_write_fd(a[0] as i32), Some(0))
-                } else {
-                    (self.guard_write_path(a[0] as i32, a[1]), Some(0))
-                };
-                self.deny_ro_or_passthrough(call, guard, fd_arg);
                 return;
             }
 
@@ -576,6 +576,17 @@ impl Personality {
     /// Resolve a path mutator's target and reject it with `EROFS` if it lands on
     /// a read-only mount. Path-resolution errors (`ENOENT`, `ELOOP`, …) carry
     /// through unchanged.
+    fn resolve_write(&self, dirfd: i32, pathptr: u64, follow: bool) -> Result<Resolved, Errno> {
+        if pathptr == 0 {
+            return Err(Errno(libc::EFAULT));
+        }
+        let raw = unsafe { read_cstr(pathptr) };
+        if raw.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        self.resolve_write_raw(dirfd, &raw, follow)
+    }
+
     fn resolve_write_raw(&self, dirfd: i32, raw: &[u8], follow: bool) -> Result<Resolved, Errno> {
         let abs = self.abs_path(dirfd, raw)?;
         let r = self.ns.resolve(&abs, follow)?;
@@ -1270,6 +1281,87 @@ impl Personality {
         self.desc(fd)?.file.fchown(uid, gid)?;
         Ok(0)
     }
+
+    fn utime(&self, pathptr: u64, bufptr: u64) -> Result<i64, Errno> {
+        // struct utimbuf: [actime, modtime] in whole seconds; NULL = both now.
+        let times = if bufptr == 0 {
+            None
+        } else {
+            let b = unsafe { ptr::read(bufptr as *const [libc::time_t; 2]) };
+            Some(b.map(|sec| Timespec { sec, nsec: 0 }))
+        };
+        self.utimens_path(libc::AT_FDCWD, pathptr, times, true)
+    }
+
+    fn utimes(&self, dirfd: i32, pathptr: u64, tvptr: u64) -> Result<i64, Errno> {
+        let times = if tvptr == 0 {
+            None
+        } else {
+            let tv = unsafe { ptr::read(tvptr as *const [libc::timeval; 2]) };
+            if tv.iter().any(|t| !(0..1_000_000).contains(&t.tv_usec)) {
+                return Err(Errno::EINVAL);
+            }
+            Some(tv.map(|t| Timespec {
+                sec: t.tv_sec,
+                nsec: t.tv_usec * 1000,
+            }))
+        };
+        if pathptr == 0 {
+            self.guard_write_fd(dirfd)?;
+            self.desc(dirfd)?.file.futimens(times)?;
+            return Ok(0);
+        }
+        self.utimens_path(dirfd, pathptr, times, true)
+    }
+
+    fn utimensat(&self, dirfd: i32, pathptr: u64, tsptr: u64, flags: i32) -> Result<i64, Errno> {
+        const ALLOWED: i32 = libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW;
+        if flags & !ALLOWED != 0 || pathptr == 0 && flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let times = if tsptr == 0 {
+            None
+        } else {
+            let ts = unsafe { ptr::read(tsptr as *const [libc::timespec; 2]) };
+            Some(ts.map(|t| Timespec {
+                sec: t.tv_sec,
+                nsec: t.tv_nsec,
+            }))
+        };
+        if pathptr == 0 {
+            // utimensat(fd, NULL, …): the fd names the file.
+            self.guard_write_fd(dirfd)?;
+            self.desc(dirfd)?.file.futimens(times)?;
+            return Ok(0);
+        }
+        let raw = unsafe { read_cstr(pathptr) };
+        if raw.is_empty() {
+            if flags & libc::AT_EMPTY_PATH == 0 {
+                return Err(Errno::ENOENT);
+            }
+            if self.is_virtual(dirfd) {
+                self.guard_write_fd(dirfd)?;
+                self.desc(dirfd)?.file.utimensat_empty(times)?;
+                return Ok(0);
+            }
+        }
+        let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
+        let r = self.resolve_write_raw(dirfd, &raw, follow)?;
+        r.fs.utimens(&r.rel, follow, times)?;
+        Ok(0)
+    }
+
+    fn utimens_path(
+        &self,
+        dirfd: i32,
+        pathptr: u64,
+        times: Option<[Timespec; 2]>,
+        follow: bool,
+    ) -> Result<i64, Errno> {
+        let r = self.resolve_write(dirfd, pathptr, follow)?;
+        r.fs.utimens(&r.rel, follow, times)?;
+        Ok(0)
+    }
 }
 
 /// Write a `SyscallResult` into `call` from a `Result<i64, Errno>`.
@@ -1458,7 +1550,7 @@ fn dirent_type(t: FileType) -> u8 {
 #[cfg(test)]
 mod tests {
     use std::{
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{MetadataExt, PermissionsExt},
         sync::{
             Arc,
             atomic::{AtomicU32, Ordering},
@@ -1545,6 +1637,7 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
 
         let fd = scratch.open(&personality, c"/target", libc::O_PATH);
+        let fd_ro = scratch.open(&personality, c"/target", libc::O_RDONLY);
         std::fs::rename(&target, &moved).unwrap();
         std::fs::write(&target, b"replacement").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1561,11 +1654,44 @@ mod tests {
                 libc::AT_EMPTY_PATH,
             )
             .unwrap();
+        let empty_times = [libc::timespec {
+            tv_sec: 111,
+            tv_nsec: 0,
+        }; 2];
+        personality
+            .utimensat(
+                fd,
+                c"".as_ptr() as u64,
+                empty_times.as_ptr() as u64,
+                libc::AT_EMPTY_PATH,
+            )
+            .unwrap();
 
+        // utimes(fd, NULL-path, …) likewise names the descriptor itself — but
+        // only through a regular descriptor: the kernel's NULL-path form
+        // rejects an O_PATH handle with EBADF (fdget refuses FMODE_PATH),
+        // unlike the AT_EMPTY_PATH form above.
+        let null_times = [
+            libc::timeval {
+                tv_sec: 222,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: 333,
+                tv_usec: 0,
+            },
+        ];
         assert_eq!(
-            std::fs::metadata(&moved).unwrap().permissions().mode() & 0o7777,
-            0o640
+            personality.utimes(fd, 0, null_times.as_ptr() as u64),
+            Err(Errno(libc::EBADF))
         );
+        personality
+            .utimes(fd_ro, 0, null_times.as_ptr() as u64)
+            .unwrap();
+
+        let moved_stat = std::fs::metadata(&moved).unwrap();
+        assert_eq!(moved_stat.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(moved_stat.mtime(), 333);
         assert_eq!(
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
             0o600

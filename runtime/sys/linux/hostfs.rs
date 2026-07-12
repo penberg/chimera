@@ -297,6 +297,19 @@ impl Vfs for HostFs {
         check(r)
     }
 
+    fn utimens(
+        &self,
+        path: &Path,
+        follow: bool,
+        times: Option<[Timespec; 2]>,
+    ) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        let ts = times.map(|t| t.map(to_timespec));
+        let tp = ts.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
+        let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+        check(unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), tp, flags) })
+    }
+
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno> {
         let fd = self.open_in_root(path, libc::O_PATH, 0)?;
         Ok(statfs_to_statfs(&raw_fstatfs(fd.as_raw_fd())?))
@@ -446,6 +459,20 @@ impl File for HostFile {
         })
     }
 
+    fn futimens(&self, times: Option<[Timespec; 2]>) -> Result<(), Errno> {
+        let ts = times.map(|t| t.map(to_timespec));
+        let tp = ts.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
+        check(unsafe { libc::futimens(self.fd.as_raw_fd(), tp) })
+    }
+
+    fn utimensat_empty(&self, times: Option<[Timespec; 2]>) -> Result<(), Errno> {
+        let ts = times.map(|t| t.map(to_timespec));
+        let tp = ts.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
+        check(unsafe {
+            libc::utimensat(self.fd.as_raw_fd(), c"".as_ptr(), tp, libc::AT_EMPTY_PATH)
+        })
+    }
+
     fn host_fd(&self) -> Option<libc::c_int> {
         Some(self.fd.as_raw_fd())
     }
@@ -551,6 +578,14 @@ fn crel(path: &Path) -> Result<CString, Errno> {
         bytes
     })
     .map_err(|_| Errno::EINVAL)
+}
+
+/// A symbolic [`Timespec`] as the C struct, `UTIME_*` specials intact.
+fn to_timespec(t: Timespec) -> libc::timespec {
+    libc::timespec {
+        tv_sec: t.sec,
+        tv_nsec: t.nsec,
+    }
 }
 
 /// Map a libc return of `-1` to the current errno, anything else to `Ok`.
@@ -948,6 +983,45 @@ mod tests {
             .unwrap();
         fs.chown(Path::new("dangling"), false, u32::MAX, u32::MAX)
             .unwrap();
+    }
+
+    #[test]
+    fn utimens_sets_explicit_times() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+
+        let file = fs
+            .open(
+                Path::new("f"),
+                OpenFlags(libc::O_CREAT | libc::O_RDWR),
+                Mode(0o644),
+            )
+            .unwrap();
+        let times = [
+            Timespec { sec: 111, nsec: 0 },
+            Timespec { sec: 222, nsec: 0 },
+        ];
+        fs.utimens(Path::new("f"), true, Some(times)).unwrap();
+        let st = fs.stat(Path::new("f"), true).unwrap();
+        assert_eq!(st.atime.sec, 111);
+        assert_eq!(st.mtime.sec, 222);
+
+        let times = [
+            Timespec { sec: 333, nsec: 0 },
+            Timespec { sec: 444, nsec: 0 },
+        ];
+        file.futimens(Some(times)).unwrap();
+        assert_eq!(file.fstat().unwrap().mtime.sec, 444);
+
+        // The no-follow form stamps a symlink itself, not its target.
+        fs.symlink(Path::new("f"), Path::new("link")).unwrap();
+        let times = [
+            Timespec { sec: 555, nsec: 0 },
+            Timespec { sec: 666, nsec: 0 },
+        ];
+        fs.utimens(Path::new("link"), false, Some(times)).unwrap();
+        assert_eq!(fs.stat(Path::new("link"), false).unwrap().mtime.sec, 666);
+        assert_eq!(fs.stat(Path::new("f"), true).unwrap().mtime.sec, 444);
     }
 
     #[test]

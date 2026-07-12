@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #ifndef SYS_fchmodat2
@@ -44,8 +45,15 @@ static int rejected_arguments(const char *self) {
         errno != EINVAL)
         return 6;
 
-    if (stat(self, &after) != 0) return 7;
-    if (before.st_mode != after.st_mode) return 8;
+    if (utimes("", NULL) == 0 || errno != ENOENT) return 7;
+    if (syscall(SYS_utimensat, AT_FDCWD, self, NULL, AT_REMOVEDIR) == 0 ||
+        errno != EINVAL)
+        return 8;
+    struct timeval invalid_tv[2] = {{0, 1000000}, {0, 0}};
+    if (syscall(SYS_utimes, self, invalid_tv) == 0 || errno != EINVAL) return 9;
+
+    if (stat(self, &after) != 0) return 91;
+    if (before.st_mode != after.st_mode) return 92;
     return 0;
 }
 
@@ -57,17 +65,21 @@ static int read_only_world(const char *self) {
     if (chmod(self, 0600) == 0 || errno != EROFS) return 12;
     if (chown(self, (uid_t)-1, (gid_t)-1) == 0 || errno != EROFS) return 13;
     if (lchown(self, (uid_t)-1, (gid_t)-1) == 0 || errno != EROFS) return 14;
+    struct timespec ts[2] = {{12345, 0}, {54321, 0}};
+    if (utimensat(AT_FDCWD, self, ts, 0) == 0 || errno != EROFS) return 15;
 
     // Fd forms on a read-only open of the same file.
     int fd = open(self, O_RDONLY);
-    if (fd < 0) return 15;
-    if (fchmod(fd, 0600) == 0 || errno != EROFS) return 16;
-    if (fchown(fd, (uid_t)-1, (gid_t)-1) == 0 || errno != EROFS) return 17;
+    if (fd < 0) return 16;
+    if (fchmod(fd, 0600) == 0 || errno != EROFS) return 17;
+    if (fchown(fd, (uid_t)-1, (gid_t)-1) == 0 || errno != EROFS) return 18;
+    if (futimens(fd, ts) == 0 || errno != EROFS) return 19;
     close(fd);
 
     // Nothing leaked through to the host.
-    if (stat(self, &after) != 0) return 18;
-    if (after.st_mode != before.st_mode) return 19;
+    if (stat(self, &after) != 0) return 20;
+    if (after.st_mode != before.st_mode) return 21;
+    if (after.st_mtim.tv_sec != before.st_mtim.tv_sec) return 22;
     return 0;
 }
 
@@ -78,11 +90,23 @@ static int writable_world(int fd) {
     if (fchmod(fd, 0640) != 0) return 31;
     if (fstat(fd, &st) != 0 || (st.st_mode & 07777) != 0640) return 32;
     if (fchown(fd, (uid_t)-1, (gid_t)-1) != 0) return 33;
+    struct timespec fts[2] = {{111, 0}, {222, 0}};
+    if (futimens(fd, fts) != 0) return 51;
+    if (fstat(fd, &st) != 0 || st.st_mtim.tv_sec != 222) return 52;
+    // UTIME_OMIT holds one timestamp while the other moves.
+    struct timespec omit[2] = {{0, UTIME_NOW}, {0, UTIME_OMIT}};
+    if (futimens(fd, omit) != 0) return 53;
+    if (fstat(fd, &st) != 0 || st.st_mtim.tv_sec != 222) return 54;
 
     // Path forms, observed through stat by path.
     if (chmod(scratch, 0600) != 0) return 34;
     if (stat(scratch, &st) != 0 || (st.st_mode & 07777) != 0600) return 35;
     if (chown(scratch, (uid_t)-1, (gid_t)-1) != 0) return 36;
+    struct timespec ts[2] = {{12345, 0}, {54321, 0}};
+    if (utimensat(AT_FDCWD, scratch, ts, 0) != 0) return 55;
+    if (stat(scratch, &st) != 0 || st.st_atim.tv_sec != 12345 ||
+        st.st_mtim.tv_sec != 54321)
+        return 56;
 
     // No-follow chmod of a symlink answers EOPNOTSUPP the way the kernel
     // does, leaving the target alone (ENOSYS: pre-6.6 native kernel).
