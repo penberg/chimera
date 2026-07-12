@@ -425,6 +425,8 @@ impl SystemCalls for Personality {
             libc::SYS_utimensat if a[1] != 0 || self.is_virtual(a[0] as i32) => {
                 self.utimensat(a[0] as i32, a[1], a[2], a[3] as i32)
             }
+            libc::SYS_mknod => self.mknod(libc::AT_FDCWD, a[0], a[1] as u32, a[2]),
+            libc::SYS_mknodat => self.mknod(a[0] as i32, a[1], a[2] as u32, a[3]),
 
             // --- metadata mutators not yet on the Vfs trait ---
             //
@@ -434,19 +436,12 @@ impl SystemCalls for Personality {
             // and otherwise let the host serve them (the only mount today is the
             // host root, so the guest path is the host path). Left unhandled they
             // would fall through to the host and mutate it under `--readonly`.
-            libc::SYS_mknod
-            | libc::SYS_setxattr
+            libc::SYS_setxattr
             | libc::SYS_lsetxattr
             | libc::SYS_removexattr
             | libc::SYS_lremovexattr => {
                 let guard = self.guard_write_path(libc::AT_FDCWD, a[0]);
                 self.deny_ro_or_passthrough(call, guard, None);
-                return;
-            }
-            libc::SYS_mknodat => {
-                let guard = self.guard_write_path(a[0] as i32, a[1]);
-                // Translate the dirfd if it is one of ours before forwarding.
-                self.deny_ro_or_passthrough(call, guard, Some(0));
                 return;
             }
             libc::SYS_fsetxattr | libc::SYS_fremovexattr | libc::SYS_fallocate => {
@@ -1360,6 +1355,14 @@ impl Personality {
     ) -> Result<i64, Errno> {
         let r = self.resolve_write(dirfd, pathptr, follow)?;
         r.fs.utimens(&r.rel, follow, times)?;
+        Ok(0)
+    }
+
+    fn mknod(&self, dirfd: i32, pathptr: u64, mode: u32, dev: u64) -> Result<i64, Errno> {
+        // mknod names the entry it creates; a trailing symlink is EEXIST, so
+        // never follow the final component.
+        let r = self.resolve_write(dirfd, pathptr, false)?;
+        r.fs.mknod(&r.rel, Mode(mode), dev)?;
         Ok(0)
     }
 }

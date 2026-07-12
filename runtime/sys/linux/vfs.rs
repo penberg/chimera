@@ -92,6 +92,11 @@ pub trait Vfs: Send + Sync {
     fn utimens(&self, path: &Path, follow: bool, times: Option<[Timespec; 2]>)
     -> Result<(), Errno>;
 
+    /// Create a filesystem node. `mode` carries the `S_IF*` type bits as
+    /// `mknod(2)` takes them (zero type bits create a regular file); `dev` is
+    /// meaningful only for device nodes.
+    fn mknod(&self, path: &Path, mode: Mode, dev: u64) -> Result<(), Errno>;
+
     /// Report filesystem-wide statistics for `statfs` by path.
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno>;
 

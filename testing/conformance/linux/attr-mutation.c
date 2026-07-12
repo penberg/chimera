@@ -52,6 +52,8 @@ static int rejected_arguments(const char *self) {
     struct timeval invalid_tv[2] = {{0, 1000000}, {0, 0}};
     if (syscall(SYS_utimes, self, invalid_tv) == 0 || errno != EINVAL) return 9;
 
+    if (mknod("", S_IFIFO | 0644, 0) == 0 || errno != ENOENT) return 10;
+
     if (stat(self, &after) != 0) return 91;
     if (before.st_mode != after.st_mode) return 92;
     return 0;
@@ -67,6 +69,7 @@ static int read_only_world(const char *self) {
     if (lchown(self, (uid_t)-1, (gid_t)-1) == 0 || errno != EROFS) return 14;
     struct timespec ts[2] = {{12345, 0}, {54321, 0}};
     if (utimensat(AT_FDCWD, self, ts, 0) == 0 || errno != EROFS) return 15;
+    if (mknod(scratch, S_IFIFO | 0644, 0) == 0 || errno != EROFS) return 23;
 
     // Fd forms on a read-only open of the same file.
     int fd = open(self, O_RDONLY);
@@ -129,6 +132,16 @@ static int writable_world(int fd) {
     unlink(dangling);
     if (symlink("nope", dangling) != 0) return 40;
     if (lchown(dangling, (uid_t)-1, (gid_t)-1) != 0) return 41;
+
+    // mknod creates a FIFO the filesystem then reports as one; through a
+    // trailing symlink — even a dangling one — it answers EEXIST instead.
+    char fifo[sizeof(scratch) + 8];
+    snprintf(fifo, sizeof(fifo), "%s.fifo", scratch);
+    unlink(fifo);
+    if (mknod(fifo, S_IFIFO | 0644, 0) != 0) return 57;
+    if (stat(fifo, &st) != 0 || !S_ISFIFO(st.st_mode)) return 58;
+    unlink(fifo);
+    if (mknod(dangling, S_IFIFO | 0644, 0) == 0 || errno != EEXIST) return 59;
     unlink(dangling);
 
     close(fd);

@@ -310,6 +310,11 @@ impl Vfs for HostFs {
         check(unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), tp, flags) })
     }
 
+    fn mknod(&self, path: &Path, mode: Mode, dev: u64) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        check(unsafe { libc::mknod(cpath.as_ptr(), mode.0 as libc::mode_t, dev as libc::dev_t) })
+    }
+
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno> {
         let fd = self.open_in_root(path, libc::O_PATH, 0)?;
         Ok(statfs_to_statfs(&raw_fstatfs(fd.as_raw_fd())?))
@@ -1022,6 +1027,26 @@ mod tests {
         fs.utimens(Path::new("link"), false, Some(times)).unwrap();
         assert_eq!(fs.stat(Path::new("link"), false).unwrap().mtime.sec, 666);
         assert_eq!(fs.stat(Path::new("f"), true).unwrap().mtime.sec, 444);
+    }
+
+    #[test]
+    fn mknod_creates_fifo() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+
+        fs.mknod(Path::new("pipe"), Mode(libc::S_IFIFO | 0o644), 0)
+            .unwrap();
+        assert_eq!(
+            fs.stat(Path::new("pipe"), true).unwrap().file_type,
+            FileType::Fifo
+        );
+
+        // Zero type bits create a regular file, as mknod(2) specifies.
+        fs.mknod(Path::new("plain"), Mode(0o600), 0).unwrap();
+        assert_eq!(
+            fs.stat(Path::new("plain"), true).unwrap().file_type,
+            FileType::Regular
+        );
     }
 
     #[test]
