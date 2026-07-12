@@ -586,15 +586,19 @@ impl Personality {
         Ok(r)
     }
 
-    /// The same check for an fd mutator, using the mount policy captured when
-    /// the open file description was created. Host fds never reach here — the
-    /// fd-form dispatch arms are gated on [`is_virtual`], since a host fd is
-    /// not ours to police.
+    /// The mutator target behind an fd, rejected with `EROFS` if the mount was
+    /// read-only when it was opened — the fd-form counterpart of
+    /// [`resolve_write`], returning the descriptor so the caller reuses the
+    /// one lookup. Host fds never reach here: the fd-form dispatch arms are
+    /// gated on [`is_virtual`], since a host fd is not ours to police, so an
+    /// fd absent from the table is `EBADF`.
     ///
+    /// [`resolve_write`]: Self::resolve_write
     /// [`is_virtual`]: Self::is_virtual
-    fn guard_write_fd(&self, fd: i32) -> Result<(), Errno> {
-        if self.desc(fd)?.writable {
-            Ok(())
+    fn writable_desc(&self, fd: i32) -> Result<Arc<OpenFileDescription>, Errno> {
+        let desc = self.desc(fd)?;
+        if desc.writable {
+            Ok(desc)
         } else {
             Err(Errno::EROFS)
         }
@@ -1211,8 +1215,7 @@ impl Personality {
                 return Err(Errno::ENOENT);
             }
             if self.is_virtual(dirfd) {
-                self.guard_write_fd(dirfd)?;
-                self.desc(dirfd)?.file.fchmodat_empty(Mode(mode))?;
+                self.writable_desc(dirfd)?.file.fchmodat_empty(Mode(mode))?;
                 return Ok(0);
             }
         }
@@ -1223,8 +1226,7 @@ impl Personality {
     }
 
     fn fchmod(&self, fd: i32, mode: u32) -> Result<i64, Errno> {
-        self.guard_write_fd(fd)?;
-        self.desc(fd)?.file.fchmod(Mode(mode))?;
+        self.writable_desc(fd)?.file.fchmod(Mode(mode))?;
         Ok(0)
     }
 
@@ -1246,8 +1248,7 @@ impl Personality {
         let raw = unsafe { read_cstr(pathptr) };
         // fchownat(fd, "", AT_EMPTY_PATH, …) targets the descriptor itself.
         if flags & libc::AT_EMPTY_PATH != 0 && raw.is_empty() && self.is_virtual(dirfd) {
-            self.guard_write_fd(dirfd)?;
-            self.desc(dirfd)?.file.fchownat_empty(uid, gid)?;
+            self.writable_desc(dirfd)?.file.fchownat_empty(uid, gid)?;
             return Ok(0);
         }
         if raw.is_empty() && flags & libc::AT_EMPTY_PATH == 0 {
@@ -1260,8 +1261,7 @@ impl Personality {
     }
 
     fn fchown(&self, fd: i32, uid: u32, gid: u32) -> Result<i64, Errno> {
-        self.guard_write_fd(fd)?;
-        self.desc(fd)?.file.fchown(uid, gid)?;
+        self.writable_desc(fd)?.file.fchown(uid, gid)?;
         Ok(0)
     }
 
@@ -1294,8 +1294,7 @@ impl Personality {
         // && dfd != AT_FDCWD` rule; a NULL path against `AT_FDCWD` is a bad
         // address, so it falls through to the path form and answers `EFAULT`.
         if pathptr == 0 && dirfd != libc::AT_FDCWD {
-            self.guard_write_fd(dirfd)?;
-            self.desc(dirfd)?.file.futimens(times)?;
+            self.writable_desc(dirfd)?.file.futimens(times)?;
             return Ok(0);
         }
         self.utimens_path(dirfd, pathptr, times, true)
@@ -1317,8 +1316,7 @@ impl Personality {
         };
         if pathptr == 0 {
             // utimensat(fd, NULL, …): the fd names the file.
-            self.guard_write_fd(dirfd)?;
-            self.desc(dirfd)?.file.futimens(times)?;
+            self.writable_desc(dirfd)?.file.futimens(times)?;
             return Ok(0);
         }
         let raw = unsafe { read_cstr(pathptr) };
@@ -1327,8 +1325,7 @@ impl Personality {
                 return Err(Errno::ENOENT);
             }
             if self.is_virtual(dirfd) {
-                self.guard_write_fd(dirfd)?;
-                self.desc(dirfd)?.file.utimensat_empty(times)?;
+                self.writable_desc(dirfd)?.file.utimensat_empty(times)?;
                 return Ok(0);
             }
         }
@@ -1387,10 +1384,9 @@ impl Personality {
         len: usize,
         flags: i32,
     ) -> Result<i64, Errno> {
-        self.guard_write_fd(fd)?;
+        let desc = self.writable_desc(fd)?;
         let name = unsafe { read_cstr(nameptr) };
-        self.desc(fd)?
-            .file
+        desc.file
             .fsetxattr(OsStr::from_bytes(&name), guest(valptr, len), flags)?;
         Ok(0)
     }
@@ -1403,15 +1399,14 @@ impl Personality {
     }
 
     fn fremovexattr(&self, fd: i32, nameptr: u64) -> Result<i64, Errno> {
-        self.guard_write_fd(fd)?;
+        let desc = self.writable_desc(fd)?;
         let name = unsafe { read_cstr(nameptr) };
-        self.desc(fd)?.file.fremovexattr(OsStr::from_bytes(&name))?;
+        desc.file.fremovexattr(OsStr::from_bytes(&name))?;
         Ok(0)
     }
 
     fn fallocate(&self, fd: i32, mode: i32, offset: u64, len: u64) -> Result<i64, Errno> {
-        self.guard_write_fd(fd)?;
-        self.desc(fd)?.file.fallocate(mode, offset, len)?;
+        self.writable_desc(fd)?.file.fallocate(mode, offset, len)?;
         Ok(0)
     }
 }
@@ -1651,7 +1646,7 @@ mod tests {
         let fd = scratch.open(&personality, c"/target", libc::O_RDONLY);
         std::fs::rename(scratch.0.join("target"), scratch.0.join("moved")).unwrap();
 
-        assert_eq!(personality.guard_write_fd(fd), Ok(()));
+        assert!(personality.writable_desc(fd).is_ok());
     }
 
     #[test]
@@ -1663,7 +1658,7 @@ mod tests {
         let fd = scratch.open(&personality, c"/target", libc::O_RDONLY);
         std::fs::remove_file(scratch.0.join("target")).unwrap();
 
-        assert_eq!(personality.guard_write_fd(fd), Ok(()));
+        assert!(personality.writable_desc(fd).is_ok());
     }
 
     #[test]
@@ -1674,7 +1669,7 @@ mod tests {
 
         let fd = scratch.open(&personality, c"/target", libc::O_RDONLY);
 
-        assert_eq!(personality.guard_write_fd(fd), Err(Errno::EROFS));
+        assert_eq!(personality.writable_desc(fd).err(), Some(Errno::EROFS));
     }
 
     /// The `AT_EMPTY_PATH` forms target the open inode, so they must land on
@@ -1771,8 +1766,8 @@ mod tests {
         let personality = scratch.personality(MountFlags::RDONLY);
 
         assert_eq!(
-            personality.guard_write_fd(libc::STDIN_FILENO),
-            Err(Errno(libc::EBADF))
+            personality.writable_desc(libc::STDIN_FILENO).err(),
+            Some(Errno(libc::EBADF))
         );
     }
 }
