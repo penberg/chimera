@@ -51,6 +51,9 @@ static int rejected_arguments(const char *self) {
         return 8;
     struct timeval invalid_tv[2] = {{0, 1000000}, {0, 0}};
     if (syscall(SYS_utimes, self, invalid_tv) == 0 || errno != EINVAL) return 9;
+    // A NULL path against AT_FDCWD is a bad address, not the futimesat fd
+    // form: utimes(NULL, tv) answers EFAULT, never EBADF.
+    if (utimes(NULL, invalid_tv) == 0 || errno != EFAULT) return 94;
 
     if (mknod("", S_IFIFO | 0644, 0) == 0 || errno != ENOENT) return 10;
 

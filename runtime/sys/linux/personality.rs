@@ -1289,7 +1289,11 @@ impl Personality {
                 nsec: t.tv_usec * 1000,
             }))
         };
-        if pathptr == 0 {
+        // The descriptor form (`futimesat(fd, NULL, …)`) is taken only when the
+        // dirfd is a real descriptor, matching the kernel's `filename == NULL
+        // && dfd != AT_FDCWD` rule; a NULL path against `AT_FDCWD` is a bad
+        // address, so it falls through to the path form and answers `EFAULT`.
+        if pathptr == 0 && dirfd != libc::AT_FDCWD {
             self.guard_write_fd(dirfd)?;
             self.desc(dirfd)?.file.futimens(times)?;
             return Ok(0);
