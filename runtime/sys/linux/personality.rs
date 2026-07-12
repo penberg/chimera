@@ -31,7 +31,7 @@ use crate::{ForkHold, SyscallResult, SystemCall, SystemCalls, host_syscall};
 
 use super::{
     hostfs::BACKING_FLOOR,
-    namespace::{Namespace, normalize},
+    namespace::{Namespace, Resolved, normalize},
     vfs::{DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec},
 };
 
@@ -133,6 +133,9 @@ struct OpenFileDescription {
     /// Open status flags (`O_APPEND`, `O_NONBLOCK`, …); the access mode lives
     /// here too. Shared across `dup`, mutable via `fcntl(F_SETFL)`.
     state: Mutex<DescState>,
+    /// Mount writability at open time. Fd operations target the open inode, so
+    /// this cannot be recovered by resolving `path` after a rename or unlink.
+    writable: bool,
 }
 
 struct DescState {
@@ -388,56 +391,58 @@ impl SystemCalls for Personality {
             libc::SYS_chdir => self.chdir(a[0]),
             libc::SYS_fchdir if self.is_virtual(a[0] as i32) => self.fchdir(a[0] as i32),
 
-            // --- metadata mutators ---
-            //
-            // These change a file's attributes rather than its path or contents.
-            // The Vfs trait has no methods for them yet, but they must still
-            // honor the read-only mount: deny on a read-only mount with EROFS,
-            // and otherwise let the host serve them (the only mount today is the
-            // host root, so the guest path is the host path). Left unhandled they
-            // would fall through to the host and mutate it under `--readonly`.
-            libc::SYS_chmod
-            | libc::SYS_chown
-            | libc::SYS_lchown
-            | libc::SYS_utime
-            | libc::SYS_utimes
-            | libc::SYS_mknod
-            | libc::SYS_setxattr
-            | libc::SYS_lsetxattr
-            | libc::SYS_removexattr
-            | libc::SYS_lremovexattr => {
-                let guard = self.guard_write_path(libc::AT_FDCWD, a[0]);
-                self.deny_ro_or_passthrough(call, guard, None);
-                return;
+            // --- attribute mutators (path forms; fd forms virtual only) ---
+            libc::SYS_chmod => self.chmod_path(libc::AT_FDCWD, a[0], a[1] as u32, 0),
+            // The raw fchmodat syscall has no flags argument; fchmodat2 adds it.
+            libc::SYS_fchmodat => self.chmod_path(a[0] as i32, a[1], a[2] as u32, 0),
+            libc::SYS_fchmodat2 => self.chmod_path(a[0] as i32, a[1], a[2] as u32, a[3] as i32),
+            libc::SYS_fchmod if self.is_virtual(a[0] as i32) => {
+                self.fchmod(a[0] as i32, a[1] as u32)
             }
-            libc::SYS_fchmodat
-            | libc::SYS_fchmodat2
-            | libc::SYS_fchownat
-            | libc::SYS_mknodat
-            | libc::SYS_futimesat => {
-                let guard = self.guard_write_path(a[0] as i32, a[1]);
-                // Translate the dirfd if it is one of ours before forwarding.
-                self.deny_ro_or_passthrough(call, guard, Some(0));
-                return;
+            libc::SYS_chown => self.chown_path(libc::AT_FDCWD, a[0], a[1] as u32, a[2] as u32, 0),
+            libc::SYS_lchown => self.chown_path(
+                libc::AT_FDCWD,
+                a[0],
+                a[1] as u32,
+                a[2] as u32,
+                libc::AT_SYMLINK_NOFOLLOW,
+            ),
+            libc::SYS_fchownat => {
+                self.chown_path(a[0] as i32, a[1], a[2] as u32, a[3] as u32, a[4] as i32)
             }
-            libc::SYS_fchmod
-            | libc::SYS_fchown
-            | libc::SYS_fsetxattr
-            | libc::SYS_fremovexattr
-            | libc::SYS_fallocate => {
-                let guard = self.guard_write_fd(a[0] as i32);
-                self.deny_ro_or_passthrough(call, guard, Some(0));
-                return;
+            libc::SYS_fchown if self.is_virtual(a[0] as i32) => {
+                self.fchown(a[0] as i32, a[1] as u32, a[2] as u32)
             }
-            libc::SYS_utimensat => {
-                // utimensat(dirfd, NULL, …) targets the dirfd itself.
-                let (guard, fd_arg) = if a[1] == 0 {
-                    (self.guard_write_fd(a[0] as i32), Some(0))
-                } else {
-                    (self.guard_write_path(a[0] as i32, a[1]), Some(0))
-                };
-                self.deny_ro_or_passthrough(call, guard, fd_arg);
-                return;
+            libc::SYS_utime => self.utime(a[0], a[1]),
+            libc::SYS_utimes => self.utimes(libc::AT_FDCWD, a[0], a[1]),
+            // futimesat(fd, NULL, …) targets the descriptor itself; that form
+            // on a host fd falls through to the host below.
+            libc::SYS_futimesat if a[1] != 0 || self.is_virtual(a[0] as i32) => {
+                self.utimes(a[0] as i32, a[1], a[2])
+            }
+            // utimensat(fd, NULL, …) targets the descriptor itself; that form
+            // on a host fd falls through to the host below.
+            libc::SYS_utimensat if a[1] != 0 || self.is_virtual(a[0] as i32) => {
+                self.utimensat(a[0] as i32, a[1], a[2], a[3] as i32)
+            }
+            libc::SYS_mknod => self.mknod(libc::AT_FDCWD, a[0], a[1] as u32, a[2]),
+            libc::SYS_mknodat => self.mknod(a[0] as i32, a[1], a[2] as u32, a[3]),
+            libc::SYS_setxattr => {
+                self.setxattr_path(a[0], a[1], a[2], a[3] as usize, a[4] as i32, true)
+            }
+            libc::SYS_lsetxattr => {
+                self.setxattr_path(a[0], a[1], a[2], a[3] as usize, a[4] as i32, false)
+            }
+            libc::SYS_fsetxattr if self.is_virtual(a[0] as i32) => {
+                self.fsetxattr(a[0] as i32, a[1], a[2], a[3] as usize, a[4] as i32)
+            }
+            libc::SYS_removexattr => self.removexattr_path(a[0], a[1], true),
+            libc::SYS_lremovexattr => self.removexattr_path(a[0], a[1], false),
+            libc::SYS_fremovexattr if self.is_virtual(a[0] as i32) => {
+                self.fremovexattr(a[0] as i32, a[1])
+            }
+            libc::SYS_fallocate if self.is_virtual(a[0] as i32) => {
+                self.fallocate(a[0] as i32, a[1] as i32, a[2], a[3])
             }
 
             // Everything else — including host-fd I/O and syscalls not modeled
@@ -522,6 +527,17 @@ impl SystemCalls for Personality {
     // across exec — benign and revisited when exec reads through the Vfs.
 }
 
+/// What an `AT_*` attribute mutator's `(dirfd, pathptr, flags)` names, as
+/// decoded by [`Personality::at_target`].
+enum AtTarget {
+    /// `AT_EMPTY_PATH` with an empty path on one of our descriptors: the
+    /// operation targets the open description, already write-guarded.
+    Fd(Arc<OpenFileDescription>),
+    /// A path resolved on a writable mount; `follow` is the final-symlink
+    /// disposition the operation must carry through to its `Vfs` call.
+    Path { resolved: Resolved, follow: bool },
+}
+
 impl Personality {
     /// `true` for a descriptor this Personality owns; `false` for any other
     /// (host) descriptor, which passes straight through.
@@ -561,25 +577,69 @@ impl Personality {
     /// Resolve a path mutator's target and reject it with `EROFS` if it lands on
     /// a read-only mount. Path-resolution errors (`ENOENT`, `ELOOP`, …) carry
     /// through unchanged.
-    fn guard_write_path(&self, dirfd: i32, pathptr: u64) -> Result<(), Errno> {
-        let raw = unsafe { read_cstr(pathptr) };
-        let abs = self.abs_path(dirfd, &raw)?;
-        if self.ns.resolve(&abs, true)?.writable {
-            Ok(())
-        } else {
-            Err(Errno::EROFS)
+    fn resolve_write(&self, dirfd: i32, pathptr: u64, follow: bool) -> Result<Resolved, Errno> {
+        if pathptr == 0 {
+            return Err(Errno(libc::EFAULT));
         }
+        let raw = unsafe { read_cstr(pathptr) };
+        if raw.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        self.resolve_write_raw(dirfd, &raw, follow)
     }
 
-    /// The same check for an fd mutator: a virtual fd's writability comes from
-    /// its mount; a host fd is not ours to police.
-    fn guard_write_fd(&self, fd: i32) -> Result<(), Errno> {
-        if !self.is_virtual(fd) {
-            return Ok(());
+    fn resolve_write_raw(&self, dirfd: i32, raw: &[u8], follow: bool) -> Result<Resolved, Errno> {
+        let abs = self.abs_path(dirfd, raw)?;
+        let r = self.ns.resolve(&abs, follow)?;
+        if !r.writable {
+            return Err(Errno::EROFS);
         }
-        let path = self.desc(fd)?.path.clone();
-        if self.ns.resolve(&path, true)?.writable {
-            Ok(())
+        Ok(r)
+    }
+
+    /// Decode an `AT_*` attribute mutator's `(dirfd, pathptr, flags)` into its
+    /// target. `flags` is validated against `AT_EMPTY_PATH |
+    /// AT_SYMLINK_NOFOLLOW`; a NULL path is `EFAULT`, an empty path is either
+    /// the `AT_EMPTY_PATH` fd form (on a virtual dirfd) or `ENOENT`. The
+    /// `utimensat` NULL-pointer form (the fd names the file) is not an
+    /// `AT_EMPTY_PATH` case and is handled by its caller before this.
+    fn at_target(&self, dirfd: i32, pathptr: u64, flags: i32) -> Result<AtTarget, Errno> {
+        const ALLOWED: i32 = libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW;
+        if flags & !ALLOWED != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if pathptr == 0 {
+            return Err(Errno(libc::EFAULT));
+        }
+        let raw = unsafe { read_cstr(pathptr) };
+        let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
+        if raw.is_empty() {
+            if flags & libc::AT_EMPTY_PATH == 0 {
+                return Err(Errno::ENOENT);
+            }
+            if self.is_virtual(dirfd) {
+                return Ok(AtTarget::Fd(self.writable_desc(dirfd)?));
+            }
+            // AT_EMPTY_PATH with an empty path on a host dirfd falls through to
+            // resolution, which answers EBADF for the unknown dirfd.
+        }
+        let resolved = self.resolve_write_raw(dirfd, &raw, follow)?;
+        Ok(AtTarget::Path { resolved, follow })
+    }
+
+    /// The mutator target behind an fd, rejected with `EROFS` if the mount was
+    /// read-only when it was opened — the fd-form counterpart of
+    /// [`resolve_write`], returning the descriptor so the caller reuses the
+    /// one lookup. Host fds never reach here: the fd-form dispatch arms are
+    /// gated on [`is_virtual`], since a host fd is not ours to police, so an
+    /// fd absent from the table is `EBADF`.
+    ///
+    /// [`resolve_write`]: Self::resolve_write
+    /// [`is_virtual`]: Self::is_virtual
+    fn writable_desc(&self, fd: i32) -> Result<Arc<OpenFileDescription>, Errno> {
+        let desc = self.desc(fd)?;
+        if desc.writable {
+            Ok(desc)
         } else {
             Err(Errno::EROFS)
         }
@@ -687,6 +747,7 @@ impl Personality {
         let desc = Arc::new(OpenFileDescription {
             file,
             path: r.abs,
+            writable: r.writable,
             state: Mutex::new(DescState {
                 offset: 0,
                 status: flags,
@@ -1180,6 +1241,182 @@ impl Personality {
         *self.cwd.lock().unwrap() = path;
         Ok(0)
     }
+
+    fn chmod_path(&self, dirfd: i32, pathptr: u64, mode: u32, flags: i32) -> Result<i64, Errno> {
+        match self.at_target(dirfd, pathptr, flags)? {
+            AtTarget::Fd(desc) => desc.file.fchmodat_empty(Mode(mode))?,
+            AtTarget::Path { resolved, follow } => {
+                resolved.fs.chmod(&resolved.rel, follow, Mode(mode))?
+            }
+        }
+        Ok(0)
+    }
+
+    fn fchmod(&self, fd: i32, mode: u32) -> Result<i64, Errno> {
+        self.writable_desc(fd)?.file.fchmod(Mode(mode))?;
+        Ok(0)
+    }
+
+    fn chown_path(
+        &self,
+        dirfd: i32,
+        pathptr: u64,
+        uid: u32,
+        gid: u32,
+        flags: i32,
+    ) -> Result<i64, Errno> {
+        match self.at_target(dirfd, pathptr, flags)? {
+            AtTarget::Fd(desc) => desc.file.fchownat_empty(uid, gid)?,
+            AtTarget::Path { resolved, follow } => {
+                resolved.fs.chown(&resolved.rel, follow, uid, gid)?
+            }
+        }
+        Ok(0)
+    }
+
+    fn fchown(&self, fd: i32, uid: u32, gid: u32) -> Result<i64, Errno> {
+        self.writable_desc(fd)?.file.fchown(uid, gid)?;
+        Ok(0)
+    }
+
+    fn utime(&self, pathptr: u64, bufptr: u64) -> Result<i64, Errno> {
+        // struct utimbuf: [actime, modtime] in whole seconds; NULL = both now.
+        let times = if bufptr == 0 {
+            None
+        } else {
+            let b = unsafe { ptr::read(bufptr as *const [libc::time_t; 2]) };
+            Some(b.map(|sec| Timespec { sec, nsec: 0 }))
+        };
+        self.utimens_path(libc::AT_FDCWD, pathptr, times, true)
+    }
+
+    fn utimes(&self, dirfd: i32, pathptr: u64, tvptr: u64) -> Result<i64, Errno> {
+        let times = if tvptr == 0 {
+            None
+        } else {
+            let tv = unsafe { ptr::read(tvptr as *const [libc::timeval; 2]) };
+            if tv.iter().any(|t| !(0..1_000_000).contains(&t.tv_usec)) {
+                return Err(Errno::EINVAL);
+            }
+            Some(tv.map(|t| Timespec {
+                sec: t.tv_sec,
+                nsec: t.tv_usec * 1000,
+            }))
+        };
+        // The descriptor form (`futimesat(fd, NULL, …)`) is taken only when the
+        // dirfd is a real descriptor, matching the kernel's `filename == NULL
+        // && dfd != AT_FDCWD` rule; a NULL path against `AT_FDCWD` is a bad
+        // address, so it falls through to the path form and answers `EFAULT`.
+        if pathptr == 0 && dirfd != libc::AT_FDCWD {
+            self.writable_desc(dirfd)?.file.futimens(times)?;
+            return Ok(0);
+        }
+        self.utimens_path(dirfd, pathptr, times, true)
+    }
+
+    fn utimensat(&self, dirfd: i32, pathptr: u64, tsptr: u64, flags: i32) -> Result<i64, Errno> {
+        // A NULL pointer (not an empty string) is glibc's futimens: the fd
+        // names the file and flags do not apply. Only the empty-string form
+        // goes through at_target's AT_EMPTY_PATH decode.
+        if pathptr == 0 && flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let times = if tsptr == 0 {
+            None
+        } else {
+            let ts = unsafe { ptr::read(tsptr as *const [libc::timespec; 2]) };
+            Some(ts.map(|t| Timespec {
+                sec: t.tv_sec,
+                nsec: t.tv_nsec,
+            }))
+        };
+        if pathptr == 0 {
+            self.writable_desc(dirfd)?.file.futimens(times)?;
+            return Ok(0);
+        }
+        match self.at_target(dirfd, pathptr, flags)? {
+            AtTarget::Fd(desc) => desc.file.utimensat_empty(times)?,
+            AtTarget::Path { resolved, follow } => {
+                resolved.fs.utimens(&resolved.rel, follow, times)?
+            }
+        }
+        Ok(0)
+    }
+
+    fn utimens_path(
+        &self,
+        dirfd: i32,
+        pathptr: u64,
+        times: Option<[Timespec; 2]>,
+        follow: bool,
+    ) -> Result<i64, Errno> {
+        let r = self.resolve_write(dirfd, pathptr, follow)?;
+        r.fs.utimens(&r.rel, follow, times)?;
+        Ok(0)
+    }
+
+    fn mknod(&self, dirfd: i32, pathptr: u64, mode: u32, dev: u64) -> Result<i64, Errno> {
+        // mknod names the entry it creates; a trailing symlink is EEXIST, so
+        // never follow the final component.
+        let r = self.resolve_write(dirfd, pathptr, false)?;
+        r.fs.mknod(&r.rel, Mode(mode), dev)?;
+        Ok(0)
+    }
+
+    fn setxattr_path(
+        &self,
+        pathptr: u64,
+        nameptr: u64,
+        valptr: u64,
+        len: usize,
+        flags: i32,
+        follow: bool,
+    ) -> Result<i64, Errno> {
+        let r = self.resolve_write(libc::AT_FDCWD, pathptr, follow)?;
+        let name = unsafe { read_cstr(nameptr) };
+        r.fs.setxattr(
+            &r.rel,
+            follow,
+            OsStr::from_bytes(&name),
+            guest(valptr, len),
+            flags,
+        )?;
+        Ok(0)
+    }
+
+    fn fsetxattr(
+        &self,
+        fd: i32,
+        nameptr: u64,
+        valptr: u64,
+        len: usize,
+        flags: i32,
+    ) -> Result<i64, Errno> {
+        let desc = self.writable_desc(fd)?;
+        let name = unsafe { read_cstr(nameptr) };
+        desc.file
+            .fsetxattr(OsStr::from_bytes(&name), guest(valptr, len), flags)?;
+        Ok(0)
+    }
+
+    fn removexattr_path(&self, pathptr: u64, nameptr: u64, follow: bool) -> Result<i64, Errno> {
+        let r = self.resolve_write(libc::AT_FDCWD, pathptr, follow)?;
+        let name = unsafe { read_cstr(nameptr) };
+        r.fs.removexattr(&r.rel, follow, OsStr::from_bytes(&name))?;
+        Ok(0)
+    }
+
+    fn fremovexattr(&self, fd: i32, nameptr: u64) -> Result<i64, Errno> {
+        let desc = self.writable_desc(fd)?;
+        let name = unsafe { read_cstr(nameptr) };
+        desc.file.fremovexattr(OsStr::from_bytes(&name))?;
+        Ok(0)
+    }
+
+    fn fallocate(&self, fd: i32, mode: i32, offset: u64, len: u64) -> Result<i64, Errno> {
+        self.writable_desc(fd)?.file.fallocate(mode, offset, len)?;
+        Ok(0)
+    }
 }
 
 /// Write a `SyscallResult` into `call` from a `Result<i64, Errno>`.
@@ -1362,5 +1599,183 @@ fn dirent_type(t: FileType) -> u8 {
         FileType::BlockDevice => libc::DT_BLK,
         FileType::Fifo => libc::DT_FIFO,
         FileType::Socket => libc::DT_SOCK,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        sync::{
+            Arc,
+            atomic::{AtomicU32, Ordering},
+        },
+    };
+
+    use super::*;
+    use crate::sys::linux::{HostFs, MountFlags};
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("chimera-personality-{}-{n}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn personality(&self, flags: MountFlags) -> Personality {
+            let root = Arc::new(HostFs::new(&self.0).unwrap());
+            Personality::new(Namespace::with_root(root, flags))
+        }
+
+        fn open(&self, personality: &Personality, path: &std::ffi::CStr, flags: i32) -> i32 {
+            personality
+                .open(libc::AT_FDCWD, path.as_ptr() as u64, flags, 0)
+                .unwrap() as i32
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn fd_write_guard_survives_rename() {
+        let scratch = Scratch::new();
+        let personality = scratch.personality(MountFlags::NONE);
+        std::fs::write(scratch.0.join("target"), b"x").unwrap();
+
+        let fd = scratch.open(&personality, c"/target", libc::O_RDONLY);
+        std::fs::rename(scratch.0.join("target"), scratch.0.join("moved")).unwrap();
+
+        assert!(personality.writable_desc(fd).is_ok());
+    }
+
+    #[test]
+    fn fd_write_guard_survives_unlink() {
+        let scratch = Scratch::new();
+        let personality = scratch.personality(MountFlags::NONE);
+        std::fs::write(scratch.0.join("target"), b"x").unwrap();
+
+        let fd = scratch.open(&personality, c"/target", libc::O_RDONLY);
+        std::fs::remove_file(scratch.0.join("target")).unwrap();
+
+        assert!(personality.writable_desc(fd).is_ok());
+    }
+
+    #[test]
+    fn fd_write_guard_denies_read_only_mount() {
+        let scratch = Scratch::new();
+        std::fs::write(scratch.0.join("target"), b"x").unwrap();
+        let personality = scratch.personality(MountFlags::RDONLY);
+
+        let fd = scratch.open(&personality, c"/target", libc::O_RDONLY);
+
+        assert_eq!(personality.writable_desc(fd).err(), Some(Errno::EROFS));
+    }
+
+    /// The `AT_EMPTY_PATH` forms target the open inode, so they must land on
+    /// the file the descriptor was opened on even after the path is renamed
+    /// away and replaced — not on the path's new occupant.
+    #[test]
+    fn empty_path_operations_target_opath_file_after_replacement() {
+        let scratch = Scratch::new();
+        let personality = scratch.personality(MountFlags::NONE);
+        let target = scratch.0.join("target");
+        let moved = scratch.0.join("moved");
+        std::fs::write(&target, b"old").unwrap();
+
+        let fd = scratch.open(&personality, c"/target", libc::O_PATH);
+        let fd_ro = scratch.open(&personality, c"/target", libc::O_RDONLY);
+        std::fs::rename(&target, &moved).unwrap();
+        std::fs::write(&target, b"replacement").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        personality
+            .chmod_path(fd, c"".as_ptr() as u64, 0o640, libc::AT_EMPTY_PATH)
+            .unwrap();
+        personality
+            .chown_path(
+                fd,
+                c"".as_ptr() as u64,
+                u32::MAX,
+                u32::MAX,
+                libc::AT_EMPTY_PATH,
+            )
+            .unwrap();
+        let empty_times = [libc::timespec {
+            tv_sec: 111,
+            tv_nsec: 0,
+        }; 2];
+        personality
+            .utimensat(
+                fd,
+                c"".as_ptr() as u64,
+                empty_times.as_ptr() as u64,
+                libc::AT_EMPTY_PATH,
+            )
+            .unwrap();
+
+        // utimes(fd, NULL-path, …) likewise names the descriptor itself — but
+        // only through a regular descriptor: the kernel's NULL-path form
+        // rejects an O_PATH handle with EBADF (fdget refuses FMODE_PATH),
+        // unlike the AT_EMPTY_PATH form above.
+        let null_times = [
+            libc::timeval {
+                tv_sec: 222,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: 333,
+                tv_usec: 0,
+            },
+        ];
+        assert_eq!(
+            personality.utimes(fd, 0, null_times.as_ptr() as u64),
+            Err(Errno(libc::EBADF))
+        );
+        personality
+            .utimes(fd_ro, 0, null_times.as_ptr() as u64)
+            .unwrap();
+
+        let moved_stat = std::fs::metadata(&moved).unwrap();
+        assert_eq!(moved_stat.permissions().mode() & 0o7777, 0o640);
+        assert_eq!(moved_stat.mtime(), 333);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn chmod_by_path_is_erofs_on_read_only_mount() {
+        let scratch = Scratch::new();
+        std::fs::write(scratch.0.join("target"), b"x").unwrap();
+        let personality = scratch.personality(MountFlags::RDONLY);
+
+        assert_eq!(
+            personality.chmod_path(libc::AT_FDCWD, c"/target".as_ptr() as u64, 0o600, 0),
+            Err(Errno::EROFS)
+        );
+    }
+
+    /// A host fd is kept away from the guard by the dispatch arms'
+    /// `is_virtual` gates; the guard itself answers EBADF for any
+    /// descriptor it does not own.
+    #[test]
+    fn fd_write_guard_rejects_unknown_fds() {
+        let scratch = Scratch::new();
+        let personality = scratch.personality(MountFlags::RDONLY);
+
+        assert_eq!(
+            personality.writable_desc(libc::STDIN_FILENO).err(),
+            Some(Errno(libc::EBADF))
+        );
     }
 }

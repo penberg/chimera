@@ -29,7 +29,7 @@
 #![allow(dead_code)]
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
 };
 
@@ -76,6 +76,40 @@ pub trait Vfs: Send + Sync {
     /// (`RENAME_NOREPLACE`, `RENAME_EXCHANGE`, …); a cross-filesystem rename is
     /// `EXDEV` and handled above.
     fn rename(&self, from: &Path, to: &Path, flags: RenameFlags) -> Result<(), Errno>;
+
+    /// Change a file's permission bits. `follow == false` atomically refuses a
+    /// final symlink with `EOPNOTSUPP`, as `fchmodat2(AT_SYMLINK_NOFOLLOW)` does.
+    fn chmod(&self, path: &Path, follow: bool, mode: Mode) -> Result<(), Errno>;
+
+    /// Change a file's ownership. `follow == false` is `lchown` semantics. An
+    /// id of `u32::MAX` (the kernel's `-1`) leaves that id unchanged.
+    fn chown(&self, path: &Path, follow: bool, uid: u32, gid: u32) -> Result<(), Errno>;
+
+    /// Set access and modification times. `None` sets both to now; otherwise
+    /// the pair is `[atime, mtime]`, whose `nsec` fields may carry the
+    /// kernel's `UTIME_NOW`/`UTIME_OMIT` specials, honored as `utimensat(2)`
+    /// does. `follow == false` names a final symlink itself.
+    fn utimens(&self, path: &Path, follow: bool, times: Option<[Timespec; 2]>)
+    -> Result<(), Errno>;
+
+    /// Create a filesystem node. `mode` carries the `S_IF*` type bits as
+    /// `mknod(2)` takes them (zero type bits create a regular file); `dev` is
+    /// meaningful only for device nodes.
+    fn mknod(&self, path: &Path, mode: Mode, dev: u64) -> Result<(), Errno>;
+
+    /// Set an extended attribute. `flags` carries `XATTR_CREATE`/
+    /// `XATTR_REPLACE`.
+    fn setxattr(
+        &self,
+        path: &Path,
+        follow: bool,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+    ) -> Result<(), Errno>;
+
+    /// Remove an extended attribute.
+    fn removexattr(&self, path: &Path, follow: bool, name: &OsStr) -> Result<(), Errno>;
 
     /// Report filesystem-wide statistics for `statfs` by path.
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno>;
@@ -131,6 +165,43 @@ pub trait File: Send + Sync {
 
     /// Flush the file to durable storage.
     fn fsync(&self) -> Result<(), Errno>;
+
+    /// `chmod` through the open handle (`fchmod`).
+    fn fchmod(&self, mode: Mode) -> Result<(), Errno>;
+
+    /// `fchmodat2(fd, "", mode, AT_EMPTY_PATH)`, which also accepts an
+    /// `O_PATH` handle.
+    fn fchmodat_empty(&self, mode: Mode) -> Result<(), Errno> {
+        self.fchmod(mode)
+    }
+
+    /// `chown` through the open handle (`fchown`). `u32::MAX` leaves an id
+    /// unchanged, as in [`Vfs::chown`].
+    fn fchown(&self, uid: u32, gid: u32) -> Result<(), Errno>;
+
+    /// `fchownat(fd, "", uid, gid, AT_EMPTY_PATH)`, including `O_PATH`.
+    fn fchownat_empty(&self, uid: u32, gid: u32) -> Result<(), Errno> {
+        self.fchown(uid, gid)
+    }
+
+    /// Set times through the open handle (`futimens`); `times` as in
+    /// [`Vfs::utimens`].
+    fn futimens(&self, times: Option<[Timespec; 2]>) -> Result<(), Errno>;
+
+    /// `utimensat(fd, "", times, AT_EMPTY_PATH)`, including `O_PATH`.
+    fn utimensat_empty(&self, times: Option<[Timespec; 2]>) -> Result<(), Errno> {
+        self.futimens(times)
+    }
+
+    /// Set an extended attribute through the open handle (`fsetxattr`).
+    fn fsetxattr(&self, name: &OsStr, value: &[u8], flags: i32) -> Result<(), Errno>;
+
+    /// Remove an extended attribute through the open handle (`fremovexattr`).
+    fn fremovexattr(&self, name: &OsStr) -> Result<(), Errno>;
+
+    /// Manipulate file space (`fallocate`): `mode` is the raw `FALLOC_FL_*`
+    /// set, zero meaning allocate.
+    fn fallocate(&self, mode: i32, offset: u64, len: u64) -> Result<(), Errno>;
 
     /// Snapshot of a directory's entries, backing `getdents64` on a dirfd. The
     /// Personality encodes the snapshot into `linux_dirent64` records and keeps

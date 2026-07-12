@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 use std::{
-    ffi::{CStr, CString, OsString},
+    ffi::{CStr, CString, OsStr, OsString},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::{OsStrExt, OsStringExt},
@@ -269,6 +269,89 @@ impl Vfs for HostFs {
         check(r)
     }
 
+    fn chmod(&self, path: &Path, follow: bool, mode: Mode) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        let r = if follow {
+            unsafe { libc::chmod(cpath.as_ptr(), mode.0 as libc::mode_t) }
+        } else {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_fchmodat2,
+                    libc::AT_FDCWD,
+                    cpath.as_ptr(),
+                    mode.0 as libc::mode_t,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                ) as libc::c_int
+            }
+        };
+        check(r)
+    }
+
+    fn chown(&self, path: &Path, follow: bool, uid: u32, gid: u32) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        let r = if follow {
+            unsafe { libc::chown(cpath.as_ptr(), uid, gid) }
+        } else {
+            unsafe { libc::lchown(cpath.as_ptr(), uid, gid) }
+        };
+        check(r)
+    }
+
+    fn utimens(
+        &self,
+        path: &Path,
+        follow: bool,
+        times: Option<[Timespec; 2]>,
+    ) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        let ts = times.map(|t| t.map(to_timespec));
+        let tp = ts.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
+        let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+        check(unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), tp, flags) })
+    }
+
+    fn mknod(&self, path: &Path, mode: Mode, dev: u64) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        check(unsafe { libc::mknod(cpath.as_ptr(), mode.0 as libc::mode_t, dev as libc::dev_t) })
+    }
+
+    fn setxattr(
+        &self,
+        path: &Path,
+        follow: bool,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+    ) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        let cname = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let f = if follow {
+            libc::setxattr
+        } else {
+            libc::lsetxattr
+        };
+        check(unsafe {
+            f(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                flags,
+            )
+        })
+    }
+
+    fn removexattr(&self, path: &Path, follow: bool, name: &OsStr) -> Result<(), Errno> {
+        let cpath = cpath(&self.host_path(path))?;
+        let cname = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let f = if follow {
+            libc::removexattr
+        } else {
+            libc::lremovexattr
+        };
+        check(unsafe { f(cpath.as_ptr(), cname.as_ptr()) })
+    }
+
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno> {
         let fd = self.open_in_root(path, libc::O_PATH, 0)?;
         Ok(statfs_to_statfs(&raw_fstatfs(fd.as_raw_fd())?))
@@ -386,6 +469,81 @@ impl File for HostFile {
         check(unsafe { libc::fsync(self.fd.as_raw_fd()) })
     }
 
+    fn fchmod(&self, mode: Mode) -> Result<(), Errno> {
+        check(unsafe { libc::fchmod(self.fd.as_raw_fd(), mode.0 as libc::mode_t) })
+    }
+
+    fn fchmodat_empty(&self, mode: Mode) -> Result<(), Errno> {
+        check(unsafe {
+            libc::syscall(
+                libc::SYS_fchmodat2,
+                self.fd.as_raw_fd(),
+                c"".as_ptr(),
+                mode.0 as libc::mode_t,
+                libc::AT_EMPTY_PATH,
+            ) as libc::c_int
+        })
+    }
+
+    fn fchown(&self, uid: u32, gid: u32) -> Result<(), Errno> {
+        check(unsafe { libc::fchown(self.fd.as_raw_fd(), uid, gid) })
+    }
+
+    fn fchownat_empty(&self, uid: u32, gid: u32) -> Result<(), Errno> {
+        check(unsafe {
+            libc::fchownat(
+                self.fd.as_raw_fd(),
+                c"".as_ptr(),
+                uid,
+                gid,
+                libc::AT_EMPTY_PATH,
+            )
+        })
+    }
+
+    fn futimens(&self, times: Option<[Timespec; 2]>) -> Result<(), Errno> {
+        let ts = times.map(|t| t.map(to_timespec));
+        let tp = ts.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
+        check(unsafe { libc::futimens(self.fd.as_raw_fd(), tp) })
+    }
+
+    fn utimensat_empty(&self, times: Option<[Timespec; 2]>) -> Result<(), Errno> {
+        let ts = times.map(|t| t.map(to_timespec));
+        let tp = ts.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
+        check(unsafe {
+            libc::utimensat(self.fd.as_raw_fd(), c"".as_ptr(), tp, libc::AT_EMPTY_PATH)
+        })
+    }
+
+    fn fsetxattr(&self, name: &OsStr, value: &[u8], flags: i32) -> Result<(), Errno> {
+        let cname = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        check(unsafe {
+            libc::fsetxattr(
+                self.fd.as_raw_fd(),
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                flags,
+            )
+        })
+    }
+
+    fn fremovexattr(&self, name: &OsStr) -> Result<(), Errno> {
+        let cname = CString::new(name.as_bytes()).map_err(|_| Errno::EINVAL)?;
+        check(unsafe { libc::fremovexattr(self.fd.as_raw_fd(), cname.as_ptr()) })
+    }
+
+    fn fallocate(&self, mode: i32, offset: u64, len: u64) -> Result<(), Errno> {
+        check(unsafe {
+            libc::fallocate(
+                self.fd.as_raw_fd(),
+                mode,
+                offset as libc::off_t,
+                len as libc::off_t,
+            )
+        })
+    }
+
     fn host_fd(&self) -> Option<libc::c_int> {
         Some(self.fd.as_raw_fd())
     }
@@ -493,6 +651,14 @@ fn crel(path: &Path) -> Result<CString, Errno> {
     .map_err(|_| Errno::EINVAL)
 }
 
+/// A symbolic [`Timespec`] as the C struct, `UTIME_*` specials intact.
+fn to_timespec(t: Timespec) -> libc::timespec {
+    libc::timespec {
+        tv_sec: t.sec,
+        tv_nsec: t.nsec,
+    }
+}
+
 /// Map a libc return of `-1` to the current errno, anything else to `Ok`.
 fn check(ret: libc::c_int) -> Result<(), Errno> {
     if ret < 0 { Err(last_errno()) } else { Ok(()) }
@@ -592,7 +758,10 @@ fn raw_statfs(path: &CStr) -> Result<RawStatFs, Errno> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::atomic::{AtomicU32, Ordering},
+    };
 
     use super::*;
 
@@ -813,6 +982,194 @@ mod tests {
         let b = fs.stat(Path::new("alias"), true).unwrap();
         assert_eq!(a.ino, b.ino);
         assert_eq!(b.nlink, 2);
+    }
+
+    #[test]
+    fn chmod_applies_permission_bits() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+
+        let file = fs
+            .open(
+                Path::new("f"),
+                OpenFlags(libc::O_CREAT | libc::O_RDWR),
+                Mode(0o644),
+            )
+            .unwrap();
+        fs.chmod(Path::new("f"), true, Mode(0o600)).unwrap();
+        assert_eq!(
+            fs.stat(Path::new("f"), true).unwrap().mode.0 & 0o7777,
+            0o600
+        );
+
+        file.fchmod(Mode(0o640)).unwrap();
+        assert_eq!(file.fstat().unwrap().mode.0 & 0o7777, 0o640);
+    }
+
+    #[test]
+    fn chmod_nofollow_refuses_symlink_without_changing_target() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+        std::fs::write(scratch.path.join("target"), b"").unwrap();
+        std::fs::set_permissions(
+            scratch.path.join("target"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("target", scratch.path.join("link")).unwrap();
+
+        assert_eq!(
+            fs.chmod(Path::new("link"), false, Mode(0o600)),
+            Err(Errno(libc::EOPNOTSUPP))
+        );
+        assert_eq!(
+            std::fs::metadata(scratch.path.join("target"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o640
+        );
+    }
+
+    /// `-1`/`-1` (leave both ids unchanged) must succeed for an unprivileged
+    /// owner — it is the only chown an unprivileged test can rely on.
+    #[test]
+    fn chown_unchanged_ids_is_permitted() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+
+        let file = fs
+            .open(
+                Path::new("f"),
+                OpenFlags(libc::O_CREAT | libc::O_WRONLY),
+                Mode(0o644),
+            )
+            .unwrap();
+        fs.chown(Path::new("f"), true, u32::MAX, u32::MAX).unwrap();
+        file.fchown(u32::MAX, u32::MAX).unwrap();
+
+        // The no-follow form names a dangling symlink itself.
+        fs.symlink(Path::new("nope"), Path::new("dangling"))
+            .unwrap();
+        fs.chown(Path::new("dangling"), false, u32::MAX, u32::MAX)
+            .unwrap();
+    }
+
+    #[test]
+    fn utimens_sets_explicit_times() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+
+        let file = fs
+            .open(
+                Path::new("f"),
+                OpenFlags(libc::O_CREAT | libc::O_RDWR),
+                Mode(0o644),
+            )
+            .unwrap();
+        let times = [
+            Timespec { sec: 111, nsec: 0 },
+            Timespec { sec: 222, nsec: 0 },
+        ];
+        fs.utimens(Path::new("f"), true, Some(times)).unwrap();
+        let st = fs.stat(Path::new("f"), true).unwrap();
+        assert_eq!(st.atime.sec, 111);
+        assert_eq!(st.mtime.sec, 222);
+
+        let times = [
+            Timespec { sec: 333, nsec: 0 },
+            Timespec { sec: 444, nsec: 0 },
+        ];
+        file.futimens(Some(times)).unwrap();
+        assert_eq!(file.fstat().unwrap().mtime.sec, 444);
+
+        // The no-follow form stamps a symlink itself, not its target.
+        fs.symlink(Path::new("f"), Path::new("link")).unwrap();
+        let times = [
+            Timespec { sec: 555, nsec: 0 },
+            Timespec { sec: 666, nsec: 0 },
+        ];
+        fs.utimens(Path::new("link"), false, Some(times)).unwrap();
+        assert_eq!(fs.stat(Path::new("link"), false).unwrap().mtime.sec, 666);
+        assert_eq!(fs.stat(Path::new("f"), true).unwrap().mtime.sec, 444);
+    }
+
+    #[test]
+    fn mknod_creates_fifo() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+
+        fs.mknod(Path::new("pipe"), Mode(libc::S_IFIFO | 0o644), 0)
+            .unwrap();
+        assert_eq!(
+            fs.stat(Path::new("pipe"), true).unwrap().file_type,
+            FileType::Fifo
+        );
+
+        // Zero type bits create a regular file, as mknod(2) specifies.
+        fs.mknod(Path::new("plain"), Mode(0o600), 0).unwrap();
+        assert_eq!(
+            fs.stat(Path::new("plain"), true).unwrap().file_type,
+            FileType::Regular
+        );
+    }
+
+    /// Read back an xattr with the host getxattr, bypassing the Vfs.
+    fn host_getxattr(path: &Path, name: &CStr) -> Option<Vec<u8>> {
+        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut buf = [0u8; 64];
+        let n = unsafe {
+            libc::getxattr(
+                cpath.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        (n >= 0).then(|| buf[..n as usize].to_vec())
+    }
+
+    #[test]
+    fn xattr_roundtrip() {
+        let scratch = Scratch::new();
+        let fs = fs(&scratch);
+
+        let file = fs
+            .open(
+                Path::new("f"),
+                OpenFlags(libc::O_CREAT | libc::O_RDWR),
+                Mode(0o644),
+            )
+            .unwrap();
+        let name = OsStr::new("user.chimera-test");
+        match fs.setxattr(Path::new("f"), true, name, b"v", 0) {
+            // A scratch filesystem without user xattrs cannot exercise this.
+            Err(e) if e == Errno(libc::ENOTSUP) => return,
+            r => r.unwrap(),
+        }
+        let host = scratch.path.join("f");
+        assert_eq!(
+            host_getxattr(&host, c"user.chimera-test").as_deref(),
+            Some(&b"v"[..])
+        );
+
+        file.fsetxattr(name, b"w", 0).unwrap();
+        assert_eq!(
+            host_getxattr(&host, c"user.chimera-test").as_deref(),
+            Some(&b"w"[..])
+        );
+
+        fs.removexattr(Path::new("f"), true, name).unwrap();
+        assert_eq!(host_getxattr(&host, c"user.chimera-test"), None);
+        assert_eq!(
+            fs.removexattr(Path::new("f"), true, name).unwrap_err(),
+            Errno(libc::ENODATA)
+        );
+
+        file.fsetxattr(name, b"x", 0).unwrap();
+        file.fremovexattr(name).unwrap();
+        assert_eq!(file.fremovexattr(name).unwrap_err(), Errno(libc::ENODATA));
     }
 
     #[test]
