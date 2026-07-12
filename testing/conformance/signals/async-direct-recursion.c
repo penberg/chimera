@@ -15,10 +15,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-// A handful of slow `idiv`s per call: enough to keep the recursion well short of
-// overflow for tens of ms (so the signal lands first) while keeping the
-// straight-line block far under the translator's basic-block size limit.
-#define V8(x) x /= dvr; x /= dvr; x /= dvr; x /= dvr; x /= dvr; x /= dvr; x /= dvr; x /= dvr;
+// A couple thousand slow `div`s per call keep stack overflow the better part of
+// a second away, so the helper's signal lands with a wide margin even on a slow,
+// jittery CI machine. Each step re-seeds the dividend: a plain `x /= dvr` chain
+// collapses x to 0 after two steps, and modern dividers early-out on small
+// dividends, which once made overflow arrive ~15 ms after the signal — close
+// enough for scheduler jitter to lose the race.
+#define STEP(x) x = x / dvr + 0x9e3779b97f4a7c15ull;
+#define V8(x) STEP(x) STEP(x) STEP(x) STEP(x) STEP(x) STEP(x) STEP(x) STEP(x)
 #define V64(x) V8(x) V8(x) V8(x) V8(x) V8(x) V8(x) V8(x) V8(x)
 
 static volatile uint64_t sink;
@@ -37,7 +41,8 @@ static void on_sig(int sig) {
 
 static void recurse(void) {
     uint64_t x = sink + 0x9e3779b97f4a7c15ull;
-    V64(x) // straight-line work: slows the call rate, no back-edge of its own
+    // Straight-line work: slows the call rate, no back-edge of its own.
+    V64(x) V64(x) V64(x) V64(x)
     sink = x;
     recurse(); // direct self-call: the only loop-closing edge (compiled at -O0,
                // so it is a real `call`, not a tail-call `jmp`)
