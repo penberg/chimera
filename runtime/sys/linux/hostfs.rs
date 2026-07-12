@@ -533,6 +533,17 @@ impl File for HostFile {
         check(unsafe { libc::fremovexattr(self.fd.as_raw_fd(), cname.as_ptr()) })
     }
 
+    fn fallocate(&self, mode: i32, offset: u64, len: u64) -> Result<(), Errno> {
+        check(unsafe {
+            libc::fallocate(
+                self.fd.as_raw_fd(),
+                mode,
+                offset as libc::off_t,
+                len as libc::off_t,
+            )
+        })
+    }
+
     fn host_fd(&self) -> Option<libc::c_int> {
         Some(self.fd.as_raw_fd())
     }

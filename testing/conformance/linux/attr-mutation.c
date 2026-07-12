@@ -6,8 +6,7 @@
 // the change; on Chimera's read-only mount the create fails with EROFS and
 // every mutator must then return EROFS too, leaving the file untouched — a
 // mutator slipping past the VFS to the host is exactly the bug this guards
-// against. Currently covers the chmod family; each mutator family grows a
-// section here as it moves onto the Vfs trait.
+// against.
 
 #define _GNU_SOURCE
 
@@ -89,12 +88,14 @@ static int read_only_world(const char *self) {
         return 25;
     if (fremovexattr(fd, "user.chimera-test") == 0 || errno != EROFS)
         return 27;
+    if (fallocate(fd, 0, 0, 1) == 0 || errno != EROFS) return 28;
     close(fd);
 
     // Nothing leaked through to the host.
     if (stat(self, &after) != 0) return 20;
     if (after.st_mode != before.st_mode) return 21;
     if (after.st_mtim.tv_sec != before.st_mtim.tv_sec) return 22;
+    if (after.st_size != before.st_size) return 29;
     return 0;
 }
 
@@ -112,6 +113,18 @@ static int writable_world(int fd) {
     struct timespec omit[2] = {{0, UTIME_NOW}, {0, UTIME_OMIT}};
     if (futimens(fd, omit) != 0) return 53;
     if (fstat(fd, &st) != 0 || st.st_mtim.tv_sec != 222) return 54;
+
+    // fallocate manipulates file space through the descriptor; punching a
+    // hole with KEEP_SIZE leaves the size alone (EOPNOTSUPP: a filesystem
+    // without hole punching).
+    if (fallocate(fd, 0, 0, 8192) != 0) return 70;
+    if (fstat(fd, &st) != 0 || st.st_size != 8192) return 71;
+    errno = 0;
+    if (fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4096) !=
+            0 &&
+        errno != EOPNOTSUPP)
+        return 72;
+    if (fstat(fd, &st) != 0 || st.st_size != 8192) return 73;
 
     // Path forms, observed through stat by path.
     if (chmod(scratch, 0600) != 0) return 34;

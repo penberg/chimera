@@ -199,6 +199,10 @@ pub trait File: Send + Sync {
     /// Remove an extended attribute through the open handle (`fremovexattr`).
     fn fremovexattr(&self, name: &OsStr) -> Result<(), Errno>;
 
+    /// Manipulate file space (`fallocate`): `mode` is the raw `FALLOC_FL_*`
+    /// set, zero meaning allocate.
+    fn fallocate(&self, mode: i32, offset: u64, len: u64) -> Result<(), Errno>;
+
     /// Snapshot of a directory's entries, backing `getdents64` on a dirfd. The
     /// Personality encodes the snapshot into `linux_dirent64` records and keeps
     /// the read position in the fd table. A non-directory handle returns

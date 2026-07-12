@@ -441,14 +441,8 @@ impl SystemCalls for Personality {
             libc::SYS_fremovexattr if self.is_virtual(a[0] as i32) => {
                 self.fremovexattr(a[0] as i32, a[1])
             }
-
-            // fallocate is the last attribute mutator not yet on the Vfs
-            // trait; it must still honor the read-only mount before the host
-            // serves it.
-            libc::SYS_fallocate => {
-                let guard = self.guard_write_fd(a[0] as i32);
-                self.deny_ro_or_passthrough(call, guard, Some(0));
-                return;
+            libc::SYS_fallocate if self.is_virtual(a[0] as i32) => {
+                self.fallocate(a[0] as i32, a[1] as i32, a[2], a[3])
             }
 
             // Everything else — including host-fd I/O and syscalls not modeled
@@ -593,11 +587,12 @@ impl Personality {
     }
 
     /// The same check for an fd mutator, using the mount policy captured when
-    /// the open file description was created; a host fd is not ours to police.
+    /// the open file description was created. Host fds never reach here — the
+    /// fd-form dispatch arms are gated on [`is_virtual`], since a host fd is
+    /// not ours to police.
+    ///
+    /// [`is_virtual`]: Self::is_virtual
     fn guard_write_fd(&self, fd: i32) -> Result<(), Errno> {
-        if !self.is_virtual(fd) {
-            return Ok(());
-        }
         if self.desc(fd)?.writable {
             Ok(())
         } else {
@@ -1409,6 +1404,12 @@ impl Personality {
         self.desc(fd)?.file.fremovexattr(OsStr::from_bytes(&name))?;
         Ok(0)
     }
+
+    fn fallocate(&self, fd: i32, mode: i32, offset: u64, len: u64) -> Result<i64, Errno> {
+        self.guard_write_fd(fd)?;
+        self.desc(fd)?.file.fallocate(mode, offset, len)?;
+        Ok(0)
+    }
 }
 
 /// Write a `SyscallResult` into `call` from a `Result<i64, Errno>`.
@@ -1757,11 +1758,17 @@ mod tests {
         );
     }
 
+    /// A host fd is kept away from the guard by the dispatch arms'
+    /// `is_virtual` gates; the guard itself answers EBADF for any
+    /// descriptor it does not own.
     #[test]
-    fn fd_write_guard_ignores_host_fds() {
+    fn fd_write_guard_rejects_unknown_fds() {
         let scratch = Scratch::new();
         let personality = scratch.personality(MountFlags::RDONLY);
 
-        assert_eq!(personality.guard_write_fd(libc::STDIN_FILENO), Ok(()));
+        assert_eq!(
+            personality.guard_write_fd(libc::STDIN_FILENO),
+            Err(Errno(libc::EBADF))
+        );
     }
 }
