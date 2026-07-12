@@ -10,7 +10,10 @@ use std::{
     },
 };
 
-use crate::{Error, arch::x86::cache::BlockCache};
+use crate::{
+    Error,
+    arch::x86::{cache::BlockCache, trampoline::guarded_copy},
+};
 
 /// Guest page size (x86-64); SMC arming and invalidation work per page.
 const PAGE: usize = 4096;
@@ -314,11 +317,15 @@ pub fn reset_cached_pid() {
 
 /// Copy `buf.len()` bytes out of guest memory at `addr` without trusting the
 /// pointer. Chimera and the guest share one address space, so the copy is a
-/// self-targeted `process_vm_readv`: the kernel walks the page tables and an
-/// unmapped or partially mapped range fails the copy — exactly where a raw
-/// dereference would fault the runtime. Returns false on any failed or short
-/// copy, so a caller reports `EFAULT` (or forwards for the kernel to) the way
-/// a native `copy_from_user` failure would.
+/// plain load loop ([`guarded_copy`]) whose faults the `SIGSEGV`/`SIGBUS`
+/// handler recovers — the kernel's `copy_from_user` exception-table pattern.
+/// An unmapped or partially mapped range fails the copy exactly where a bare
+/// dereference would fault the runtime, and the common, fully mapped case
+/// costs a `memcpy` instead of a system call: the translator takes this path
+/// for every basic block it decodes, hundreds of thousands of times in a JIT
+/// warm-up. Returns false on any failed copy, so a caller reports `EFAULT`
+/// (or forwards for the kernel to) the way a native `copy_from_user` failure
+/// would.
 pub fn copy_from_guest(addr: u64, buf: &mut [u8]) -> bool {
     if buf.is_empty() {
         return true;
@@ -326,16 +333,7 @@ pub fn copy_from_guest(addr: u64, buf: &mut [u8]) -> bool {
     if addr == 0 {
         return false;
     }
-    let local = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: buf.len(),
-    };
-    let remote = libc::iovec {
-        iov_base: addr as *mut libc::c_void,
-        iov_len: buf.len(),
-    };
-    let copied = unsafe { libc::process_vm_readv(own_pid(), &local, 1, &remote, 1, 0) };
-    copied == buf.len() as isize
+    unsafe { guarded_copy(buf.as_mut_ptr(), addr as *const u8, buf.len()) != 0 }
 }
 
 /// Copy `buf` into guest memory at `addr` without trusting the pointer — the

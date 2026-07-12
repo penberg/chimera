@@ -281,3 +281,26 @@ chimera_fetch_fixup:
     sub rax, rcx
     ret
 .size chimera_fetch_copy, . - chimera_fetch_copy
+// fn guarded_copy(dst: *mut u8 /* rdi */, src: *const u8 /* rsi */,
+//                 len: usize /* rdx */) -> i64
+//
+// Copy `len` bytes from unvalidated guest memory with plain loads — the
+// kernel's `copy_from_user` exception-table pattern, in miniature. The fault
+// handler recovers a `SIGSEGV`/`SIGBUS` whose rip lies inside this routine by
+// redirecting the interrupted thread to `guarded_copy_fault`, which reports
+// the failed copy. Returns 1 on a complete copy, 0 on a fault; a faulted copy
+// may have written any readable prefix of `dst`.
+.globl guarded_copy
+.type guarded_copy, @function
+guarded_copy:
+    mov rcx, rdx
+    rep movsb
+    mov eax, 1
+    ret
+.globl guarded_copy_fault
+guarded_copy_fault:
+    xor eax, eax
+    ret
+.size guarded_copy, . - guarded_copy
+.globl guarded_copy_end
+guarded_copy_end:
