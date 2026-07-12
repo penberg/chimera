@@ -527,6 +527,17 @@ impl SystemCalls for Personality {
     // across exec — benign and revisited when exec reads through the Vfs.
 }
 
+/// What an `AT_*` attribute mutator's `(dirfd, pathptr, flags)` names, as
+/// decoded by [`Personality::at_target`].
+enum AtTarget {
+    /// `AT_EMPTY_PATH` with an empty path on one of our descriptors: the
+    /// operation targets the open description, already write-guarded.
+    Fd(Arc<OpenFileDescription>),
+    /// A path resolved on a writable mount; `follow` is the final-symlink
+    /// disposition the operation must carry through to its `Vfs` call.
+    Path { resolved: Resolved, follow: bool },
+}
+
 impl Personality {
     /// `true` for a descriptor this Personality owns; `false` for any other
     /// (host) descriptor, which passes straight through.
@@ -584,6 +595,36 @@ impl Personality {
             return Err(Errno::EROFS);
         }
         Ok(r)
+    }
+
+    /// Decode an `AT_*` attribute mutator's `(dirfd, pathptr, flags)` into its
+    /// target. `flags` is validated against `AT_EMPTY_PATH |
+    /// AT_SYMLINK_NOFOLLOW`; a NULL path is `EFAULT`, an empty path is either
+    /// the `AT_EMPTY_PATH` fd form (on a virtual dirfd) or `ENOENT`. The
+    /// `utimensat` NULL-pointer form (the fd names the file) is not an
+    /// `AT_EMPTY_PATH` case and is handled by its caller before this.
+    fn at_target(&self, dirfd: i32, pathptr: u64, flags: i32) -> Result<AtTarget, Errno> {
+        const ALLOWED: i32 = libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW;
+        if flags & !ALLOWED != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if pathptr == 0 {
+            return Err(Errno(libc::EFAULT));
+        }
+        let raw = unsafe { read_cstr(pathptr) };
+        let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
+        if raw.is_empty() {
+            if flags & libc::AT_EMPTY_PATH == 0 {
+                return Err(Errno::ENOENT);
+            }
+            if self.is_virtual(dirfd) {
+                return Ok(AtTarget::Fd(self.writable_desc(dirfd)?));
+            }
+            // AT_EMPTY_PATH with an empty path on a host dirfd falls through to
+            // resolution, which answers EBADF for the unknown dirfd.
+        }
+        let resolved = self.resolve_write_raw(dirfd, &raw, follow)?;
+        Ok(AtTarget::Path { resolved, follow })
     }
 
     /// The mutator target behind an fd, rejected with `EROFS` if the mount was
@@ -1202,26 +1243,12 @@ impl Personality {
     }
 
     fn chmod_path(&self, dirfd: i32, pathptr: u64, mode: u32, flags: i32) -> Result<i64, Errno> {
-        const ALLOWED: i32 = libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW;
-        if flags & !ALLOWED != 0 {
-            return Err(Errno::EINVAL);
-        }
-        if pathptr == 0 {
-            return Err(Errno(libc::EFAULT));
-        }
-        let raw = unsafe { read_cstr(pathptr) };
-        if raw.is_empty() {
-            if flags & libc::AT_EMPTY_PATH == 0 {
-                return Err(Errno::ENOENT);
-            }
-            if self.is_virtual(dirfd) {
-                self.writable_desc(dirfd)?.file.fchmodat_empty(Mode(mode))?;
-                return Ok(0);
+        match self.at_target(dirfd, pathptr, flags)? {
+            AtTarget::Fd(desc) => desc.file.fchmodat_empty(Mode(mode))?,
+            AtTarget::Path { resolved, follow } => {
+                resolved.fs.chmod(&resolved.rel, follow, Mode(mode))?
             }
         }
-        let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
-        let r = self.resolve_write_raw(dirfd, &raw, follow)?;
-        r.fs.chmod(&r.rel, follow, Mode(mode))?;
         Ok(0)
     }
 
@@ -1238,25 +1265,12 @@ impl Personality {
         gid: u32,
         flags: i32,
     ) -> Result<i64, Errno> {
-        const ALLOWED: i32 = libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW;
-        if flags & !ALLOWED != 0 {
-            return Err(Errno::EINVAL);
+        match self.at_target(dirfd, pathptr, flags)? {
+            AtTarget::Fd(desc) => desc.file.fchownat_empty(uid, gid)?,
+            AtTarget::Path { resolved, follow } => {
+                resolved.fs.chown(&resolved.rel, follow, uid, gid)?
+            }
         }
-        if pathptr == 0 {
-            return Err(Errno(libc::EFAULT));
-        }
-        let raw = unsafe { read_cstr(pathptr) };
-        // fchownat(fd, "", AT_EMPTY_PATH, …) targets the descriptor itself.
-        if flags & libc::AT_EMPTY_PATH != 0 && raw.is_empty() && self.is_virtual(dirfd) {
-            self.writable_desc(dirfd)?.file.fchownat_empty(uid, gid)?;
-            return Ok(0);
-        }
-        if raw.is_empty() && flags & libc::AT_EMPTY_PATH == 0 {
-            return Err(Errno::ENOENT);
-        }
-        let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
-        let r = self.resolve_write_raw(dirfd, &raw, follow)?;
-        r.fs.chown(&r.rel, follow, uid, gid)?;
         Ok(0)
     }
 
@@ -1301,8 +1315,10 @@ impl Personality {
     }
 
     fn utimensat(&self, dirfd: i32, pathptr: u64, tsptr: u64, flags: i32) -> Result<i64, Errno> {
-        const ALLOWED: i32 = libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW;
-        if flags & !ALLOWED != 0 || pathptr == 0 && flags != 0 {
+        // A NULL pointer (not an empty string) is glibc's futimens: the fd
+        // names the file and flags do not apply. Only the empty-string form
+        // goes through at_target's AT_EMPTY_PATH decode.
+        if pathptr == 0 && flags != 0 {
             return Err(Errno::EINVAL);
         }
         let times = if tsptr == 0 {
@@ -1315,23 +1331,15 @@ impl Personality {
             }))
         };
         if pathptr == 0 {
-            // utimensat(fd, NULL, …): the fd names the file.
             self.writable_desc(dirfd)?.file.futimens(times)?;
             return Ok(0);
         }
-        let raw = unsafe { read_cstr(pathptr) };
-        if raw.is_empty() {
-            if flags & libc::AT_EMPTY_PATH == 0 {
-                return Err(Errno::ENOENT);
-            }
-            if self.is_virtual(dirfd) {
-                self.writable_desc(dirfd)?.file.utimensat_empty(times)?;
-                return Ok(0);
+        match self.at_target(dirfd, pathptr, flags)? {
+            AtTarget::Fd(desc) => desc.file.utimensat_empty(times)?,
+            AtTarget::Path { resolved, follow } => {
+                resolved.fs.utimens(&resolved.rel, follow, times)?
             }
         }
-        let follow = flags & libc::AT_SYMLINK_NOFOLLOW == 0;
-        let r = self.resolve_write_raw(dirfd, &raw, follow)?;
-        r.fs.utimens(&r.rel, follow, times)?;
         Ok(0)
     }
 
