@@ -84,6 +84,18 @@ impl Namespace {
         });
     }
 
+    /// Ask the root filesystem to re-resolve its anchored host state; see
+    /// [`Vfs::reanchor`]. Only the root follows the guest's mount view: a
+    /// guest that pivots has changed what `/` means, but a filesystem the
+    /// embedder mounted elsewhere names a fixed host object, the way a
+    /// descriptor the guest saved before the pivot does. bwrap writes its
+    /// `uid_map` through a `/proc` handle taken before it bound a read-only
+    /// `/proc` into the new root, and only the original mount still takes
+    /// the write.
+    pub fn reanchor(&self) {
+        self.mounts[0].fs.reanchor();
+    }
+
     /// Resolve an absolute guest path. `follow_final` chooses whether a symlink
     /// in the last position is dereferenced (`open`/`stat`) or named as itself
     /// (`lstat`/`unlink`/`readlink`). Intermediate symlinks are always followed.
