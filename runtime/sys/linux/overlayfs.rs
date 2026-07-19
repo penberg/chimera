@@ -26,7 +26,7 @@ use std::{
 };
 
 use super::{
-    delta::{Delta, is_opaque, is_whiteout, is_whiteout_fd, origin},
+    delta::{Delta, is_opaque, is_whiteout, is_whiteout_fd, mark_opaque, origin},
     hostfs::HostFs,
     vfs::{
         DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec, Vfs,
@@ -357,9 +357,18 @@ impl Vfs for OverlayFs {
             // Creating over a deleted name replaces the whiteout — the lower
             // file it hid must not bleed through, which the fresh upper file
             // now guarantees. (O_EXCL succeeds: the merged view had no name.)
+            // The syscall's result is the open descriptor, so this creation
+            // cannot be staged; a failure restores the marker instead,
+            // compare-and-swap so a concurrent creator keeps the name.
             Visibility::Whiteout if flags.create() => {
                 inner.remove_marker(path)?;
-                inner.upper.open(path, flags, mode)
+                match inner.upper.open(path, flags, mode) {
+                    Ok(file) => Ok(file),
+                    Err(e) => {
+                        let _ = inner.delta.restore_whiteout(path);
+                        Err(e)
+                    }
+                }
             }
             Visibility::Masked if flags.create() => {
                 inner.delta.materialize_parents(path)?;
@@ -400,13 +409,17 @@ impl Vfs for OverlayFs {
                 inner.delta.materialize_parents(path)?;
                 inner.upper.mkdir(path, mode)
             }
-            // Over a whiteout the new directory must be opaque: the deleted
-            // lower directory’s contents must not merge back in.
-            Visibility::Whiteout => {
-                inner.remove_marker(path)?;
-                inner.upper.mkdir(path, mode)?;
-                inner.delta.set_opaque(path)
-            }
+            // Over a whiteout the new directory must be opaque — the deleted
+            // lower directory’s contents must not merge back in — and the
+            // opacity is part of the publication: the directory is built and
+            // marked under a staging name, then takes the marker's place in
+            // one rename.
+            Visibility::Whiteout => inner.delta.replace_whiteout(path, |staging| {
+                let mut builder = std::fs::DirBuilder::new();
+                std::os::unix::fs::DirBuilderExt::mode(&mut builder, mode.0);
+                builder.create(staging).map_err(|e| Errno::from_io(&e))?;
+                mark_opaque(staging)
+            }),
         }
     }
 
@@ -462,10 +475,9 @@ impl Vfs for OverlayFs {
                 inner.delta.materialize_parents(link)?;
                 inner.upper.symlink(target, link)
             }
-            Visibility::Whiteout => {
-                inner.remove_marker(link)?;
-                inner.upper.symlink(target, link)
-            }
+            Visibility::Whiteout => inner.delta.replace_whiteout(link, |staging| {
+                std::os::unix::fs::symlink(target, staging).map_err(|e| Errno::from_io(&e))
+            }),
         }
     }
 
@@ -482,10 +494,10 @@ impl Vfs for OverlayFs {
                 inner.delta.materialize_parents(new)?;
                 inner.upper.link(old, new)
             }
-            Visibility::Whiteout => {
-                inner.remove_marker(new)?;
-                inner.upper.link(old, new)
-            }
+            Visibility::Whiteout => inner.delta.replace_whiteout(new, |staging| {
+                std::fs::hard_link(inner.delta.data_path(old), staging)
+                    .map_err(|e| Errno::from_io(&e))
+            }),
         }
     }
 
@@ -555,9 +567,11 @@ impl Vfs for OverlayFs {
         // upper destination directory may still hold whiteout markers the
         // kernel would count as entries; they vanish with the directory.
         let to_upper = inner.delta.data_path(to);
+        let mut removed_marker = false;
         match std::fs::symlink_metadata(&to_upper) {
             Ok(_) if is_whiteout(&to_upper)? && (src_dir || flags.noreplace()) => {
                 inner.remove_marker(to)?;
+                removed_marker = true;
             }
             Ok(md) if src_dir && md.is_dir() && dst.is_some() => {
                 std::fs::remove_dir_all(&to_upper).map_err(|e| Errno::from_io(&e))?;
@@ -566,8 +580,14 @@ impl Vfs for OverlayFs {
         }
         // The upper rename atomically claims `to` — replacing a live upper
         // entry or a whiteout marker alike — and the moved entry then
-        // shadows any lower `to`.
-        inner.upper.rename(from, to, flags)?;
+        // shadows any lower `to`. A failure after the marker went restores
+        // it (compare-and-swap), so the deleted name never resurrects.
+        if let Err(e) = inner.upper.rename(from, to, flags) {
+            if removed_marker {
+                let _ = inner.delta.restore_whiteout(to);
+            }
+            return Err(e);
+        }
         // A directory that replaced or shadows a lower name must keep that
         // lower directory's children (present and future) hidden.
         if src_dir && inner.lower_visible(to) {
@@ -606,7 +626,24 @@ impl Vfs for OverlayFs {
             Visibility::Lower if self.inner.lower_visible(path) => {
                 return Err(Errno::EEXIST);
             }
-            Visibility::Whiteout => self.inner.remove_marker(path)?,
+            Visibility::Whiteout => {
+                return self.inner.delta.replace_whiteout(path, |staging| {
+                    use std::os::unix::ffi::OsStrExt;
+                    let cstaging = std::ffi::CString::new(staging.as_os_str().as_bytes())
+                        .map_err(|_| Errno::EINVAL)?;
+                    if unsafe {
+                        libc::mknod(
+                            cstaging.as_ptr(),
+                            mode.0 as libc::mode_t,
+                            dev as libc::dev_t,
+                        )
+                    } != 0
+                    {
+                        return Err(Errno::from_io(&std::io::Error::last_os_error()));
+                    }
+                    Ok(())
+                });
+            }
             _ => {}
         }
         self.inner.delta.materialize_parents(path)?;

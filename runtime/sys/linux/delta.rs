@@ -168,11 +168,8 @@ impl Delta {
         })
     }
 
-    /// Write a whiteout for `rel`: the upper entry that says "this name is
-    /// deleted", hiding any lower file. Staged and renamed like a copy-up —
-    /// a marker file observed without its xattr would read as an empty upper
-    /// file shadowing live lower content.
-    pub fn whiteout(&self, rel: &Path) -> Result<(), Errno> {
+    /// Build a fresh marker file under a staging name.
+    fn stage_whiteout(&self) -> Result<PathBuf, Errno> {
         let staging = self.staging_path();
         let cstaging = cpath(&staging)?;
         // Owner-readable, or the marker xattr itself becomes unreadable: the
@@ -188,16 +185,30 @@ impl Delta {
             return Err(last_errno());
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        match check(unsafe {
+            libc::fsetxattr(
+                fd.as_raw_fd(),
+                WHITEOUT_XATTR.as_ptr(),
+                c"1".as_ptr() as *const libc::c_void,
+                1,
+                0,
+            )
+        }) {
+            Ok(()) => Ok(staging),
+            Err(e) => {
+                let _ = std::fs::remove_file(&staging);
+                Err(e)
+            }
+        }
+    }
+
+    /// Write a whiteout for `rel`: the upper entry that says "this name is
+    /// deleted", hiding any lower file. Staged and renamed like a copy-up —
+    /// a marker file observed without its xattr would read as an empty upper
+    /// file shadowing live lower content.
+    pub fn whiteout(&self, rel: &Path) -> Result<(), Errno> {
+        let staging = self.stage_whiteout()?;
         let publish = (|| {
-            check(unsafe {
-                libc::fsetxattr(
-                    fd.as_raw_fd(),
-                    WHITEOUT_XATTR.as_ptr(),
-                    c"1".as_ptr() as *const libc::c_void,
-                    1,
-                    0,
-                )
-            })?;
             self.materialize_parents(rel)?;
             std::fs::rename(&staging, self.data_path(rel)).map_err(|e| Errno::from_io(&e))
         })();
@@ -207,20 +218,69 @@ impl Delta {
         publish
     }
 
+    /// Put a whiteout back at `rel` after a failed creation removed the
+    /// marker — compare-and-swap, so a concurrent creator that took the name
+    /// in the meantime keeps it.
+    pub fn restore_whiteout(&self, rel: &Path) -> Result<(), Errno> {
+        let staging = self.stage_whiteout()?;
+        match rename_noreplace(&staging, &self.data_path(rel)) {
+            Ok(()) => Ok(()),
+            Err(Errno(libc::EEXIST)) => {
+                let _ = std::fs::remove_file(&staging);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&staging);
+                Err(e)
+            }
+        }
+    }
+
+    /// Replace the whiteout at `rel` with an object `build` constructs under
+    /// a staging name: the marker leaves the tree only in the same exchange
+    /// that publishes its fully-made replacement (plain rename cannot put a
+    /// directory over the marker file), so a failed construction leaves the
+    /// recorded deletion exactly in place and the merged view never flickers
+    /// back to the lower entry. A marker already replaced by a concurrent
+    /// creator answers `EEXIST`; if the exchange nevertheless swaps out a
+    /// live object rather than a marker, the object is left in `tmp/` as
+    /// garbage, never destroyed.
+    pub fn replace_whiteout(
+        &self,
+        rel: &Path,
+        build: impl FnOnce(&Path) -> Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        let staging = self.staging_path();
+        build(&staging)?;
+        let discard = |staging: &Path| {
+            let _ = match std::fs::symlink_metadata(staging) {
+                Ok(md) if md.is_dir() => std::fs::remove_dir_all(staging),
+                _ => std::fs::remove_file(staging),
+            };
+        };
+        match rename_exchange(&staging, &self.data_path(rel)) {
+            Ok(()) => {
+                if is_whiteout(&staging).unwrap_or(false) {
+                    let _ = std::fs::remove_file(&staging);
+                }
+                Ok(())
+            }
+            Err(Errno(libc::ENOENT)) => {
+                discard(&staging);
+                Err(Errno::EEXIST)
+            }
+            Err(e) => {
+                discard(&staging);
+                Err(e)
+            }
+        }
+    }
+
     /// Mark an existing upper directory opaque: lower entries beneath it no
     /// longer merge into the guest's view. A single xattr write is already
     /// atomic, so no staging is needed.
     pub fn set_opaque(&self, rel: &Path) -> Result<(), Errno> {
-        let cdir = cpath(&self.data_path(rel))?;
-        check(unsafe {
-            libc::lsetxattr(
-                cdir.as_ptr(),
-                OPAQUE_XATTR.as_ptr(),
-                c"1".as_ptr() as *const libc::c_void,
-                1,
-                0,
-            )
-        })
+        mark_opaque(&self.data_path(rel))
     }
 
     /// Copy the lower regular file at the host path `src` up to `rel`:
@@ -321,6 +381,22 @@ fn rename_noreplace(from: &Path, to: &Path) -> Result<(), Errno> {
     })
 }
 
+/// `rename(2)` that atomically swaps two existing entries — how a staged
+/// object of any type takes a whiteout marker's place in one step.
+fn rename_exchange(a: &Path, b: &Path) -> Result<(), Errno> {
+    let ca = cpath(a)?;
+    let cb = cpath(b)?;
+    check(unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            ca.as_ptr(),
+            libc::AT_FDCWD,
+            cb.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    })
+}
+
 /// `true` when the upper entry at `path` is a whiteout. A missing entry is
 /// not one, and a filesystem answer of "no such attribute" (or no xattrs at
 /// all) is an ordinary upper file.
@@ -331,6 +407,21 @@ pub fn is_whiteout(path: &Path) -> Result<bool, Errno> {
 /// `true` when the upper directory at `path` is opaque.
 pub fn is_opaque(path: &Path) -> Result<bool, Errno> {
     has_marker(path, OPAQUE_XATTR)
+}
+
+/// Mark the directory at `path` (a host path — an upper entry or a staging
+/// directory about to be published as one) opaque.
+pub fn mark_opaque(path: &Path) -> Result<(), Errno> {
+    let cdir = cpath(path)?;
+    check(unsafe {
+        libc::lsetxattr(
+            cdir.as_ptr(),
+            OPAQUE_XATTR.as_ptr(),
+            c"1".as_ptr() as *const libc::c_void,
+            1,
+            0,
+        )
+    })
 }
 
 /// Record `origin` on the upper entry at `path` — how apply advances a
