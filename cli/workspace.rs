@@ -551,6 +551,21 @@ impl From<io::Error> for ApplyError {
     }
 }
 
+/// Remove whatever the host has at `path` so a replacement (or deletion) can
+/// land. The removal call is selected from the existing target, never from
+/// the incoming type — and never through a symlink: a symlink is unlinked
+/// itself, only a real directory is removed recursively. An absent target is
+/// already removed. A target that changes type between inspection and
+/// removal surfaces as the resulting I/O error, not a mis-typed deletion.
+fn remove_host(path: &std::path::Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(md) if md.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn apply_change(change: &Change) -> Result<(), ApplyError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
@@ -570,23 +585,15 @@ fn apply_change(change: &Change) -> Result<(), ApplyError> {
         // surfaces as a conflict on the rerun — the safe direction, since
         // the mark is what guarantees no later host entry gets clobbered.
         mark_applied(&change.upper).map_err(errno_to_io)?;
-        // The guest deleted the name; whether file or directory, it goes.
-        match fs::symlink_metadata(host) {
-            Ok(md) if md.is_dir() => fs::remove_dir_all(host)?,
-            Ok(_) => fs::remove_file(host)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+        remove_host(host)?;
         return Ok(());
     }
 
     let md = fs::symlink_metadata(&change.upper)?;
     if md.is_dir() {
-        // An opaque directory replaces the lower one wholesale; its children
-        // follow in the walk.
-        if fs::symlink_metadata(host).is_ok() {
-            fs::remove_dir_all(host)?;
-        }
+        // An opaque directory replaces the lower entry wholesale, whatever
+        // its type; its children follow in the walk.
+        remove_host(host)?;
         fs::create_dir_all(host)?;
         fs::set_permissions(host, md.permissions())?;
         return Ok(());
@@ -648,9 +655,7 @@ fn apply_change(change: &Change) -> Result<(), ApplyError> {
 
     if md.file_type().is_symlink() {
         let target = fs::read_link(&change.upper)?;
-        if fs::symlink_metadata(host).is_ok() {
-            fs::remove_file(host)?;
-        }
+        remove_host(host)?;
         std::os::unix::fs::symlink(target, host)?;
         return Ok(());
     }
@@ -658,9 +663,7 @@ fn apply_change(change: &Change) -> Result<(), ApplyError> {
     if md.file_type().is_fifo() {
         let cpath = std::ffi::CString::new(host.as_os_str().as_bytes())
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-        if fs::symlink_metadata(host).is_ok() {
-            fs::remove_file(host)?;
-        }
+        remove_host(host)?;
         if unsafe { libc::mkfifo(cpath.as_ptr(), (md.mode() & 0o7777) as libc::mode_t) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
