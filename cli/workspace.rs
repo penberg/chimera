@@ -18,7 +18,10 @@ use std::{
     ffi::OsStr,
     fmt::Write as _,
     fs, io,
-    os::unix::ffi::OsStrExt,
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -33,11 +36,17 @@ pub struct Workspace {
     fresh: bool,
     /// The session root's pid. Guest fork is a host fork, so every guest
     /// child's host process carries a copy of this struct and returns
-    /// through the CLI when its guest exits — but end-of-session
-    /// disposition belongs to the root alone, or the first short-lived
-    /// child would garbage-collect the live workspace out from under the
-    /// session.
+    /// through the CLI when its guest exits. The root alone speaks for the
+    /// session (the kept notice); disposal belongs to whoever releases the
+    /// hold last.
     owner: u32,
+    /// This process's share of the tree-wide hold: a shared `flock` on
+    /// `<root>/lock`, one open file description inherited by every host
+    /// process of the guest tree. The lock outlives any single process and
+    /// ends only when the last inherited descriptor closes, which is
+    /// exactly the lifetime disposal must wait for — a counter in process
+    /// memory would tear at the first host fork.
+    hold: Option<OwnedFd>,
 }
 
 /// Where workspaces live: `$XDG_STATE_HOME/chimera/workspaces`, defaulting
@@ -64,11 +73,13 @@ pub fn create(command: &str) -> io::Result<Workspace> {
         match fs::create_dir(&root) {
             Ok(()) => {
                 write_meta(&root, &id, command)?;
+                let hold = hold(&root)?;
                 return Ok(Workspace {
                     id,
                     root,
                     fresh: true,
                     owner: std::process::id(),
+                    hold: Some(hold),
                 });
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -85,11 +96,13 @@ pub fn attach(selector: &OsStr) -> io::Result<Workspace> {
     if selector.as_bytes().contains(&b'/') {
         let root = PathBuf::from(selector);
         fs::create_dir_all(&root)?;
+        let hold = hold(&root)?;
         return Ok(Workspace {
             id: selector.to_string_lossy().into_owned(),
             root,
             fresh: false,
             owner: std::process::id(),
+            hold: Some(hold),
         });
     }
     let root = workspaces_dir().join(selector);
@@ -103,12 +116,45 @@ pub fn attach(selector: &OsStr) -> io::Result<Workspace> {
             ),
         ));
     }
+    let hold = hold(&root)?;
     Ok(Workspace {
         id: selector.to_string_lossy().into_owned(),
         root,
         fresh: false,
         owner: std::process::id(),
+        hold: Some(hold),
     })
+}
+
+/// Acquire this session's share of the tree-wide hold on `root`. The shared
+/// lock never contends with other sessions' shares; only a disposal in
+/// progress (which holds it exclusively) refuses, so an attach cannot land
+/// on a tree that is being removed. The descriptor sits above the runtime's
+/// backing-fd floor, out of reach of guest descriptor operations.
+fn hold(root: &std::path::Path) -> io::Result<OwnedFd> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("lock"))?;
+    // No host FD_CLOEXEC: Chimera emulates guest execve in-process and
+    // sweeps CLOEXEC-marked host descriptors as part of it; the hold must
+    // survive every guest exec in the tree.
+    let high = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 512) };
+    if high < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(high) };
+    if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(if e.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(io::ErrorKind::WouldBlock, "workspace is being removed")
+        } else {
+            e
+        });
+    }
+    Ok(fd)
 }
 
 impl Workspace {
@@ -116,22 +162,49 @@ impl Workspace {
     /// (`--rm`). Otherwise a fresh workspace whose delta is empty vanishes
     /// silently — `chimera run ls` leaves no residue — and a kept one prints
     /// its one-line notice. Attached workspaces are left exactly as they
-    /// are.
-    pub fn finish(self, discard: bool) {
-        if std::process::id() != self.owner {
+    /// are. Disposal itself belongs to the last process out of the guest
+    /// tree (across every attached session), so a backgrounded guest keeps
+    /// its workspace usable after the session root has exited.
+    pub fn finish(mut self, discard: bool) {
+        let owner = std::process::id() == self.owner;
+        // Release this process's share before probing: while any other
+        // process still holds one, disposal is eventually theirs, not ours.
+        drop(self.hold.take());
+        if !discard && !self.fresh {
             return;
         }
-        if discard {
+        let Some(_disposing) = self.last_out() else {
+            // The tree lives on. The root still announces a fresh workspace
+            // it is leaving behind non-empty.
+            if owner && !discard && self.fresh && !self.delta_is_empty() {
+                self.notice();
+            }
+            return;
+        };
+        if discard || self.delta_is_empty() {
             let _ = fs::remove_dir_all(&self.root);
             return;
         }
-        if !self.fresh {
-            return;
+        if owner {
+            self.notice();
         }
-        if self.delta_is_empty() {
-            let _ = fs::remove_dir_all(&self.root);
-            return;
-        }
+    }
+
+    /// The disposal probe: taking the lock exclusively succeeds only when
+    /// every share of every session's process tree is gone. The returned
+    /// guard is held through the removal so a concurrent attach cannot
+    /// acquire a share on the tree mid-deletion.
+    fn last_out(&self) -> Option<OwnedFd> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.root.join("lock"))
+            .ok()?;
+        let fd = OwnedFd::from(file);
+        (unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0).then_some(fd)
+    }
+
+    fn notice(&self) {
         eprintln!(
             "chimera: workspace {} kept at {} (reattach: chimera run -w {} …)",
             self.id,
@@ -407,6 +480,26 @@ fn diff(selector: &str) -> io::Result<()> {
 fn rm(selectors: &[String]) -> io::Result<()> {
     for selector in selectors {
         let root = resolve(selector)?;
+        // Refuse a workspace some live session's tree still holds; the
+        // exclusive guard rides through the removal. A workspace from
+        // before the lock existed has no live holders to protect.
+        let _guard = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("lock"))
+        {
+            Ok(file) => {
+                let fd = OwnedFd::from(file);
+                if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!("workspace {selector} is in use"),
+                    ));
+                }
+                Some(fd)
+            }
+            Err(_) => None,
+        };
         fs::remove_dir_all(&root)?;
     }
     Ok(())
