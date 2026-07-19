@@ -551,6 +551,132 @@ impl From<io::Error> for ApplyError {
     }
 }
 
+/// `CString` from a path's bytes; an embedded NUL is invalid input.
+fn cpath(path: &std::path::Path) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// The xattrs apply replays onto the host: the guest-visible user namespace
+/// and the POSIX ACL attributes. Chimera's reserved `user.chimera.*`
+/// bookkeeping is delta state and never reaches the host.
+fn replayable_xattr(name: &[u8]) -> bool {
+    (name.starts_with(b"user.") && !name.starts_with(b"user.chimera."))
+        || name == b"system.posix_acl_access"
+        || name == b"system.posix_acl_default"
+}
+
+fn copy_xattrs(upper: &std::ffi::CStr, host: &std::ffi::CStr) -> io::Result<()> {
+    let mut names = vec![0u8; 1024];
+    let len = loop {
+        let n = unsafe {
+            libc::llistxattr(
+                upper.as_ptr(),
+                names.as_mut_ptr() as *mut libc::c_char,
+                names.len(),
+            )
+        };
+        if n >= 0 {
+            break n as usize;
+        }
+        match io::Error::last_os_error() {
+            e if e.raw_os_error() == Some(libc::ERANGE) => names.resize(names.len() * 2, 0),
+            // A delta filesystem without xattrs holds none to replay.
+            e if e.raw_os_error() == Some(libc::ENOTSUP) => return Ok(()),
+            e => return Err(e),
+        }
+    };
+    for name in names[..len].split(|&b| b == 0).filter(|n| !n.is_empty()) {
+        if !replayable_xattr(name) {
+            continue;
+        }
+        let cname =
+            std::ffi::CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let mut value = vec![0u8; 256];
+        let vlen = loop {
+            let n = unsafe {
+                libc::lgetxattr(
+                    upper.as_ptr(),
+                    cname.as_ptr(),
+                    value.as_mut_ptr() as *mut libc::c_void,
+                    value.len(),
+                )
+            };
+            if n >= 0 {
+                break n as usize;
+            }
+            match io::Error::last_os_error() {
+                e if e.raw_os_error() == Some(libc::ERANGE) => value.resize(value.len() * 2, 0),
+                e => return Err(e),
+            }
+        };
+        if unsafe {
+            libc::lsetxattr(
+                host.as_ptr(),
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                vlen,
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Reproduce the guest-visible metadata of the upper entry on its applied
+/// host object: ownership first (`chown` may clear set-id bits), then the
+/// permission bits, then the replayable xattrs, and timestamps last because
+/// every earlier step can disturb them. Symlinks take the no-follow subset —
+/// ownership and timestamps. `md` is the upper's metadata captured before
+/// the content transfer: reading the upper for the copy already disturbs
+/// its atime. A failure here is the command's failure; a partial apply
+/// never reads as success.
+fn replay_metadata(
+    md: &fs::Metadata,
+    upper: &std::path::Path,
+    host: &std::path::Path,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let cupper = cpath(upper)?;
+    let chost = cpath(host)?;
+    if unsafe { libc::lchown(chost.as_ptr(), md.uid(), md.gid()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let symlink = md.file_type().is_symlink();
+    if !symlink {
+        if unsafe { libc::chmod(chost.as_ptr(), (md.mode() & 0o7777) as libc::mode_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        copy_xattrs(&cupper, &chost)?;
+    }
+    let times = [
+        libc::timespec {
+            tv_sec: md.atime(),
+            tv_nsec: md.atime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: md.mtime(),
+            tv_nsec: md.mtime_nsec(),
+        },
+    ];
+    if unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            chost.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Remove whatever the host has at `path` so a replacement (or deletion) can
 /// land. The removal call is selected from the existing target, never from
 /// the incoming type — and never through a symlink: a symlink is unlinked
@@ -595,7 +721,7 @@ fn apply_change(change: &Change) -> Result<(), ApplyError> {
         // its type; its children follow in the walk.
         remove_host(host)?;
         fs::create_dir_all(host)?;
-        fs::set_permissions(host, md.permissions())?;
+        replay_metadata(&md, &change.upper, host)?;
         return Ok(());
     }
 
@@ -633,11 +759,13 @@ fn apply_change(change: &Change) -> Result<(), ApplyError> {
             fs::create_dir_all(parent)?;
         }
         fs::copy(&change.upper, host)?;
-        // Advance the origin to the exact host identity this apply produced:
-        // the rerun then recognizes its own work as applied, and anything
-        // the host does to the file afterward as a conflict. A failure
-        // between the copy and here leaves the stale origin, which the
-        // rerun reports as a conflict — never a silent overwrite.
+        replay_metadata(&md, &change.upper, host)?;
+        // Advance the origin to the exact host identity this apply produced
+        // (after the metadata replay, whose timestamps are part of it): the
+        // rerun then recognizes its own work as applied, and anything the
+        // host does to the file afterward as a conflict. A failure between
+        // the copy and here leaves the stale origin, which the rerun
+        // reports as a conflict — never a silent overwrite.
         let applied = fs::symlink_metadata(host)?;
         record_origin(
             &change.upper,
@@ -657,16 +785,17 @@ fn apply_change(change: &Change) -> Result<(), ApplyError> {
         let target = fs::read_link(&change.upper)?;
         remove_host(host)?;
         std::os::unix::fs::symlink(target, host)?;
+        replay_metadata(&md, &change.upper, host)?;
         return Ok(());
     }
 
     if md.file_type().is_fifo() {
-        let cpath = std::ffi::CString::new(host.as_os_str().as_bytes())
-            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let chost = cpath(host)?;
         remove_host(host)?;
-        if unsafe { libc::mkfifo(cpath.as_ptr(), (md.mode() & 0o7777) as libc::mode_t) } != 0 {
+        if unsafe { libc::mkfifo(chost.as_ptr(), (md.mode() & 0o7777) as libc::mode_t) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
+        replay_metadata(&md, &change.upper, host)?;
         return Ok(());
     }
 
