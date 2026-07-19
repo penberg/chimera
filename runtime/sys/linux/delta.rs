@@ -123,6 +123,50 @@ impl Delta {
         Ok(())
     }
 
+    /// Create the upper directory at `rel` itself as scaffolding: structure
+    /// an upper entry needs beneath it, not a claim on the directory's
+    /// identity. A scaffold carries no origin, which is what keeps stat
+    /// serving the lower directory it merges with.
+    pub fn scaffold(&self, rel: &Path) -> Result<(), Errno> {
+        std::fs::create_dir_all(self.data_path(rel)).map_err(|e| Errno::from_io(&e))
+    }
+
+    /// Deliberately copy the lower directory at the host path `src` up to
+    /// `rel`, for a mutation aimed at the directory itself: mirror its
+    /// permission bits and timestamps, then record the origin. The origin
+    /// lands last, so an interruption leaves ordinary scaffolding — which
+    /// keeps serving the lower — never a half-claimed directory.
+    pub fn copy_up_dir(&self, src: &Path, rel: &Path) -> Result<(), Errno> {
+        let csrc = cpath(src)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        check(unsafe { libc::stat(csrc.as_ptr(), &mut st) })?;
+
+        std::fs::create_dir_all(self.data_path(rel)).map_err(|e| Errno::from_io(&e))?;
+        let cdst = cpath(&self.data_path(rel))?;
+        check(unsafe { libc::chmod(cdst.as_ptr(), (st.st_mode & 0o7777) as libc::mode_t) })?;
+        let times = [
+            libc::timespec {
+                tv_sec: st.st_atime,
+                tv_nsec: st.st_atime_nsec,
+            },
+            libc::timespec {
+                tv_sec: st.st_mtime,
+                tv_nsec: st.st_mtime_nsec,
+            },
+        ];
+        check(unsafe { libc::utimensat(libc::AT_FDCWD, cdst.as_ptr(), times.as_ptr(), 0) })?;
+        let origin = Origin::of(&st).encode();
+        check(unsafe {
+            libc::lsetxattr(
+                cdst.as_ptr(),
+                ORIGIN_XATTR.as_ptr(),
+                origin.as_ptr() as *const libc::c_void,
+                origin.len(),
+                0,
+            )
+        })
+    }
+
     /// Write a whiteout for `rel`: the upper entry that says "this name is
     /// deleted", hiding any lower file. Staged and renamed like a copy-up —
     /// a marker file observed without its xattr would read as an empty upper

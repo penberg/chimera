@@ -26,7 +26,7 @@ use std::{
 };
 
 use super::{
-    delta::{Delta, is_opaque, is_whiteout, is_whiteout_fd},
+    delta::{Delta, is_opaque, is_whiteout, is_whiteout_fd, origin},
     hostfs::HostFs,
     vfs::{
         DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec, Vfs,
@@ -149,13 +149,32 @@ impl OverlayInner {
     }
 
     /// Materialize `rel` in the upper so a mutation can land on it: a regular
-    /// file copies up, a directory mirrors (its attribute change must not
-    /// touch the lower), a symlink is recreated with the same target. Special
-    /// files never copy up — the node lives on the lower and stays there —
-    /// so a mutation aimed at one is refused. Idempotent: an existing upper
-    /// entry is left alone.
+    /// file copies up, a directory is deliberately copied up (mirroring the
+    /// lower metadata its scaffold-or-absent upper has been presenting, then
+    /// claiming the identity with an origin), a symlink is recreated with the
+    /// same target. Special files never copy up — the node lives on the lower
+    /// and stays there — so a mutation aimed at one is refused. Idempotent:
+    /// an upper entry that already owns its identity is left alone.
     fn ensure_upper(&self, rel: &Path) -> Result<(), Errno> {
-        if std::fs::symlink_metadata(self.delta.data_path(rel)).is_ok() {
+        let upper = self.delta.data_path(rel);
+        if let Ok(md) = std::fs::symlink_metadata(&upper) {
+            // A directory that has so far been pure scaffolding is about to
+            // take a mutation aimed at itself: claim it, or the change would
+            // land invisibly behind the lower metadata stat keeps serving.
+            if md.is_dir()
+                && matches!(
+                    self.visibility(rel)?,
+                    Visibility::Upper {
+                        lower_masked: false
+                    }
+                )
+                && !is_opaque(&upper)?
+                && origin(&upper)?.is_none()
+                && let Some(src) = self.lower.host_path(rel)
+                && matches!(self.lower.stat(rel, false), Ok(st) if st.file_type == FileType::Directory)
+            {
+                self.delta.copy_up_dir(&src, rel)?;
+            }
             return Ok(());
         }
         let st = self.lower.stat(rel, false)?;
@@ -165,7 +184,8 @@ impl OverlayInner {
                 self.delta.copy_up(&src, rel)
             }
             FileType::Directory => {
-                std::fs::create_dir_all(self.delta.data_path(rel)).map_err(|e| Errno::from_io(&e))
+                let src = self.lower.host_path(rel).ok_or(Errno::EROFS)?;
+                self.delta.copy_up_dir(&src, rel)
             }
             FileType::Symlink => {
                 let target = self.lower.readlink(rel)?;
@@ -174,6 +194,23 @@ impl OverlayInner {
                     .map_err(|e| Errno::from_io(&e))
             }
             _ => Err(Errno::EROFS),
+        }
+    }
+
+    /// The lower stat a scaffold directory keeps presenting, `None` when the
+    /// upper entry genuinely owns the name: a non-directory, a copied-up or
+    /// opaque directory, or a directory with no merged lower counterpart.
+    fn scaffold_stat(&self, rel: &Path, upper: &Stat, lower_masked: bool) -> Option<Stat> {
+        if upper.file_type != FileType::Directory || lower_masked {
+            return None;
+        }
+        let data = self.delta.data_path(rel);
+        if is_opaque(&data).ok()? || origin(&data).ok()?.is_some() {
+            return None;
+        }
+        match self.lower.stat(rel, false) {
+            Ok(st) if st.file_type == FileType::Directory => Some(st),
+            _ => None,
         }
     }
 
@@ -237,6 +274,8 @@ impl Vfs for OverlayFs {
                     upper: file,
                     lower,
                     upper_host: inner.delta.data_path(path),
+                    fs: Arc::clone(inner),
+                    rel: path.to_path_buf(),
                 }))
             }
             Visibility::Lower => {
@@ -278,9 +317,11 @@ impl Vfs for OverlayFs {
                         }
                         // O_TMPFILE writes an anonymous inode into a
                         // directory: it must land in the upper, or the host
-                        // filesystem takes the bytes.
+                        // filesystem takes the bytes. The directory itself is
+                        // only scaffolding for it — not a claim on its
+                        // identity.
                         FileType::Directory if flags.raw() & libc::O_TMPFILE == libc::O_TMPFILE => {
-                            inner.ensure_upper(path)?;
+                            inner.delta.scaffold(path)?;
                             inner.upper.open(path, flags, mode)
                         }
                         // Writing a special file sends bytes to the object
@@ -330,7 +371,13 @@ impl Vfs for OverlayFs {
 
     fn stat(&self, path: &Path, follow: bool) -> Result<Stat, Errno> {
         match self.inner.visibility(path)? {
-            Visibility::Upper { .. } => self.inner.upper.stat(path, follow),
+            Visibility::Upper { lower_masked } => {
+                let st = self.inner.upper.stat(path, follow)?;
+                Ok(self
+                    .inner
+                    .scaffold_stat(path, &st, lower_masked)
+                    .unwrap_or(st))
+            }
             Visibility::Lower => self.inner.lower.stat(path, follow),
             Visibility::Whiteout | Visibility::Masked => Err(Errno::ENOENT),
         }
@@ -542,7 +589,13 @@ impl Vfs for OverlayFs {
 
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno> {
         match self.inner.visibility(path)? {
-            Visibility::Upper { .. } => self.inner.upper.statfs(path),
+            Visibility::Upper { lower_masked } => {
+                let st = self.inner.upper.stat(path, false)?;
+                if self.inner.scaffold_stat(path, &st, lower_masked).is_some() {
+                    return self.inner.lower.statfs(path);
+                }
+                self.inner.upper.statfs(path)
+            }
             Visibility::Lower => self.inner.lower.statfs(path),
             Visibility::Whiteout | Visibility::Masked => Err(Errno::ENOENT),
         }
@@ -661,15 +714,31 @@ impl File for OverlayFile {
     }
 }
 
-/// A merged directory handle: the upper directory (which owns the identity
-/// the guest observes) plus the lower directory whose entries fold into
-/// `getdents`. Everything but the merge delegates to the upper handle.
+/// A merged directory handle: the upper directory plus the lower directory
+/// whose entries fold into `getdents`. While the upper is pure scaffolding
+/// the lower owns the identity the guest observes, so `fstat` answers from
+/// it; an attribute mutation claims the directory first, after which the
+/// upper answers.
 struct OverlayDir {
     upper: Box<dyn File>,
     lower: Option<Box<dyn File>>,
     /// The upper directory's host path, where whiteout markers on its entries
     /// live.
     upper_host: PathBuf,
+    fs: Arc<OverlayInner>,
+    rel: PathBuf,
+}
+
+impl OverlayDir {
+    /// The lower handle, while it still owns the merged identity (see
+    /// [`OverlayInner::scaffold_stat`]; a `lower` here already implies the
+    /// merge is live).
+    fn scaffold_lower(&self) -> Option<&dyn File> {
+        match &self.lower {
+            Some(lower) if origin(&self.upper_host).ok()?.is_none() => Some(lower.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 impl File for OverlayDir {
@@ -686,10 +755,16 @@ impl File for OverlayDir {
     }
 
     fn fstat(&self) -> Result<Stat, Errno> {
+        if let Some(lower) = self.scaffold_lower() {
+            return lower.fstat();
+        }
         self.upper.fstat()
     }
 
     fn fstatfs(&self) -> Result<StatFs, Errno> {
+        if let Some(lower) = self.scaffold_lower() {
+            return lower.fstatfs();
+        }
         self.upper.fstatfs()
     }
 
@@ -702,23 +777,29 @@ impl File for OverlayDir {
     }
 
     fn fchmod(&self, mode: Mode) -> Result<(), Errno> {
-        self.upper.fchmod(mode)
+        self.fs
+            .mutate_upper(&self.rel, |upper| upper.chmod(&self.rel, false, mode))
     }
 
     fn fchown(&self, uid: u32, gid: u32) -> Result<(), Errno> {
-        self.upper.fchown(uid, gid)
+        self.fs
+            .mutate_upper(&self.rel, |upper| upper.chown(&self.rel, false, uid, gid))
     }
 
     fn futimens(&self, times: Option<[Timespec; 2]>) -> Result<(), Errno> {
-        self.upper.futimens(times)
+        self.fs
+            .mutate_upper(&self.rel, |upper| upper.utimens(&self.rel, false, times))
     }
 
     fn fsetxattr(&self, name: &std::ffi::OsStr, value: &[u8], flags: i32) -> Result<(), Errno> {
-        self.upper.fsetxattr(name, value, flags)
+        self.fs.mutate_upper(&self.rel, |upper| {
+            upper.setxattr(&self.rel, false, name, value, flags)
+        })
     }
 
     fn fremovexattr(&self, name: &std::ffi::OsStr) -> Result<(), Errno> {
-        self.upper.fremovexattr(name)
+        self.fs
+            .mutate_upper(&self.rel, |upper| upper.removexattr(&self.rel, false, name))
     }
 
     fn fallocate(&self, mode: i32, offset: u64, len: u64) -> Result<(), Errno> {
@@ -851,6 +932,54 @@ mod tests {
             fs.stat(Path::new("/absent"), true).unwrap_err(),
             Errno::ENOENT
         );
+    }
+
+    /// The workspace root's `data/` always exists and scaffolds appear as
+    /// upper children land, yet the merged identity — inode, device, mode —
+    /// must keep coming from the lower directory until a mutation aimed at
+    /// the directory itself claims it.
+    #[test]
+    fn scaffold_keeps_lower_directory_identity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let scratch = Scratch::new();
+        let Some((fs, _)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::create_dir(scratch.join("lower/d")).unwrap();
+        std::fs::set_permissions(
+            scratch.join("lower/d"),
+            std::fs::Permissions::from_mode(0o1777),
+        )
+        .unwrap();
+        let lower_root = std::fs::metadata(scratch.join("lower")).unwrap();
+        let lower_d = std::fs::metadata(scratch.join("lower/d")).unwrap();
+
+        // "/" is physically upper from the moment the delta exists.
+        let st = fs.stat(Path::new("/"), true).unwrap();
+        assert_eq!((st.dev, st.ino), (lower_root.dev(), lower_root.ino()));
+
+        // An upper child materializes /d as a scaffold; identity stays put.
+        fs.open(
+            Path::new("/d/new"),
+            OpenFlags(libc::O_CREAT | libc::O_WRONLY),
+            Mode(0o644),
+        )
+        .unwrap();
+        let st = fs.stat(Path::new("/d"), true).unwrap();
+        assert_eq!(st.mode.0 & 0o7777, 0o1777);
+        assert_eq!((st.dev, st.ino), (lower_d.dev(), lower_d.ino()));
+        let d = fs
+            .open(Path::new("/d"), OpenFlags(libc::O_RDONLY), Mode(0))
+            .unwrap();
+        let st = d.fstat().unwrap();
+        assert_eq!((st.dev, st.ino), (lower_d.dev(), lower_d.ino()));
+
+        // A chmod aimed at /d claims it: the change is visible and the upper
+        // owns the identity from here on.
+        fs.chmod(Path::new("/d"), true, Mode(0o700)).unwrap();
+        let st = fs.stat(Path::new("/d"), true).unwrap();
+        assert_eq!(st.mode.0 & 0o7777, 0o700);
     }
 
     #[test]
