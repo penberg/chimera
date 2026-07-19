@@ -14,7 +14,7 @@ pub mod signal;
 pub mod syscall;
 mod vfs;
 
-pub use delta::{Origin, is_opaque, is_whiteout, origin};
+pub use delta::{Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin};
 pub use hostfs::HostFs;
 pub use namespace::{MountFlags, Namespace};
 pub use overlayfs::OverlayFs;

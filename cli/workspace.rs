@@ -274,7 +274,9 @@ fn write_meta(root: &std::path::Path, id: &str, command: &str) -> io::Result<()>
 
 use std::path::Path;
 
-use chimera::delta::{Origin, is_opaque, is_whiteout, origin};
+use chimera::delta::{
+    Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin,
+};
 
 use crate::opts::{WorkspaceAction, WsApplyCmd, WsDiffCmd, WsRmCmd};
 
@@ -554,6 +556,20 @@ fn apply_change(change: &Change) -> Result<(), ApplyError> {
 
     let host = &change.path;
     if change.kind == Kind::Deleted {
+        // Once this whiteout's removal has been applied, the name belongs
+        // to the host again: an entry there now is the host's own and a
+        // rerun must refuse it, never delete it twice.
+        if is_applied(&change.upper).map_err(errno_to_io)? {
+            return match fs::symlink_metadata(host) {
+                Ok(_) => Err(ApplyError::Conflict),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            };
+        }
+        // The applied mark lands before the removal: a failure in between
+        // surfaces as a conflict on the rerun — the safe direction, since
+        // the mark is what guarantees no later host entry gets clobbered.
+        mark_applied(&change.upper).map_err(errno_to_io)?;
         // The guest deleted the name; whether file or directory, it goes.
         match fs::symlink_metadata(host) {
             Ok(md) if md.is_dir() => fs::remove_dir_all(host)?,
@@ -610,6 +626,23 @@ fn apply_change(change: &Change) -> Result<(), ApplyError> {
             fs::create_dir_all(parent)?;
         }
         fs::copy(&change.upper, host)?;
+        // Advance the origin to the exact host identity this apply produced:
+        // the rerun then recognizes its own work as applied, and anything
+        // the host does to the file afterward as a conflict. A failure
+        // between the copy and here leaves the stale origin, which the
+        // rerun reports as a conflict — never a silent overwrite.
+        let applied = fs::symlink_metadata(host)?;
+        record_origin(
+            &change.upper,
+            &Origin {
+                dev: applied.dev(),
+                ino: applied.ino(),
+                size: applied.size(),
+                mtime_sec: applied.mtime(),
+                mtime_nsec: applied.mtime_nsec(),
+            },
+        )
+        .map_err(errno_to_io)?;
         return Ok(());
     }
 

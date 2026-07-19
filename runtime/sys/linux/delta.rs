@@ -38,6 +38,7 @@ pub const XATTR_NAMESPACE: &[u8] = b"user.chimera.";
 const WHITEOUT_XATTR: &CStr = c"user.chimera.whiteout";
 const OPAQUE_XATTR: &CStr = c"user.chimera.opaque";
 const ORIGIN_XATTR: &CStr = c"user.chimera.origin";
+const APPLIED_XATTR: &CStr = c"user.chimera.applied";
 const PROBE_XATTR: &CStr = c"user.chimera.probe";
 
 /// A workspace's delta directory: the writable upper tree under `data/` and
@@ -330,6 +331,44 @@ pub fn is_whiteout(path: &Path) -> Result<bool, Errno> {
 /// `true` when the upper directory at `path` is opaque.
 pub fn is_opaque(path: &Path) -> Result<bool, Errno> {
     has_marker(path, OPAQUE_XATTR)
+}
+
+/// Record `origin` on the upper entry at `path` — how apply advances a
+/// change's origin to the exact host identity it just produced, so a rerun
+/// recognizes its own work instead of conflicting with it.
+pub fn record_origin(path: &Path, origin: &Origin) -> Result<(), Errno> {
+    let cpath = cpath(path)?;
+    let encoded = origin.encode();
+    check(unsafe {
+        libc::lsetxattr(
+            cpath.as_ptr(),
+            ORIGIN_XATTR.as_ptr(),
+            encoded.as_ptr() as *const libc::c_void,
+            encoded.len(),
+            0,
+        )
+    })
+}
+
+/// Mark the whiteout at `path` as applied: its host removal has happened (or
+/// was found already done), and any host entry at the name afterward is the
+/// host's own, never to be deleted again by a rerun.
+pub fn mark_applied(path: &Path) -> Result<(), Errno> {
+    let cpath = cpath(path)?;
+    check(unsafe {
+        libc::lsetxattr(
+            cpath.as_ptr(),
+            APPLIED_XATTR.as_ptr(),
+            c"1".as_ptr() as *const libc::c_void,
+            1,
+            0,
+        )
+    })
+}
+
+/// `true` when the whiteout at `path` has already been applied to the host.
+pub fn is_applied(path: &Path) -> Result<bool, Errno> {
+    has_marker(path, APPLIED_XATTR)
 }
 
 /// `true` when the open file is a whiteout marker. Race-free where the
