@@ -496,7 +496,8 @@ impl Vfs for OverlayFs {
         if flags.noreplace() && dst.is_some() {
             return Err(Errno::EEXIST);
         }
-        if src.file_type == FileType::Directory {
+        let src_dir = src.file_type == FileType::Directory;
+        if src_dir {
             // Only a directory that lives purely in the upper can move as a
             // rename; anything lower-visible would need a redirect the format
             // does not carry, so the guest gets EXDEV and its libc falls back
@@ -506,29 +507,72 @@ impl Vfs for OverlayFs {
             if !upper_only {
                 return Err(Errno::EXDEV);
             }
-        } else if !flags.exchange()
-            && dst
-                .as_ref()
-                .is_some_and(|d| d.file_type == FileType::Directory)
-        {
-            return Err(Errno::EISDIR);
         }
         if flags.exchange() {
             // Both names stay live, so both sides materialize and swap in
-            // the upper; nothing needs a whiteout.
-            if dst.is_none() {
+            // the upper; nothing needs a whiteout. A lower-visible directory
+            // destination cannot swap for the same reason a lower source
+            // cannot move: its children stay behind.
+            let Some(dst) = dst else {
                 return Err(Errno::ENOENT);
+            };
+            if dst.file_type == FileType::Directory
+                && (inner.lower_visible(to)
+                    || !matches!(inner.visibility(to)?, Visibility::Upper { .. }))
+            {
+                return Err(Errno::EXDEV);
             }
             inner.ensure_upper(from)?;
             inner.ensure_upper(to)?;
             return inner.upper.rename(from, to, flags);
         }
+        // The remaining preconditions are Linux's, answered in the merged
+        // view — the physical upper may be absent or an empty scaffold where
+        // the merged destination is a populated lower directory.
+        match &dst {
+            Some(d) if src_dir && d.file_type != FileType::Directory => {
+                return Err(Errno::ENOTDIR);
+            }
+            Some(d) if !src_dir && d.file_type == FileType::Directory => {
+                return Err(Errno::EISDIR);
+            }
+            Some(_) if src_dir => {
+                // Directory over directory: the destination must be
+                // merged-empty (whiteouts hide their lower names).
+                let dir = self.open(to, OpenFlags(libc::O_RDONLY | libc::O_DIRECTORY), Mode(0))?;
+                if !dir.getdents()?.is_empty() {
+                    return Err(Errno::ENOTEMPTY);
+                }
+            }
+            _ => {}
+        }
         inner.ensure_upper(from)?;
         inner.delta.materialize_parents(to)?;
+        // Prepare the physical destination where the merged and physical
+        // views disagree. A whiteout marker is a regular file the kernel
+        // would refuse to rename a directory over (and NOREPLACE would trip
+        // on); the merged name is free, so the marker goes. A merged-empty
+        // upper destination directory may still hold whiteout markers the
+        // kernel would count as entries; they vanish with the directory.
+        let to_upper = inner.delta.data_path(to);
+        match std::fs::symlink_metadata(&to_upper) {
+            Ok(_) if is_whiteout(&to_upper)? && (src_dir || flags.noreplace()) => {
+                inner.remove_marker(to)?;
+            }
+            Ok(md) if src_dir && md.is_dir() && dst.is_some() => {
+                std::fs::remove_dir_all(&to_upper).map_err(|e| Errno::from_io(&e))?;
+            }
+            _ => {}
+        }
         // The upper rename atomically claims `to` — replacing a live upper
         // entry or a whiteout marker alike — and the moved entry then
         // shadows any lower `to`.
         inner.upper.rename(from, to, flags)?;
+        // A directory that replaced or shadows a lower name must keep that
+        // lower directory's children (present and future) hidden.
+        if src_dir && inner.lower_visible(to) {
+            inner.delta.set_opaque(to)?;
+        }
         if inner.lower_visible(from) {
             inner.delta.whiteout(from)?;
         }
@@ -1441,6 +1485,28 @@ mod tests {
             ),
             Err(Errno::EEXIST)
         );
+    }
+
+    /// A directory renamed over a lower directory is committed opaque:
+    /// children the lower gains afterward must never merge into the moved
+    /// directory the guest sees at that name.
+    #[test]
+    fn rename_over_lower_directory_commits_opacity() {
+        let scratch = Scratch::new();
+        let Some((fs, _)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::create_dir(scratch.join("lower/dest")).unwrap();
+        fs.mkdir(Path::new("/moved"), Mode(0o755)).unwrap();
+        fs.rename(Path::new("/moved"), Path::new("/dest"), RenameFlags::EMPTY)
+            .unwrap();
+
+        // The host writes into the replaced lower directory afterward.
+        std::fs::write(scratch.join("lower/dest/late"), b"x").unwrap();
+        let dir = fs
+            .open(Path::new("/dest"), OpenFlags(libc::O_RDONLY), Mode(0))
+            .unwrap();
+        assert!(names(dir.as_ref()).is_empty());
     }
 
     #[test]
