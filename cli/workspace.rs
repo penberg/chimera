@@ -518,7 +518,7 @@ fn apply(selector: &str) -> io::Result<()> {
             Err(ApplyError::Conflict) => {
                 conflicts += 1;
                 eprintln!(
-                    "chimera: conflict: {} changed on the host since the workspace copied it (skipped)",
+                    "chimera: conflict: {} changed on the host since the workspace change (skipped)",
                     change.path.display(),
                 );
             }
@@ -577,21 +577,34 @@ fn apply_change(change: &Change) -> Result<(), ApplyError> {
     }
 
     if md.is_file() {
-        // The origin check: a copied-up file knows which lower it shadowed.
-        // A guest-created file has no origin and simply lands.
-        if let Some(o) = origin(&change.upper).map_err(errno_to_io)?
-            && let Ok(host_md) = fs::symlink_metadata(host)
-        {
-            let current = Origin {
-                dev: host_md.dev(),
-                ino: host_md.ino(),
-                size: host_md.size(),
-                mtime_sec: host_md.mtime(),
-                mtime_nsec: host_md.mtime_nsec(),
-            };
-            if current != o {
-                return Err(ApplyError::Conflict);
+        // The origin check, both ways around. A copied-up file knows which
+        // lower it shadowed: that lower must still exist and match, or the
+        // host has moved on — deletion is as much a host-side change as an
+        // edit, and recreating the file would overrule it. A guest-created
+        // file has no origin and lands only where the host still has
+        // nothing; a host entry that appeared since is equally a conflict.
+        // Lookup failures other than NotFound are I/O errors, never
+        // permission to apply.
+        let host_md = match fs::symlink_metadata(host) {
+            Ok(md) => Some(md),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        match (origin(&change.upper).map_err(errno_to_io)?, host_md) {
+            (Some(o), Some(host_md)) => {
+                let current = Origin {
+                    dev: host_md.dev(),
+                    ino: host_md.ino(),
+                    size: host_md.size(),
+                    mtime_sec: host_md.mtime(),
+                    mtime_nsec: host_md.mtime_nsec(),
+                };
+                if current != o {
+                    return Err(ApplyError::Conflict);
+                }
             }
+            (Some(_), None) | (None, Some(_)) => return Err(ApplyError::Conflict),
+            (None, None) => {}
         }
         if let Some(parent) = host.parent() {
             fs::create_dir_all(parent)?;
