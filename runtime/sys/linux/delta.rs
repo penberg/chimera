@@ -284,10 +284,11 @@ impl Delta {
     }
 
     /// Copy the lower regular file at the host path `src` up to `rel`:
-    /// contents (clone → `copy_file_range` → read/write loop), permission
-    /// bits, and timestamps, with the lower's identity recorded in the origin
-    /// xattr — all staged in `tmp/` and renamed into `data/` in one atomic
-    /// step. Publication is first-wins: the staging file claims the name only
+    /// contents (clone → `copy_file_range` → read/write loop), ownership,
+    /// permission bits, timestamps, and the carried xattrs, with the lower's
+    /// identity recorded in the origin xattr — all staged in `tmp/` and
+    /// renamed into `data/` in one atomic step. Publication is first-wins:
+    /// the staging file claims the name only
     /// if no upper entry exists (`RENAME_NOREPLACE`). Two staged copies stop
     /// being equivalent the moment the first publisher opens its result, so a
     /// loser must never detach the winning inode — it discards its staging
@@ -324,6 +325,16 @@ impl Delta {
             transfer(src_fd.as_raw_fd(), dst_fd.as_raw_fd())?;
             // Everything lands on the staging file before the rename
             // publishes it: an upper file is never observable half-made.
+            // Ownership and ACLs come before the mode bits — chown can
+            // clear set-id bits and an ACL write can rewrite the group
+            // class — and timestamps go last (below), after every step that
+            // could disturb them.
+            copy_fd_xattrs(src_fd.as_raw_fd(), dst_fd.as_raw_fd())?;
+            check(unsafe { libc::fchown(dst_fd.as_raw_fd(), st.st_uid, st.st_gid) })?;
+            // The open's 0o600 was filtered by the umask; set the real bits.
+            check(unsafe {
+                libc::fchmod(dst_fd.as_raw_fd(), (st.st_mode & 0o7777) as libc::mode_t)
+            })?;
             let origin = Origin::of(&st).encode();
             check(unsafe {
                 libc::fsetxattr(
@@ -333,10 +344,6 @@ impl Delta {
                     origin.len(),
                     0,
                 )
-            })?;
-            // The open's 0o600 was filtered by the umask; set the real bits.
-            check(unsafe {
-                libc::fchmod(dst_fd.as_raw_fd(), (st.st_mode & 0o7777) as libc::mode_t)
             })?;
             let times = [
                 libc::timespec {
@@ -562,6 +569,69 @@ pub fn origin(path: &Path) -> Result<Option<Origin>, Errno> {
         };
     }
     Ok(Origin::decode(&buf[..n as usize]))
+}
+
+/// The lower attributes a copy-up carries: the guest-visible user namespace
+/// and the POSIX ACLs. The reserved `user.chimera.*` names never come along
+/// — a lower file carrying one, forged or stray, must not become delta
+/// bookkeeping — and kernel-managed namespaces (`security.*`) belong to the
+/// upper file's own filesystem.
+fn carried_xattr(name: &[u8]) -> bool {
+    (name.starts_with(b"user.") && !name.starts_with(XATTR_NAMESPACE))
+        || name == b"system.posix_acl_access"
+        || name == b"system.posix_acl_default"
+}
+
+/// Copy the carried xattrs from one open file to another.
+fn copy_fd_xattrs(src: libc::c_int, dst: libc::c_int) -> Result<(), Errno> {
+    let mut names = vec![0u8; 1024];
+    let len = loop {
+        let n =
+            unsafe { libc::flistxattr(src, names.as_mut_ptr() as *mut libc::c_char, names.len()) };
+        if n >= 0 {
+            break n as usize;
+        }
+        match last_errno() {
+            Errno(libc::ERANGE) => names.resize(names.len() * 2, 0),
+            // A lower filesystem without xattrs holds none to carry.
+            Errno(libc::ENOTSUP) => return Ok(()),
+            e => return Err(e),
+        }
+    };
+    for name in names[..len].split(|&b| b == 0).filter(|n| !n.is_empty()) {
+        if !carried_xattr(name) {
+            continue;
+        }
+        let cname = CString::new(name).map_err(|_| Errno::EINVAL)?;
+        let mut value = vec![0u8; 256];
+        let vlen = loop {
+            let n = unsafe {
+                libc::fgetxattr(
+                    src,
+                    cname.as_ptr(),
+                    value.as_mut_ptr() as *mut libc::c_void,
+                    value.len(),
+                )
+            };
+            if n >= 0 {
+                break n as usize;
+            }
+            match last_errno() {
+                Errno(libc::ERANGE) => value.resize(value.len() * 2, 0),
+                e => return Err(e),
+            }
+        };
+        check(unsafe {
+            libc::fsetxattr(
+                dst,
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                vlen,
+                0,
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Copy `src`'s contents to `dst` (both at offset 0, `dst` freshly created):
@@ -796,6 +866,54 @@ mod tests {
         );
         std::fs::write(d.data_path(Path::new("/fresh")), b"y").unwrap();
         assert_eq!(origin(&d.data_path(Path::new("/fresh"))).unwrap(), None);
+    }
+
+    /// Copy-up carries the lower's user xattrs — and only those: a forged
+    /// reserved-namespace marker on the lower must not become delta
+    /// bookkeeping that deletes the file it rides on.
+    #[test]
+    fn copy_up_carries_xattrs_but_never_markers() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let scratch = Scratch::new();
+        let Some(d) = delta(&scratch) else { return };
+
+        let src = scratch.join("lower");
+        std::fs::write(&src, b"bytes").unwrap();
+        let csrc = CString::new(src.as_os_str().as_bytes()).unwrap();
+        for (name, value) in [
+            (c"user.app", b"v1".as_slice()),
+            (c"user.chimera.whiteout", b"1"),
+        ] {
+            assert_eq!(
+                unsafe {
+                    libc::setxattr(
+                        csrc.as_ptr(),
+                        name.as_ptr(),
+                        value.as_ptr() as *const libc::c_void,
+                        value.len(),
+                        0,
+                    )
+                },
+                0
+            );
+        }
+
+        d.copy_up(&src, Path::new("/f")).unwrap();
+        let upper = d.data_path(Path::new("/f"));
+        let cupper = CString::new(upper.as_os_str().as_bytes()).unwrap();
+        let mut buf = [0u8; 16];
+        let n = unsafe {
+            libc::getxattr(
+                cupper.as_ptr(),
+                c"user.app".as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..2], b"v1");
+        assert!(!is_whiteout(&upper).unwrap());
     }
 
     /// Publication is first-wins: a later copy-up must not detach an inode
