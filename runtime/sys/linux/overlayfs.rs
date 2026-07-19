@@ -26,7 +26,7 @@ use std::{
 };
 
 use super::{
-    delta::{Delta, is_opaque, is_whiteout},
+    delta::{Delta, is_opaque, is_whiteout, is_whiteout_fd},
     hostfs::HostFs,
     vfs::{
         DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec, Vfs,
@@ -263,7 +263,18 @@ impl Vfs for OverlayFs {
                         FileType::Regular => {
                             let src = inner.lower.host_path(path).ok_or(Errno::EROFS)?;
                             inner.delta.copy_up(&src, path)?;
-                            inner.upper.open(path, flags, mode)
+                            let file = inner.upper.open(path, flags, mode)?;
+                            // A lost publication continues through whatever
+                            // won the name — which a concurrent unlink may
+                            // have made a whiteout. The marker on the opened
+                            // fd proves the name was deleted by then, and
+                            // this open serializes after that deletion.
+                            if let Some(fd) = file.host_fd()
+                                && is_whiteout_fd(fd)?
+                            {
+                                return Err(Errno::ENOENT);
+                            }
+                            Ok(file)
                         }
                         // O_TMPFILE writes an anonymous inode into a
                         // directory: it must land in the upper, or the host

@@ -182,8 +182,13 @@ impl Delta {
     /// contents (clone → `copy_file_range` → read/write loop), permission
     /// bits, and timestamps, with the lower's identity recorded in the origin
     /// xattr — all staged in `tmp/` and renamed into `data/` in one atomic
-    /// step. Concurrent copy-ups of the same file are benign: both stage
-    /// equivalent copies of the same lower and the last rename wins.
+    /// step. Publication is first-wins: the staging file claims the name only
+    /// if no upper entry exists (`RENAME_NOREPLACE`). Two staged copies stop
+    /// being equivalent the moment the first publisher opens its result, so a
+    /// loser must never detach the winning inode — it discards its staging
+    /// copy and returns success, and the caller continues through the
+    /// published entry, which a concurrent operation may also have made a
+    /// whiteout or another object entirely. The caller owns validating that.
     pub fn copy_up(&self, src: &Path, rel: &Path) -> Result<(), Errno> {
         let csrc = cpath(src)?;
         let src_fd = unsafe { libc::open(csrc.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
@@ -240,13 +245,35 @@ impl Delta {
             ];
             check(unsafe { libc::futimens(dst_fd.as_raw_fd(), times.as_ptr()) })?;
             self.materialize_parents(rel)?;
-            std::fs::rename(&staging, self.data_path(rel)).map_err(|e| Errno::from_io(&e))
+            match rename_noreplace(&staging, &self.data_path(rel)) {
+                Err(Errno(libc::EEXIST)) => {
+                    let _ = std::fs::remove_file(&staging);
+                    Ok(())
+                }
+                r => r,
+            }
         })();
         if publish.is_err() {
             let _ = std::fs::remove_file(&staging);
         }
         publish
     }
+}
+
+/// `rename(2)` that refuses to replace an existing destination — the
+/// compare-and-swap a first-wins publication needs.
+fn rename_noreplace(from: &Path, to: &Path) -> Result<(), Errno> {
+    let cfrom = cpath(from)?;
+    let cto = cpath(to)?;
+    check(unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            cfrom.as_ptr(),
+            libc::AT_FDCWD,
+            cto.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    })
 }
 
 /// `true` when the upper entry at `path` is a whiteout. A missing entry is
@@ -259,6 +286,21 @@ pub fn is_whiteout(path: &Path) -> Result<bool, Errno> {
 /// `true` when the upper directory at `path` is opaque.
 pub fn is_opaque(path: &Path) -> Result<bool, Errno> {
     has_marker(path, OPAQUE_XATTR)
+}
+
+/// `true` when the open file is a whiteout marker. Race-free where the
+/// path-based probe is not: a whiteout only ever arrives whole by rename,
+/// never by marking a live file in place, so an fd carrying the xattr proves
+/// the name was already deleted when the open resolved it.
+pub fn is_whiteout_fd(fd: std::os::fd::RawFd) -> Result<bool, Errno> {
+    let n = unsafe { libc::fgetxattr(fd, WHITEOUT_XATTR.as_ptr(), std::ptr::null_mut(), 0) };
+    if n >= 0 {
+        return Ok(true);
+    }
+    match last_errno() {
+        Errno(libc::ENODATA) | Errno(libc::ENOTSUP) => Ok(false),
+        e => Err(e),
+    }
 }
 
 fn has_marker(path: &Path, name: &CStr) -> Result<bool, Errno> {
@@ -582,19 +624,40 @@ mod tests {
         assert_eq!(origin(&d.data_path(Path::new("/fresh"))).unwrap(), None);
     }
 
-    /// Concurrent or repeated copy-ups of the same lower file both publish;
-    /// the last rename wins with equivalent content.
+    /// Publication is first-wins: a later copy-up must not detach an inode
+    /// the first publisher has already opened, or the writes acknowledged
+    /// through that descriptor would vanish with the unlinked inode.
     #[test]
-    fn copy_up_replaces_existing_upper() {
+    fn copy_up_lost_publication_keeps_winning_inode() {
+        use std::io::Write;
+
         let scratch = Scratch::new();
         let Some(d) = delta(&scratch) else { return };
 
         let src = scratch.join("lower");
         std::fs::write(&src, b"one").unwrap();
         d.copy_up(&src, Path::new("/f")).unwrap();
+        let mut winner = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.data_path(Path::new("/f")))
+            .unwrap();
+
+        // A copy-up that staged before observing the publication loses the
+        // rename and reports success, leaving the published entry alone.
         std::fs::write(&src, b"two").unwrap();
         d.copy_up(&src, Path::new("/f")).unwrap();
-        assert_eq!(std::fs::read(d.data_path(Path::new("/f"))).unwrap(), b"two");
+
+        // The winner's descriptor still names the inode pathname lookup
+        // serves, and the loser left no staging debris behind.
+        winner.write_all(b"WIN").unwrap();
+        drop(winner);
+        assert_eq!(std::fs::read(d.data_path(Path::new("/f"))).unwrap(), b"WIN");
+        assert_eq!(
+            std::fs::read_dir(scratch.join("delta/tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     /// A multi-block file survives whichever transfer strategy the scratch
