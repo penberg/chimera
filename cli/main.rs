@@ -45,24 +45,6 @@ fn version() -> ExitCode {
 }
 
 fn run(cmd: RunCmd) -> ExitCode {
-    let program = match resolve_program(&cmd.program, &cmd.args) {
-        Ok(program) => program,
-        Err(err) => {
-            eprintln!("chimera: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut sandbox = match Sandbox::new(&program.exec) {
-        Ok(sandbox) => sandbox,
-        Err(err) => {
-            eprintln!("chimera: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Some(mib) = cmd.code_cache_size {
-        sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
-    }
-
     // Route the guest's filesystem syscalls through a userspace VFS mounted
     // at `/`. Copy-on-write is the default: every run mounts an overlay
     // whose upper layer is a workspace's delta, so the guest works against
@@ -86,7 +68,7 @@ fn run(cmd: RunCmd) -> ExitCode {
     } else {
         let ws = match &selector {
             Some(sel) => workspace::attach(sel),
-            None => workspace::create(&describe(&program)),
+            None => workspace::create(&describe(&cmd)),
         };
         let ws = match ws {
             Ok(ws) => ws,
@@ -121,6 +103,34 @@ fn run(cmd: RunCmd) -> ExitCode {
             }
         }
     };
+    // Resolve the initial executable through the same merged view the
+    // guest's own syscalls will see: an attached workspace may have replaced
+    // or deleted the program, its script, or its interpreter, and the session
+    // must load the bytes the guest observes, not the lower host's.
+    let program = match resolve_program(root.as_ref(), &cmd.program, &cmd.args) {
+        Ok(program) => program,
+        Err(err) => {
+            eprintln!("chimera: {err}");
+            if let Some(ws) = ws {
+                ws.finish(cmd.rm);
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut sandbox = match Sandbox::new(&program.host_exec) {
+        Ok(sandbox) => sandbox,
+        Err(err) => {
+            eprintln!("chimera: {err}");
+            if let Some(ws) = ws {
+                ws.finish(cmd.rm);
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(mib) = cmd.code_cache_size {
+        sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
+    }
+
     let personality = Personality::new(Namespace::with_root(root, MountFlags::NONE));
     personality.set_exe(&program.exec);
     sandbox.system_calls(personality);
@@ -139,50 +149,71 @@ fn run(cmd: RunCmd) -> ExitCode {
 }
 
 /// The command line a workspace's provenance records.
-fn describe(program: &Program) -> String {
-    let mut s = program.exec.display().to_string();
-    for arg in &program.args {
+fn describe(cmd: &RunCmd) -> String {
+    let mut s = cmd.program.display().to_string();
+    for arg in &cmd.args {
         s.push(' ');
-        s.push_str(&arg.to_string_lossy());
+        s.push_str(arg);
     }
     s
 }
 
 struct Program {
+    /// The guest-visible executable path — what `/proc/self/exe` reports.
     exec: PathBuf,
+    /// The host file serving `exec` through the merged view; where the ELF
+    /// loader actually reads.
+    host_exec: PathBuf,
     args: Vec<OsString>,
 }
 
-fn resolve_program(program: &Path, args: &[String]) -> Result<Program, io::Error> {
-    let program = resolve_path(program)?;
-    if let Some((interpreter, interpreter_args)) = read_shebang(&program)? {
+fn resolve_program(root: &dyn Vfs, program: &Path, args: &[String]) -> Result<Program, io::Error> {
+    let (exec, host_exec) = resolve_path(root, program)?;
+    if let Some((interpreter, interpreter_args)) = read_shebang(&host_exec)? {
         let mut exec_args = interpreter_args;
         // Run shebang scripts through their interpreter so the runtime still
-        // only has to execute ELF binaries.
-        exec_args.push(program.as_os_str().to_os_string());
+        // only has to execute ELF binaries. The interpreter re-opens the
+        // script by its guest-visible name.
+        exec_args.push(exec.into_os_string());
         exec_args.extend(args.iter().map(OsString::from));
+        let (exec, host_exec) = resolve_path(root, &interpreter)?;
         return Ok(Program {
-            exec: resolve_path(&interpreter)?,
+            exec,
+            host_exec,
             args: exec_args,
         });
     }
 
     Ok(Program {
-        exec: program,
+        exec,
+        host_exec,
         args: args.iter().map(OsString::from).collect(),
     })
 }
 
-fn resolve_path(program: &Path) -> Result<PathBuf, io::Error> {
+/// Resolve `program` to its guest-visible absolute path and the host file
+/// serving it. A bare name walks `PATH` with each candidate's existence
+/// judged in the merged view, so a workspace whiteout hides a candidate
+/// instead of letting the lower host file shadow through.
+fn resolve_path(root: &dyn Vfs, program: &Path) -> Result<(PathBuf, PathBuf), io::Error> {
     if program.is_absolute() || program.components().count() > 1 {
-        return Ok(program.to_path_buf());
+        let exec = absolutize(program)?;
+        let host = root.host_path(&exec).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("program {:?}: no such file or directory", exec.display()),
+            )
+        })?;
+        return Ok((exec, host));
     }
 
     let path = env::var_os("PATH").unwrap_or_default();
     for dir in env::split_paths(&path) {
-        let candidate = dir.join(program);
-        if candidate.is_file() {
-            return Ok(candidate);
+        let candidate = absolutize(&dir.join(program))?;
+        if let Some(host) = root.host_path(&candidate)
+            && host.is_file()
+        {
+            return Ok((candidate, host));
         }
     }
 
@@ -190,6 +221,25 @@ fn resolve_path(program: &Path) -> Result<PathBuf, io::Error> {
         io::ErrorKind::NotFound,
         format!("program {:?} not found in PATH", program.display()),
     ))
+}
+
+/// The lexically absolute form of `path`, anchored at the current directory:
+/// the merged view is indexed by absolute guest paths.
+fn absolutize(path: &Path) -> Result<PathBuf, io::Error> {
+    use std::path::Component;
+
+    let mut out = env::current_dir()?;
+    for c in path.components() {
+        match c {
+            Component::RootDir => out = PathBuf::from("/"),
+            Component::Prefix(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(n) => out.push(n),
+        }
+    }
+    Ok(out)
 }
 
 fn read_shebang(path: &Path) -> Result<Option<(PathBuf, Vec<OsString>)>, io::Error> {
