@@ -17,38 +17,38 @@ pub struct Opts {
 pub enum Command {
     Run(RunCmd),
     Version(VersionCmd),
-    Workspace(WorkspaceCmd),
+    Fs(FsCmd),
 }
 
-/// Manage workspaces: the change-sets kept runs leave behind.
+/// Manage workspace filesystems: the change-sets kept runs leave behind.
 #[derive(FromArgs)]
-#[argh(subcommand, name = "workspace")]
-pub struct WorkspaceCmd {
+#[argh(subcommand, name = "fs")]
+pub struct FsCmd {
     #[argh(subcommand)]
-    pub action: WorkspaceAction,
+    pub action: FsAction,
 }
 
-/// Workspace subcommands.
+/// `fs` subcommands.
 #[derive(FromArgs)]
 #[argh(subcommand)]
-pub enum WorkspaceAction {
-    List(WsListCmd),
-    Diff(WsDiffCmd),
-    Apply(WsApplyCmd),
-    Rm(WsRmCmd),
-    Prune(WsPruneCmd),
+pub enum FsAction {
+    List(FsListCmd),
+    Diff(FsDiffCmd),
+    Apply(FsApplyCmd),
+    Rm(FsRmCmd),
+    Prune(FsPruneCmd),
 }
 
 /// List kept workspaces.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "list")]
-pub struct WsListCmd {}
+pub struct FsListCmd {}
 
 /// Show what a workspace changed, relative to the live host: A added,
 /// M modified, D deleted.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "diff")]
-pub struct WsDiffCmd {
+pub struct FsDiffCmd {
     /// workspace id or path
     #[argh(positional)]
     pub workspace: String,
@@ -59,7 +59,7 @@ pub struct WsDiffCmd {
 /// clobbered.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "apply")]
-pub struct WsApplyCmd {
+pub struct FsApplyCmd {
     /// workspace id or path
     #[argh(positional)]
     pub workspace: String,
@@ -68,7 +68,7 @@ pub struct WsApplyCmd {
 /// Remove workspaces.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "rm")]
-pub struct WsRmCmd {
+pub struct FsRmCmd {
     /// workspace ids or paths
     #[argh(positional)]
     pub workspaces: Vec<String>,
@@ -77,7 +77,7 @@ pub struct WsRmCmd {
 /// Remove every workspace no live session is using, after confirmation.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "prune")]
-pub struct WsPruneCmd {
+pub struct FsPruneCmd {
     /// remove without asking for confirmation
     #[argh(switch, short = 'f')]
     pub force: bool,

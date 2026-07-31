@@ -122,7 +122,7 @@ static int drive(const char *fixture, const char *runner) {
 
     // apply: reports failure (the conflict) but adopts everything else.
     char cmd[PATH_MAX * 2];
-    snprintf(cmd, sizeof(cmd), "%s workspace apply %s >/dev/null 2>&1", chim, ws);
+    snprintf(cmd, sizeof(cmd), "%s fs apply %s >/dev/null 2>&1", chim, ws);
     if (system(cmd) == 0) return 37; // must fail: one conflict
 
     char path[PATH_MAX];
@@ -139,11 +139,11 @@ static int drive(const char *fixture, const char *runner) {
     if (strcmp(buf, "host v1 + host edit") != 0) return 44; // refused, intact
 
     // list: runs cleanly (the path workspace is not under the state dir).
-    snprintf(cmd, sizeof(cmd), "%s workspace list >/dev/null 2>&1", chim);
+    snprintf(cmd, sizeof(cmd), "%s fs list >/dev/null 2>&1", chim);
     if (system(cmd) != 0) return 45;
 
     // rm: the workspace is gone.
-    snprintf(cmd, sizeof(cmd), "%s workspace rm %s >/dev/null 2>&1", chim, ws);
+    snprintf(cmd, sizeof(cmd), "%s fs rm %s >/dev/null 2>&1", chim, ws);
     if (system(cmd) != 0) return 46;
     if (stat(ws, &st) == 0 || errno != ENOENT) return 47;
     return 0;

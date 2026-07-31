@@ -27,7 +27,7 @@ fn main() -> ExitCode {
     match opts.command {
         Command::Run(cmd) => run(cmd),
         Command::Version(_) => version(),
-        Command::Workspace(cmd) => workspace::command(cmd.action),
+        Command::Fs(cmd) => workspace::command(cmd.action),
     }
 }
 

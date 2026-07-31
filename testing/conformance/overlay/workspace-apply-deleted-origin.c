@@ -89,7 +89,7 @@ static int drive(const char *fixture, const char *runner) {
 
     // Both entries are conflicts; apply must fail.
     char cmd[PATH_MAX * 2];
-    snprintf(cmd, sizeof(cmd), "%s workspace apply %s >/dev/null 2>&1", chim, ws);
+    snprintf(cmd, sizeof(cmd), "%s fs apply %s >/dev/null 2>&1", chim, ws);
     if (system(cmd) == 0) return 35;
 
     // The deletion stands: the workspace must not resurrect the file.

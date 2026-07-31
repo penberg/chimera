@@ -1,7 +1,7 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture
 // RUN: test -z "%runner" || %t drive %t.fixture "%runner"
 //
-// `workspace prune` sweeps the state directory: a workspace no session
+// `fs prune` sweeps the state directory: a workspace no session
 // holds is removed (including one from before the lock file existed), a
 // workspace some live session's tree still holds survives, and without -f
 // a prompt fed from a closed stdin declines and removes nothing. The test
@@ -55,7 +55,7 @@ static int exists(const char *base, const char *id) {
 static int prune(const char *chim, const char *state, const char *flags) {
     char cmd[PATH_MAX * 2];
     snprintf(cmd, sizeof(cmd),
-             "XDG_STATE_HOME=%s %s workspace prune %s </dev/null "
+             "XDG_STATE_HOME=%s %s fs prune %s </dev/null "
              ">/dev/null 2>&1",
              state, chim, flags);
     return system(cmd);

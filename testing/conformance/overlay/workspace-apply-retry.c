@@ -84,7 +84,7 @@ static int mutate(const char *fixture) {
 
 static int apply(const char *chim, const char *ws) {
     char cmd[PATH_MAX * 2];
-    snprintf(cmd, sizeof(cmd), "%s workspace apply %s >/dev/null 2>&1", chim, ws);
+    snprintf(cmd, sizeof(cmd), "%s fs apply %s >/dev/null 2>&1", chim, ws);
     return system(cmd);
 }
 

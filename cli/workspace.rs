@@ -263,7 +263,7 @@ fn write_meta(root: &std::path::Path, id: &str, command: &str) -> io::Result<()>
     )
 }
 
-// --- `chimera workspace` tooling -------------------------------------------
+// --- `chimera fs` tooling --------------------------------------------------
 //
 // All of it reads the self-describing on-disk format directly — no daemon,
 // no index. The marker predicates and the origin record come from the
@@ -275,16 +275,16 @@ use chimera::delta::{
     Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin,
 };
 
-use crate::opts::{WorkspaceAction, WsApplyCmd, WsDiffCmd, WsPruneCmd, WsRmCmd};
+use crate::opts::{FsAction, FsApplyCmd, FsDiffCmd, FsPruneCmd, FsRmCmd};
 
-/// Entry point for `chimera workspace <action>`.
-pub fn command(action: WorkspaceAction) -> std::process::ExitCode {
+/// Entry point for `chimera fs <action>`.
+pub fn command(action: FsAction) -> std::process::ExitCode {
     let result = match action {
-        WorkspaceAction::List(_) => list(),
-        WorkspaceAction::Diff(WsDiffCmd { workspace }) => diff(&workspace),
-        WorkspaceAction::Apply(WsApplyCmd { workspace }) => apply(&workspace),
-        WorkspaceAction::Rm(WsRmCmd { workspaces }) => rm(&workspaces),
-        WorkspaceAction::Prune(WsPruneCmd { force }) => prune(force),
+        FsAction::List(_) => list(),
+        FsAction::Diff(FsDiffCmd { workspace }) => diff(&workspace),
+        FsAction::Apply(FsApplyCmd { workspace }) => apply(&workspace),
+        FsAction::Rm(FsRmCmd { workspaces }) => rm(&workspaces),
+        FsAction::Prune(FsPruneCmd { force }) => prune(force),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

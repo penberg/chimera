@@ -24,10 +24,9 @@ pub use sys::linux::{
 /// The tooling side of the workspace delta format, for inspecting and
 /// applying a delta from outside a sandbox: the marker predicates, the
 /// origin record a copy-up leaves behind, and the applied-state writers
-/// `workspace apply` advances after each successful host operation. The
-/// format itself is owned by this crate; the CLI's `chimera workspace`
-/// subcommands consume these rather than reimplementing the on-disk
-/// knowledge.
+/// `fs apply` advances after each successful host operation. The format
+/// itself is owned by this crate; the CLI's `chimera fs` subcommands
+/// consume these rather than reimplementing the on-disk knowledge.
 pub mod delta {
     pub use crate::sys::linux::{
         Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin,

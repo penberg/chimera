@@ -107,7 +107,7 @@ static int drive(const char *fixture, const char *runner) {
     if (sscanf(runner, "%s", chim) != 1) return 32;
 
     char cmd[PATH_MAX * 2];
-    snprintf(cmd, sizeof(cmd), "%s workspace apply %s >/dev/null 2>&1", chim, ws);
+    snprintf(cmd, sizeof(cmd), "%s fs apply %s >/dev/null 2>&1", chim, ws);
     if (system(cmd) != 0) return 33;
 
     // The directory landed over the file, child and all.
