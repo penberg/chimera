@@ -44,6 +44,7 @@ pub struct AddressSpace {
     /// the store — not a genuine fault. Pre-reserved so the fault-path `insert`
     /// does not allocate in the common case.
     granted: HashSet<usize>,
+    program_break: Option<usize>,
 }
 
 impl AddressSpace {
@@ -55,6 +56,7 @@ impl AddressSpace {
             regions: Vec::new(),
             armed: HashSet::new(),
             granted,
+            program_break: None,
         })
     }
 
@@ -232,6 +234,19 @@ impl AddressSpace {
         self.add_region(new_start, new_len);
     }
 
+    pub fn contains_region(&self, start: usize, len: usize) -> bool {
+        let len = round_mapping_len(len);
+        if len == 0 {
+            return false;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        self.regions
+            .iter()
+            .any(|region| region.start <= start && region.start.saturating_add(region.len) >= end)
+    }
+
     pub fn reset(&mut self) {
         self.clear_regions();
         self.code.reset();
@@ -239,7 +254,25 @@ impl AddressSpace {
         self.granted.clear();
     }
 
+    pub fn set_program_break(&mut self, brk: usize) {
+        self.program_break = Some(brk);
+    }
+
+    pub fn update_program_break(&mut self, brk: usize) {
+        if let Some(old_brk) = self.program_break {
+            let old_end = round_mapping_len(old_brk);
+            let new_end = round_mapping_len(brk);
+            if new_end > old_end {
+                self.add_region(old_end, new_end - old_end);
+            } else if new_end < old_end {
+                self.remove_region(new_end, old_end - new_end);
+            }
+        }
+        self.program_break = Some(brk);
+    }
+
     fn clear_regions(&mut self) {
+        self.program_break = None;
         for region in self.regions.drain(..) {
             let ret = unsafe { libc::munmap(region.start as *mut libc::c_void, region.len) };
             debug_assert_eq!(ret, 0, "guest region munmap failed");

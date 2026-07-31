@@ -21,7 +21,7 @@ A workable starter policy for a dynamically linked binary looks
 something like:
 
     cargo run --example sandbox -- \
-        --allow '^(read|write|close|fstat|lseek|mprotect|brk|set_tid_address|set_robust_list|rseq|prlimit64|getrandom|openat|newfstatat|pread64)$' \
+        --allow '^(read|write|close|fstat|lseek|brk|set_tid_address|set_robust_list|rseq|prlimit64|getrandom|openat|newfstatat|pread64)$' \
         /bin/echo hi
 
 Less is more revealing — start with `--allow '^write$'` and let the
@@ -52,7 +52,8 @@ a seccomp-enforced one.
 
 Only delegated syscalls reach `do_syscall()`: Chimera-owned syscalls
 like `exit`/`exit_group`, `execve`, the virtualized `arch_prctl` cases,
-and the `mmap` family are handled by the runtime before
+and the memory-management calls (`mmap`/`munmap`/`mremap` and
+guest-address-space `mprotect`/`pkey_mprotect`) are handled by the runtime before
 `post_syscall()` observers run.
 
 Unknown syscall numbers serialize as `syscall_<n>` so a user-supplied
