@@ -85,7 +85,7 @@ static int mutate(const char *fixture) {
 /// to *status.
 static FILE *tool(const char *chim, const char *args, const char *ws) {
     char cmd[PATH_MAX * 2];
-    snprintf(cmd, sizeof(cmd), "%s workspace %s %s 2>/dev/null", chim, args, ws);
+    snprintf(cmd, sizeof(cmd), "%s fs %s %s 2>/dev/null", chim, args, ws);
     return popen(cmd, "r");
 }
 
