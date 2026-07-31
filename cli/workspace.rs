@@ -205,12 +205,9 @@ impl Workspace {
     }
 
     fn notice(&self) {
-        eprintln!(
-            "chimera: workspace {} kept at {} (reattach: chimera run -w {} …)",
-            self.id,
-            self.root.display(),
-            self.id,
-        );
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        eprintln!("chimera: workspace kept; continue with:");
+        eprintln!("  chimera run -w {} {}", self.id, shell);
     }
 
     /// An empty delta means the guest changed nothing: no upper entries at
