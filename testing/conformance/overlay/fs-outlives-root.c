@@ -1,18 +1,18 @@
 // RUN: %cc %s -o %t && rm -rf %t.probeA %t.probeB %t.childA %t.childB %t.ws2
 // RUN: timeout 15 %runner %t scenario %t.probeA > %t.childA
 // RUN: %t await %t.childA
-// RUN: %t verify-kept "$XDG_STATE_HOME/chimera/workspaces" %t.probeA
-// RUN: case "%runner" in *--unsafe*) : ;; *chimera*) CHIMERA_WORKSPACE=%t.ws2 timeout 15 %runner --rm %t scenario %t.probeB > %t.childB && %t await %t.childB && %t verify-rm %t.ws2 %t.probeB ;; *) : ;; esac
+// RUN: %t verify-kept "$XDG_STATE_HOME/chimera/fs" %t.probeA
+// RUN: case "%runner" in *--unsafe*) : ;; *chimera*) CHIMERA_FS=%t.ws2 timeout 15 %runner --rm %t scenario %t.probeB > %t.childB && %t await %t.childB && %t verify-rm %t.ws2 %t.probeB ;; *) : ;; esac
 //
 // The session lifetime is the guest process tree, not the root command: a
-// forked guest that outlives the session root must keep a usable workspace.
+// forked guest that outlives the session root must keep a usable filesystem.
 // The scenario forks a child that waits (by pipe EOF) until its parent — the
 // session root — has fully exited, then creates and reads back an upper
 // file, reporting through the inherited host stdout. Disposal decisions are
-// deferred to the last process out: the fresh-and-still-empty workspace of
+// deferred to the last process out: the fresh-and-still-empty filesystem of
 // the first run must not be garbage-collected at root exit (the child's
 // write lands in it and keeps it), and the --rm of the second run must not
-// remove the workspace before the child is done — but must remove it after.
+// remove the filesystem before the child is done — but must remove it after.
 // Natively the child simply writes to disk after its parent exits.
 
 #include <dirent.h>
@@ -67,7 +67,7 @@ static int await(const char *report) {
     return 42;
 }
 
-// Overlay runs keep the (now non-empty) workspace: some workspace under the
+// Overlay runs keep the (now non-empty) filesystem: some filesystem under the
 // state directory holds the probe, and the host path stays absent. Native
 // and --unsafe runs wrote straight to disk.
 static int verify_kept(const char *statedir, const char *probe) {

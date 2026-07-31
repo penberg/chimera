@@ -1,5 +1,5 @@
 // RUN: %cc %s -o %t && rm -rf %t.d && %t prep %t.d
-// RUN: CHIMERA_WORKSPACE=%t.ws timeout 20 %runner %t check %t.d
+// RUN: CHIMERA_FS=%t.ws timeout 20 %runner %t check %t.d
 // RUN: %t verify %t.ws %t.d
 //
 // Opening a lower file with write intent copies it up — and that must not
@@ -104,7 +104,7 @@ static int verify(const char *ws, const char *d) {
     snprintf(p, sizeof(p), "%s/data", ws);
     if (stat(p, &st) != 0) return 0; // native or --unsafe: no delta
 
-    // The guest's removexattr stayed in the workspace; the host keeps its
+    // The guest's removexattr stayed in the filesystem; the host keeps its
     // xattr. The forged file's copy-up in the delta is a real file, not a
     // whiteout — the host marker never became bookkeeping.
     snprintf(p, sizeof(p), "%s/g", d);

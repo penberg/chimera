@@ -1,9 +1,9 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture
 // RUN: test -z "%runner" || %t drive %t.fixture "%runner"
 //
-// `fs prune` sweeps the state directory: a workspace no session
+// `fs prune` sweeps the state directory: a filesystem no session
 // holds is removed (including one from before the lock file existed), a
-// workspace some live session's tree still holds survives, and without -f
+// filesystem some live session's tree still holds survives, and without -f
 // a prompt fed from a closed stdin declines and removes nothing. The test
 // runs natively against a private XDG_STATE_HOME, extracting the chimera
 // binary from the runner prefix.
@@ -28,9 +28,9 @@ static int write_file(const char *path, const char *content) {
     return close(fd);
 }
 
-/// Lay out one fake kept workspace: `data/` with a delta file, `meta`, and
+/// Lay out one fake kept filesystem: `data/` with a delta file, `meta`, and
 /// (unless lockless) the `lock` file sessions hold shares on.
-static int fake_workspace(const char *base, const char *id, int lockless) {
+static int fake_filesystem(const char *base, const char *id, int lockless) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", base, id);
     if (mkdir(path, 0755) != 0) return -1;
@@ -67,17 +67,17 @@ static int drive(const char *fixture, const char *runner) {
 
     char state[PATH_MAX], base[PATH_MAX], path[PATH_MAX];
     snprintf(state, sizeof(state), "%s/state", fixture);
-    snprintf(base, sizeof(base), "%s/chimera/workspaces", state);
+    snprintf(base, sizeof(base), "%s/chimera/fs", state);
     if (mkdir(fixture, 0755) != 0) return 12;
     snprintf(path, sizeof(path), "%s/chimera", state);
     if (mkdir(state, 0755) != 0 || mkdir(path, 0755) != 0 ||
         mkdir(base, 0755) != 0)
         return 13;
-    if (fake_workspace(base, "stale", 0) != 0) return 14;
-    if (fake_workspace(base, "prelock", 1) != 0) return 15;
-    if (fake_workspace(base, "busy", 0) != 0) return 16;
+    if (fake_filesystem(base, "stale", 0) != 0) return 14;
+    if (fake_filesystem(base, "prelock", 1) != 0) return 15;
+    if (fake_filesystem(base, "busy", 0) != 0) return 16;
 
-    // A live session's share of the busy workspace's tree-wide hold.
+    // A live session's share of the busy filesystem's tree-wide hold.
     snprintf(path, sizeof(path), "%s/busy/lock", base);
     int held = open(path, O_RDWR);
     if (held < 0 || flock(held, LOCK_SH) != 0) return 17;
@@ -88,12 +88,12 @@ static int drive(const char *fixture, const char *runner) {
         !exists(base, "busy"))
         return 19;
 
-    // Forced: the unheld workspaces go, lock file or not; busy survives.
+    // Forced: the unheld filesystems go, lock file or not; busy survives.
     if (prune(chim, state, "-f") != 0) return 20;
     if (exists(base, "stale") || exists(base, "prelock")) return 21;
     if (!exists(base, "busy")) return 22;
 
-    // Released, the busy workspace is residue like any other.
+    // Released, the busy filesystem is residue like any other.
     close(held);
     if (prune(chim, state, "-f") != 0) return 23;
     if (exists(base, "busy")) return 24;

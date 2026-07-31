@@ -1,12 +1,12 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
-// RUN: test -z "%runner" || CHIMERA_WORKSPACE=%t.fixture/ws %runner %t mutate %t.fixture
+// RUN: test -z "%runner" || CHIMERA_FS=%t.fixture/ws %runner %t mutate %t.fixture
 // RUN: test -z "%runner" || %t drive %t.fixture "%runner"
 //
 // Cross-type replacement: removing the existing host entry must be selected
 // from what the host actually has, never from the incoming upper type. A
 // guest that turned a file into a directory, a directory into a symlink,
 // and a directory into a FIFO leaves an opaque directory, a symlink, and a
-// FIFO in the workspace; apply used to pick remove_dir_all or remove_file
+// FIFO in the filesystem; apply used to pick remove_dir_all or remove_file
 // from those incoming types and then fail with ENOTDIR replacing the file
 // and EISDIR replacing the directories. Apply must land all three: the
 // directory over the file (with its child), the symlink over the directory

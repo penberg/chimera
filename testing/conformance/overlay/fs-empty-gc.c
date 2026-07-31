@@ -1,13 +1,13 @@
 // RUN: %cc %s -o %t && %runner %t read
-// RUN: test -z "$(ls -A "$XDG_STATE_HOME/chimera/workspaces" 2>/dev/null)"
+// RUN: test -z "$(ls -A "$XDG_STATE_HOME/chimera/fs" 2>/dev/null)"
 // RUN: %runner %t write %t.scribble
-// RUN: test -n "$(ls -A "$XDG_STATE_HOME/chimera/workspaces" 2>/dev/null)" || test -f %t.scribble
+// RUN: test -n "$(ls -A "$XDG_STATE_HOME/chimera/fs" 2>/dev/null)" || test -f %t.scribble
 //
-// Workspace hygiene: a run that changes nothing leaves no residue — its
-// fresh workspace's delta is empty and the workspace is removed on exit —
-// while a run that writes keeps its workspace. The suite runner points
+// Filesystem hygiene: a run that changes nothing leaves no residue — its
+// fresh filesystem's delta is empty and the filesystem is removed on exit —
+// while a run that writes keeps its filesystem. The suite runner points
 // XDG_STATE_HOME at a per-test directory, so the shell can observe the
-// workspaces that survive. Natively no workspace exists either way; the
+// filesystems that survive. Natively no filesystem exists either way; the
 // write probe then satisfies the fallback file check instead.
 
 #include <fcntl.h>

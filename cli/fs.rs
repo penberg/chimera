@@ -1,16 +1,16 @@
-//! Workspace lifecycle for `chimera run`.
+//! Filesystem lifecycle for `chimera run`.
 //!
-//! A workspace is the persistent unit of a sandbox's changes: the delta
+//! A filesystem is the persistent unit of a sandbox's changes: the delta
 //! directory (`data/` + `tmp/`, the format `chimera-runtime` owns) plus an
 //! identity and a small provenance file. A session is one `chimera run`
-//! attached to a workspace; sessions come and go, the workspace is what they
-//! leave behind. Every plain run creates a fresh workspace — parallel runs
+//! attached to a filesystem; sessions come and go, the filesystem is what they
+//! leave behind. Every plain run creates a fresh filesystem — parallel runs
 //! are isolated candidate change-sets over the same live tree — and
-//! `-w`/`CHIMERA_WORKSPACE` attaches a new session to an existing one.
+//! `-f`/`CHIMERA_FS` attaches a new session to an existing one.
 //!
 //! The metadata file is informational only: everything correctness depends
 //! on is encoded in the delta tree itself, which is also why two sessions
-//! (or one session's forked processes) can share a workspace with no
+//! (or one session's forked processes) can share a filesystem with no
 //! coordination here.
 
 use std::{
@@ -26,13 +26,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// One workspace: its short id and the directory holding `data/`, `tmp/`,
+/// One filesystem: its short id and the directory holding `data/`, `tmp/`,
 /// and the metadata file.
-pub struct Workspace {
+pub struct Filesystem {
     pub id: String,
     pub root: PathBuf,
     /// Created fresh by this run — eligible for empty-delta removal and the
-    /// kept notice. An attached workspace is the user's to manage.
+    /// kept notice. An attached filesystem is the user's to manage.
     fresh: bool,
     /// The session root's pid. Guest fork is a host fork, so every guest
     /// child's host process carries a copy of this struct and returns
@@ -49,9 +49,9 @@ pub struct Workspace {
     hold: Option<OwnedFd>,
 }
 
-/// Where workspaces live: `$XDG_STATE_HOME/chimera/workspaces`, defaulting
+/// Where filesystems live: `$XDG_STATE_HOME/chimera/fs`, defaulting
 /// to `~/.local/state`.
-fn workspaces_dir() -> PathBuf {
+fn filesystems_dir() -> PathBuf {
     let state = match env::var_os("XDG_STATE_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => match env::var_os("HOME") {
@@ -60,12 +60,12 @@ fn workspaces_dir() -> PathBuf {
             None => env::temp_dir().join("chimera-state"),
         },
     };
-    state.join("chimera/workspaces")
+    state.join("chimera/fs")
 }
 
-/// A fresh workspace with a collision-free generated id.
-pub fn create(command: &str) -> io::Result<Workspace> {
-    let base = workspaces_dir();
+/// A fresh filesystem with a collision-free generated id.
+pub fn create(command: &str) -> io::Result<Filesystem> {
+    let base = filesystems_dir();
     fs::create_dir_all(&base)?;
     loop {
         let id = fresh_id()?;
@@ -74,7 +74,7 @@ pub fn create(command: &str) -> io::Result<Workspace> {
             Ok(()) => {
                 write_meta(&root, &id, command)?;
                 let hold = hold(&root)?;
-                return Ok(Workspace {
+                return Ok(Filesystem {
                     id,
                     root,
                     fresh: true,
@@ -88,16 +88,16 @@ pub fn create(command: &str) -> io::Result<Workspace> {
     }
 }
 
-/// Attach to an existing workspace. A selector containing a path separator
-/// names the workspace directory itself (created if missing — the escape
+/// Attach to an existing filesystem. A selector containing a path separator
+/// names the filesystem directory itself (created if missing — the escape
 /// hatch scripts and the conformance suite use); anything else is an id
 /// under the state directory, which must exist.
-pub fn attach(selector: &OsStr) -> io::Result<Workspace> {
+pub fn attach(selector: &OsStr) -> io::Result<Filesystem> {
     if selector.as_bytes().contains(&b'/') {
         let root = PathBuf::from(selector);
         fs::create_dir_all(&root)?;
         let hold = hold(&root)?;
-        return Ok(Workspace {
+        return Ok(Filesystem {
             id: selector.to_string_lossy().into_owned(),
             root,
             fresh: false,
@@ -105,19 +105,19 @@ pub fn attach(selector: &OsStr) -> io::Result<Workspace> {
             hold: Some(hold),
         });
     }
-    let root = workspaces_dir().join(selector);
+    let root = filesystems_dir().join(selector);
     if !root.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "no workspace {:?} under {}",
+                "no filesystem {:?} under {}",
                 selector,
-                workspaces_dir().display()
+                filesystems_dir().display()
             ),
         ));
     }
     let hold = hold(&root)?;
-    Ok(Workspace {
+    Ok(Filesystem {
         id: selector.to_string_lossy().into_owned(),
         root,
         fresh: false,
@@ -149,7 +149,7 @@ fn hold(root: &std::path::Path) -> io::Result<OwnedFd> {
     if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
         let e = io::Error::last_os_error();
         return Err(if e.kind() == io::ErrorKind::WouldBlock {
-            io::Error::new(io::ErrorKind::WouldBlock, "workspace is being removed")
+            io::Error::new(io::ErrorKind::WouldBlock, "filesystem is being removed")
         } else {
             e
         });
@@ -157,14 +157,14 @@ fn hold(root: &std::path::Path) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-impl Workspace {
-    /// End-of-session disposition. `discard` removes the workspace outright
-    /// (`--rm`). Otherwise a fresh workspace whose delta is empty vanishes
+impl Filesystem {
+    /// End-of-session disposition. `discard` removes the filesystem outright
+    /// (`--rm`). Otherwise a fresh filesystem whose delta is empty vanishes
     /// silently — `chimera run ls` leaves no residue — and a kept one prints
-    /// its one-line notice. Attached workspaces are left exactly as they
+    /// its one-line notice. Attached filesystems are left exactly as they
     /// are. Disposal itself belongs to the last process out of the guest
     /// tree (across every attached session), so a backgrounded guest keeps
-    /// its workspace usable after the session root has exited.
+    /// its filesystem usable after the session root has exited.
     pub fn finish(mut self, discard: bool) {
         let owner = std::process::id() == self.owner;
         // Release this process's share before probing: while any other
@@ -174,7 +174,7 @@ impl Workspace {
             return;
         }
         let Some(_disposing) = self.last_out() else {
-            // The tree lives on. The root still announces a fresh workspace
+            // The tree lives on. The root still announces a fresh filesystem
             // it is leaving behind non-empty.
             if owner && !discard && self.fresh && !self.delta_is_empty() {
                 self.notice();
@@ -206,8 +206,8 @@ impl Workspace {
 
     fn notice(&self) {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        eprintln!("chimera: workspace kept; continue with:");
-        eprintln!("  chimera run -w {} {}", self.id, shell);
+        eprintln!("chimera: filesystem kept; continue with:");
+        eprintln!("  chimera run -f {} {}", self.id, shell);
     }
 
     /// An empty delta means the guest changed nothing: no upper entries at
@@ -248,7 +248,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// The provenance record: which command created the workspace, from where,
+/// The provenance record: which command created the filesystem, from where,
 /// and when.
 fn write_meta(root: &std::path::Path, id: &str, command: &str) -> io::Result<()> {
     let cwd = env::current_dir()
@@ -281,9 +281,9 @@ use crate::opts::{FsAction, FsApplyCmd, FsDiffCmd, FsPruneCmd, FsRmCmd};
 pub fn command(action: FsAction) -> std::process::ExitCode {
     let result = match action {
         FsAction::List(_) => list(),
-        FsAction::Diff(FsDiffCmd { workspace }) => diff(&workspace),
-        FsAction::Apply(FsApplyCmd { workspace }) => apply(&workspace),
-        FsAction::Rm(FsRmCmd { workspaces }) => rm(&workspaces),
+        FsAction::Diff(FsDiffCmd { filesystem }) => diff(&filesystem),
+        FsAction::Apply(FsApplyCmd { filesystem }) => apply(&filesystem),
+        FsAction::Rm(FsRmCmd { filesystems }) => rm(&filesystems),
         FsAction::Prune(FsPruneCmd { force }) => prune(force),
     };
     match result {
@@ -295,25 +295,25 @@ pub fn command(action: FsAction) -> std::process::ExitCode {
     }
 }
 
-/// A workspace named on the command line: an id under the state directory,
-/// or a path to a workspace directory. Either way it must exist.
+/// A filesystem named on the command line: an id under the state directory,
+/// or a path to a filesystem directory. Either way it must exist.
 fn resolve(selector: &str) -> io::Result<PathBuf> {
     let root = if selector.contains('/') {
         PathBuf::from(selector)
     } else {
-        workspaces_dir().join(selector)
+        filesystems_dir().join(selector)
     };
     if !root.join("data").is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("no workspace at {}", root.display()),
+            format!("no filesystem at {}", root.display()),
         ));
     }
     Ok(root)
 }
 
 fn list() -> io::Result<()> {
-    let base = workspaces_dir();
+    let base = filesystems_dir();
     let mut entries = match fs::read_dir(&base) {
         Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -335,7 +335,7 @@ fn list() -> io::Result<()> {
     Ok(())
 }
 
-/// One workspace's `list`-format line: id, age, delta size, creating command.
+/// One filesystem's `list`-format line: id, age, delta size, creating command.
 fn row(id: &str, root: &Path) -> String {
     let meta = fs::read_to_string(root.join("meta")).unwrap_or_default();
     let field = |name: &str| {
@@ -388,7 +388,7 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-/// One entry of a workspace's change-set, keyed by the guest-visible path.
+/// One entry of a filesystem's change-set, keyed by the guest-visible path.
 struct Change {
     kind: Kind,
     /// The absolute path the guest saw (and the host path the change is
@@ -485,8 +485,8 @@ fn diff(selector: &str) -> io::Result<()> {
 /// Take the disposal guard on `root`: the exclusive lock succeeds only when
 /// no live session's tree holds a share, and riding through the removal it
 /// keeps a concurrent attach from landing mid-deletion. `None` for a
-/// workspace from before the lock existed — no live holders to protect.
-/// `WouldBlock` while any session is using the workspace.
+/// filesystem from before the lock existed — no live holders to protect.
+/// `WouldBlock` while any session is using the filesystem.
 fn disposal_guard(root: &Path) -> io::Result<Option<OwnedFd>> {
     let Ok(file) = fs::OpenOptions::new()
         .read(true)
@@ -508,7 +508,7 @@ fn rm(selectors: &[String]) -> io::Result<()> {
         let _guard = disposal_guard(&root).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::WouldBlock,
-                format!("workspace {selector} is in use"),
+                format!("filesystem {selector} is in use"),
             )
         })?;
         fs::remove_dir_all(&root)?;
@@ -516,12 +516,12 @@ fn rm(selectors: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-/// Remove every workspace under the state directory that no live session
+/// Remove every filesystem under the state directory that no live session
 /// holds. The unapplied change-sets go with them, so the candidates are
 /// listed and confirmed first unless forced; a declined prompt (or one fed
 /// from a closed stdin) removes nothing.
 fn prune(force: bool) -> io::Result<()> {
-    let mut entries = match fs::read_dir(workspaces_dir()) {
+    let mut entries = match fs::read_dir(filesystems_dir()) {
         Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
@@ -545,11 +545,11 @@ fn prune(force: bool) -> io::Result<()> {
     }
     if !force {
         use std::io::Write as _;
-        println!("pruning removes these workspaces and their unapplied changes:");
+        println!("pruning removes these filesystems and their unapplied changes:");
         for (id, root, _) in &victims {
             println!("  {}", row(id, root));
         }
-        print!("remove {} workspace(s)? [y/N] ", victims.len());
+        print!("remove {} filesystem(s)? [y/N] ", victims.len());
         io::stdout().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
@@ -563,14 +563,14 @@ fn prune(force: bool) -> io::Result<()> {
         fs::remove_dir_all(root)?;
     }
     println!(
-        "removed {} workspace(s), freed {}",
+        "removed {} filesystem(s), freed {}",
         victims.len(),
         human_size(freed),
     );
     Ok(())
 }
 
-/// Copy the workspace's changes onto the host. A modified file whose host
+/// Copy the filesystem's changes onto the host. A modified file whose host
 /// copy no longer matches the origin recorded at copy-up is refused rather
 /// than clobbered; everything else applies, and any conflict makes the whole
 /// command report failure.
@@ -583,7 +583,7 @@ fn apply(selector: &str) -> io::Result<()> {
             Err(ApplyError::Conflict) => {
                 conflicts += 1;
                 eprintln!(
-                    "chimera: conflict: {} changed on the host since the workspace change (skipped)",
+                    "chimera: conflict: {} changed on the host since the filesystem change (skipped)",
                     change.path.display(),
                 );
             }

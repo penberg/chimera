@@ -1,5 +1,5 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
-// RUN: test -z "%runner" || CHIMERA_WORKSPACE=%t.fixture/ws %runner %t mutate %t.fixture
+// RUN: test -z "%runner" || CHIMERA_FS=%t.fixture/ws %runner %t mutate %t.fixture
 // RUN: test -z "%runner" || %t drive %t.fixture "%runner"
 //
 // Apply must treat every host-side change as a conflict, not only an edit.
@@ -80,7 +80,7 @@ static int drive(const char *fixture, const char *runner) {
     char chim[PATH_MAX];
     if (sscanf(runner, "%s", chim) != 1) return 32;
 
-    // The host moves on underneath the workspace: the copied-up file is
+    // The host moves on underneath the filesystem: the copied-up file is
     // deleted, and a squatter appears where the guest created a new file.
     snprintf(path, sizeof(path), "%s/gone", lower);
     if (unlink(path) != 0) return 33;
@@ -92,7 +92,7 @@ static int drive(const char *fixture, const char *runner) {
     snprintf(cmd, sizeof(cmd), "%s fs apply %s >/dev/null 2>&1", chim, ws);
     if (system(cmd) == 0) return 35;
 
-    // The deletion stands: the workspace must not resurrect the file.
+    // The deletion stands: the filesystem must not resurrect the file.
     snprintf(path, sizeof(path), "%s/gone", lower);
     if (stat(path, &st) == 0 || errno != ENOENT) return 36;
 

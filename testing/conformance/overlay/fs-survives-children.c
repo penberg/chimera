@@ -1,12 +1,12 @@
 // RUN: %cc %s -o %t && rm -rf %t.probe && %runner %t %t.probe && rm -f %t.probe
 //
-// A guest child's exit must not end the session's workspace. Guest fork is a
+// A guest child's exit must not end the session's filesystem. Guest fork is a
 // host fork, so a child's host process carries a copy of the CLI and returns
 // through it when the child exits; the end-of-session disposition (the
 // empty-delta removal, the kept notice, --rm) belongs to the session root
 // alone. The regression this pins: an interactive bash forks short-lived rc
 // children before anything writes, the first child's exit garbage-collected
-// the still-empty workspace, and every later write in the session failed
+// the still-empty filesystem, and every later write in the session failed
 // with ENOENT while reads kept working.
 
 #include <fcntl.h>
@@ -18,7 +18,7 @@
 int main(int argc, char **argv) {
     if (argc != 2) return 10;
 
-    // A child that exits while the workspace's delta is still empty.
+    // A child that exits while the filesystem's delta is still empty.
     pid_t pid = fork();
     if (pid < 0) return 1;
     if (pid == 0) _exit(0);

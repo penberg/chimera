@@ -70,8 +70,8 @@ def run_test(source: Path, *, cc: str, runner: str, timeout: float) -> Result:
         return Result("skip", "no RUN directives")
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td) / source.stem
-        # Fresh workspaces land under $XDG_STATE_HOME/chimera/workspaces;
-        # point that at the per-test directory so every run's workspace is
+        # Fresh filesystems land under $XDG_STATE_HOME/chimera/fs;
+        # point that at the per-test directory so every run's filesystem is
         # born and dies with the test.
         env = dict(os.environ)
         env["XDG_STATE_HOME"] = str(Path(td) / "state")

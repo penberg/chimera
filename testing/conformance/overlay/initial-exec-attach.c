@@ -1,17 +1,17 @@
 // RUN: %cc %s -o %t && %cc -DNEWVER %s -o %t.new && rm -rf %t.d %t.ws && %t prep %t.d
-// RUN: CHIMERA_WORKSPACE=%t.ws %runner %t rewrite %t.new %t.d/prog
-// RUN: CHIMERA_WORKSPACE=%t.ws %runner %t.d/prog; test $? -eq 77
-// RUN: CHIMERA_WORKSPACE=%t.ws %runner %t.d/script; test $? -eq 77
-// RUN: CHIMERA_WORKSPACE=%t.ws %runner %t unlink %t.d/prog
-// RUN: CHIMERA_WORKSPACE=%t.ws %runner %t.d/prog; c=$?; test $c -ne 0 && test $c -ne 11
+// RUN: CHIMERA_FS=%t.ws %runner %t rewrite %t.new %t.d/prog
+// RUN: CHIMERA_FS=%t.ws %runner %t.d/prog; test $? -eq 77
+// RUN: CHIMERA_FS=%t.ws %runner %t.d/script; test $? -eq 77
+// RUN: CHIMERA_FS=%t.ws %runner %t unlink %t.d/prog
+// RUN: CHIMERA_FS=%t.ws %runner %t.d/prog; c=$?; test $c -ne 0 && test $c -ne 11
 //
 // Initial-exec coherence: the executable that starts a session must come
 // from the same merged view the guest's own syscalls see. One session
 // rewrites `prog` (old version exits 11, new version 77); a second session
-// attached to the same workspace then runs `prog` as its *initial*
-// executable and must get 77 — the workspace's copy, not the stale host
+// attached to the same filesystem then runs `prog` as its *initial*
+// executable and must get 77 — the filesystem's copy, not the stale host
 // bytes. The same holds one level down: `script`'s shebang names `prog`, so
-// the interpreter lookup must resolve through the workspace too. Finally a
+// the interpreter lookup must resolve through the filesystem too. Finally a
 // session deletes `prog`; launching it afterward must fail rather than
 // resurrect the lower file (and in particular must not run the old version,
 // exit 11). Natively the rewrite and unlink hit the host file itself, so

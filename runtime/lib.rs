@@ -21,7 +21,7 @@ pub use sys::linux::{
     Personality, RenameFlags, Stat, StatFs, Timespec, Vfs, WriteResult,
 };
 
-/// The tooling side of the workspace delta format, for inspecting and
+/// The tooling side of the filesystem delta format, for inspecting and
 /// applying a delta from outside a sandbox: the marker predicates, the
 /// origin record a copy-up leaves behind, and the applied-state writers
 /// `fs apply` advances after each successful host operation. The format

@@ -1,5 +1,5 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
-// RUN: test -f %t.fixture/skip || CHIMERA_WORKSPACE=%t.fixture/delta %runner %t check %t.fixture
+// RUN: test -f %t.fixture/skip || CHIMERA_FS=%t.fixture/delta %runner %t check %t.fixture
 //
 // Overlay resolution: a whiteout deletes a lower name from the merged view
 // (and never appears itself), an upper file shadows its lower counterpart,

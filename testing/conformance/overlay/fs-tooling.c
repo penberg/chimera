@@ -1,11 +1,11 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
-// RUN: test -z "%runner" || CHIMERA_WORKSPACE=%t.fixture/ws %runner %t mutate %t.fixture
+// RUN: test -z "%runner" || CHIMERA_FS=%t.fixture/ws %runner %t mutate %t.fixture
 // RUN: test -z "%runner" || %t drive %t.fixture "%runner"
 //
-// The workspace tooling, driven against a workspace a scripted run left
+// The filesystem tooling, driven against a filesystem a scripted run left
 // behind: diff reports the added, modified, and deleted paths; apply adopts
 // the changes onto the host but refuses a file whose host copy changed since
-// the workspace copied it up (the origin check); rm removes the workspace;
+// the filesystem copied it up (the origin check); rm removes the filesystem;
 // list exits cleanly. The drive step runs natively, extracts the chimera
 // binary from the runner prefix, and skips itself when no delta materialized
 // (native and --unsafe suite runs, where the mutations landed directly).
@@ -81,7 +81,7 @@ static int mutate(const char *fixture) {
     return 0;
 }
 
-/// Run `<chimera> workspace <args>`, capturing stdout; the exit status goes
+/// Run `<chimera> filesystem <args>`, capturing stdout; the exit status goes
 /// to *status.
 static FILE *tool(const char *chim, const char *args, const char *ws) {
     char cmd[PATH_MAX * 2];
@@ -138,11 +138,11 @@ static int drive(const char *fixture, const char *runner) {
     if (read_file(path, buf, sizeof(buf)) != 0) return 43;
     if (strcmp(buf, "host v1 + host edit") != 0) return 44; // refused, intact
 
-    // list: runs cleanly (the path workspace is not under the state dir).
+    // list: runs cleanly (the path filesystem is not under the state dir).
     snprintf(cmd, sizeof(cmd), "%s fs list >/dev/null 2>&1", chim);
     if (system(cmd) != 0) return 45;
 
-    // rm: the workspace is gone.
+    // rm: the filesystem is gone.
     snprintf(cmd, sizeof(cmd), "%s fs rm %s >/dev/null 2>&1", chim, ws);
     if (system(cmd) != 0) return 46;
     if (stat(ws, &st) == 0 || errno != ENOENT) return 47;
