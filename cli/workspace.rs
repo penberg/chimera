@@ -275,7 +275,7 @@ use chimera::delta::{
     Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin,
 };
 
-use crate::opts::{WorkspaceAction, WsApplyCmd, WsDiffCmd, WsRmCmd};
+use crate::opts::{WorkspaceAction, WsApplyCmd, WsDiffCmd, WsPruneCmd, WsRmCmd};
 
 /// Entry point for `chimera workspace <action>`.
 pub fn command(action: WorkspaceAction) -> std::process::ExitCode {
@@ -284,6 +284,7 @@ pub fn command(action: WorkspaceAction) -> std::process::ExitCode {
         WorkspaceAction::Diff(WsDiffCmd { workspace }) => diff(&workspace),
         WorkspaceAction::Apply(WsApplyCmd { workspace }) => apply(&workspace),
         WorkspaceAction::Rm(WsRmCmd { workspaces }) => rm(&workspaces),
+        WorkspaceAction::Prune(WsPruneCmd { force }) => prune(force),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -329,25 +330,30 @@ fn list() -> io::Result<()> {
             continue;
         }
         let id = entry.file_name().to_string_lossy().into_owned();
-        let meta = fs::read_to_string(root.join("meta")).unwrap_or_default();
-        let field = |name: &str| {
-            meta.lines()
-                .find_map(|l| l.strip_prefix(name))
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        };
-        let age = field("created =")
-            .parse::<u64>()
-            .map(|created| human_age(now_secs().saturating_sub(created)))
-            .unwrap_or_default();
-        println!(
-            "{id:<10} {age:>5} {:>8}  {}",
-            human_size(tree_size(&root.join("data"))),
-            field("command ="),
-        );
+        println!("{}", row(&id, &root));
     }
     Ok(())
+}
+
+/// One workspace's `list`-format line: id, age, delta size, creating command.
+fn row(id: &str, root: &Path) -> String {
+    let meta = fs::read_to_string(root.join("meta")).unwrap_or_default();
+    let field = |name: &str| {
+        meta.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let age = field("created =")
+        .parse::<u64>()
+        .map(|created| human_age(now_secs().saturating_sub(created)))
+        .unwrap_or_default();
+    format!(
+        "{id:<10} {age:>5} {:>8}  {}",
+        human_size(tree_size(&root.join("data"))),
+        field("command ="),
+    )
 }
 
 fn tree_size(dir: &Path) -> u64 {
@@ -476,31 +482,91 @@ fn diff(selector: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Take the disposal guard on `root`: the exclusive lock succeeds only when
+/// no live session's tree holds a share, and riding through the removal it
+/// keeps a concurrent attach from landing mid-deletion. `None` for a
+/// workspace from before the lock existed — no live holders to protect.
+/// `WouldBlock` while any session is using the workspace.
+fn disposal_guard(root: &Path) -> io::Result<Option<OwnedFd>> {
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("lock"))
+    else {
+        return Ok(None);
+    };
+    let fd = OwnedFd::from(file);
+    if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::ErrorKind::WouldBlock.into());
+    }
+    Ok(Some(fd))
+}
+
 fn rm(selectors: &[String]) -> io::Result<()> {
     for selector in selectors {
         let root = resolve(selector)?;
-        // Refuse a workspace some live session's tree still holds; the
-        // exclusive guard rides through the removal. A workspace from
-        // before the lock existed has no live holders to protect.
-        let _guard = match fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(root.join("lock"))
-        {
-            Ok(file) => {
-                let fd = OwnedFd::from(file);
-                if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        format!("workspace {selector} is in use"),
-                    ));
-                }
-                Some(fd)
-            }
-            Err(_) => None,
-        };
+        let _guard = disposal_guard(&root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("workspace {selector} is in use"),
+            )
+        })?;
         fs::remove_dir_all(&root)?;
     }
+    Ok(())
+}
+
+/// Remove every workspace under the state directory that no live session
+/// holds. The unapplied change-sets go with them, so the candidates are
+/// listed and confirmed first unless forced; a declined prompt (or one fed
+/// from a closed stdin) removes nothing.
+fn prune(force: bool) -> io::Result<()> {
+    let mut entries = match fs::read_dir(workspaces_dir()) {
+        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    entries.sort_by_key(|e| e.file_name());
+    let mut victims = Vec::new();
+    for entry in entries {
+        let root = entry.path();
+        if !root.join("data").is_dir() {
+            continue;
+        }
+        let Ok(guard) = disposal_guard(&root) else {
+            continue;
+        };
+        let id = entry.file_name().to_string_lossy().into_owned();
+        victims.push((id, root, guard));
+    }
+    if victims.is_empty() {
+        println!("nothing to prune");
+        return Ok(());
+    }
+    if !force {
+        use std::io::Write as _;
+        println!("pruning removes these workspaces and their unapplied changes:");
+        for (id, root, _) in &victims {
+            println!("  {}", row(id, root));
+        }
+        print!("remove {} workspace(s)? [y/N] ", victims.len());
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            return Ok(());
+        }
+    }
+    let mut freed = 0;
+    for (_, root, _guard) in &victims {
+        freed += tree_size(&root.join("data"));
+        fs::remove_dir_all(root)?;
+    }
+    println!(
+        "removed {} workspace(s), freed {}",
+        victims.len(),
+        human_size(freed),
+    );
     Ok(())
 }
 

@@ -36,6 +36,7 @@ pub enum WorkspaceAction {
     Diff(WsDiffCmd),
     Apply(WsApplyCmd),
     Rm(WsRmCmd),
+    Prune(WsPruneCmd),
 }
 
 /// List kept workspaces.
@@ -71,6 +72,15 @@ pub struct WsRmCmd {
     /// workspace ids or paths
     #[argh(positional)]
     pub workspaces: Vec<String>,
+}
+
+/// Remove every workspace no live session is using, after confirmation.
+#[derive(FromArgs)]
+#[argh(subcommand, name = "prune")]
+pub struct WsPruneCmd {
+    /// remove without asking for confirmation
+    #[argh(switch, short = 'f')]
+    pub force: bool,
 }
 
 /// Run a program.
