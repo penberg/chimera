@@ -70,6 +70,11 @@ def run_test(source: Path, *, cc: str, runner: str, timeout: float) -> Result:
         return Result("skip", "no RUN directives")
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td) / source.stem
+        # Fresh workspaces land under $XDG_STATE_HOME/chimera/workspaces;
+        # point that at the per-test directory so every run's workspace is
+        # born and dies with the test.
+        env = dict(os.environ)
+        env["XDG_STATE_HOME"] = str(Path(td) / "state")
         for cmd in runs:
             full = substitute(cmd, source=source, tmp=tmp, cc=cc, runner=runner)
             try:
@@ -79,6 +84,7 @@ def run_test(source: Path, *, cc: str, runner: str, timeout: float) -> Result:
                     capture_output=True,
                     text=True,
                     timeout=timeout,
+                    env=env,
                 )
             except subprocess.TimeoutExpired:
                 # A test that never returns (e.g. a deadlock) is a failure, not

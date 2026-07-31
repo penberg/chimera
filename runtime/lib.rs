@@ -17,9 +17,22 @@ pub use syscall::{ForkHold, Passthrough, SyscallResult, SystemCall, SystemCalls}
 pub use sys::linux::syscall::host_syscall;
 
 pub use sys::linux::{
-    DirEntry, Errno, File, FileType, HostFs, Mode, MountFlags, Namespace, OpenFlags, Personality,
-    RenameFlags, Stat, StatFs, Timespec, Vfs, WriteResult,
+    DirEntry, Errno, File, FileType, HostFs, Mode, MountFlags, Namespace, OpenFlags, OverlayFs,
+    Personality, RenameFlags, Stat, StatFs, Timespec, Vfs, WriteResult,
 };
+
+/// The tooling side of the workspace delta format, for inspecting and
+/// applying a delta from outside a sandbox: the marker predicates, the
+/// origin record a copy-up leaves behind, and the applied-state writers
+/// `workspace apply` advances after each successful host operation. The
+/// format itself is owned by this crate; the CLI's `chimera workspace`
+/// subcommands consume these rather than reimplementing the on-disk
+/// knowledge.
+pub mod delta {
+    pub use crate::sys::linux::{
+        Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin,
+    };
+}
 
 /// Default capacity of the translated-code cache, in bytes. One cache is
 /// shared by every guest thread, so a multithreaded guest translates more
