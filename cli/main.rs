@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-use chimera::{HostFs, MountFlags, Namespace, OverlayFs, Personality, Sandbox, Vfs};
+use chimera::{Backend, HostFs, MountFlags, Namespace, OverlayFs, Personality, Sandbox, Vfs};
 use mimalloc::MiMalloc;
 
 use opts::{Command, Opts, RunCmd};
@@ -50,6 +50,14 @@ fn version() -> ExitCode {
 }
 
 fn run(mut cmd: RunCmd) -> ExitCode {
+    let backend = match cmd.backend.as_deref() {
+        None | Some("dbt") => Backend::Translate,
+        Some("sud") => Backend::SyscallUserDispatch,
+        Some(other) => {
+            eprintln!("chimera: unknown backend {other:?} (expected dbt or sud)");
+            return ExitCode::FAILURE;
+        }
+    };
     // Only a shell Chimera starts on its own gets a badged prompt; a program
     // the user named runs exactly as typed.
     let implicit_shell = cmd.argv.is_empty();
@@ -199,6 +207,7 @@ fn run(mut cmd: RunCmd) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    sandbox.backend(backend);
     if let Some(mib) = cmd.code_cache_size {
         sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
     }

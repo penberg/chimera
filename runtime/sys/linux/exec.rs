@@ -38,30 +38,7 @@ pub fn execv(
     handler: Box<dyn SystemCalls>,
     code_cache_size: usize,
 ) -> Result<i32, Error> {
-    // The first image's argv and envp come from the embedder: argv[0] is the
-    // program path, then the supplied args; the environment is the explicit set
-    // if one was given, otherwise the host's. The program path is the
-    // guest-visible name, resolved and installed exactly like a guest `execve`
-    // target — handler namespace, shebang splice, and `on_execve` report — so
-    // the initial image comes from the same view the guest's own execs use.
-    let mut argv: Vec<Vec<u8>> = Vec::with_capacity(args.len() + 1);
-    argv.push(program.as_os_str().as_bytes().to_vec());
-    for a in args {
-        argv.push(a.as_bytes().to_vec());
-    }
-    let envp: Vec<Vec<u8>> = match envs {
-        Some(over) => over.iter().map(|(k, v)| env_pair(k, v)).collect(),
-        None => std::env::vars_os().map(|(k, v)| env_pair(&k, &v)).collect(),
-    };
-    let raw = program.as_os_str().as_bytes().to_vec();
-    let path = resolve_exec_path(AT_FDCWD, &raw, 0, &*handler)?;
-    let mut req = ExecRequest {
-        path,
-        raw,
-        argv,
-        envp,
-    };
-    splice_shebang(&mut req, &*handler)?;
+    let req = initial_request(program, args, envs, &*handler)?;
 
     let main = load_elf(&req.path)?;
     let (rip, interp_base, interp) = match &main.interp {
@@ -183,7 +160,7 @@ pub fn drive(thread: &mut dispatch::Thread, mut reason: ExitReason) -> Result<i3
 /// deliver. `keep` names the runtime's own fds that must survive the install
 /// (the replacement image's files, still to be mapped); any runtime fd held
 /// across an exec must be listed there, since Rust opens files `O_CLOEXEC`.
-fn close_cloexec_fds(keep: &[RawFd]) -> Result<(), Error> {
+pub fn close_cloexec_fds(keep: &[RawFd]) -> Result<(), Error> {
     let entries = fs::read_dir("/proc/self/fd")
         .map_err(|e| Error::io("execve: listing /proc/self/fd".to_string(), e))?;
     // Collect before closing: the directory walk holds an fd of its own, and
@@ -210,9 +187,9 @@ fn close_cloexec_fds(keep: &[RawFd]) -> Result<(), Error> {
 /// throughout, so it can be published on the shared `Process` by whichever
 /// thread's `execve` committed and consumed later on the main host thread.
 pub struct PreparedExec {
-    req: ExecRequest,
-    parsed: ParsedElf,
-    parsed_interp: Option<ParsedElf>,
+    pub req: ExecRequest,
+    pub parsed: ParsedElf,
+    pub parsed_interp: Option<ParsedElf>,
 }
 
 /// Read an `execve`/`execveat` request out of guest memory and parse the
@@ -357,6 +334,39 @@ fn shebang_line(path: &Path) -> Result<Option<ShebangLine>, Error> {
     Ok(Some((interp, optarg)))
 }
 
+/// Build the first image's exec request from the embedder's configuration:
+/// argv[0] is the program path, then the supplied args; the environment is
+/// the explicit set if one was given, otherwise the host's. The program path
+/// is the guest-visible name, resolved exactly like a guest `execve` target —
+/// handler namespace and shebang splice — so the initial image comes from
+/// the same view the guest's own execs use.
+pub fn initial_request(
+    program: &Path,
+    args: &[OsString],
+    envs: Option<&[(OsString, OsString)]>,
+    handler: &dyn SystemCalls,
+) -> Result<ExecRequest, Error> {
+    let mut argv: Vec<Vec<u8>> = Vec::with_capacity(args.len() + 1);
+    argv.push(program.as_os_str().as_bytes().to_vec());
+    for a in args {
+        argv.push(a.as_bytes().to_vec());
+    }
+    let envp: Vec<Vec<u8>> = match envs {
+        Some(over) => over.iter().map(|(k, v)| env_pair(k, v)).collect(),
+        None => std::env::vars_os().map(|(k, v)| env_pair(&k, &v)).collect(),
+    };
+    let raw = program.as_os_str().as_bytes().to_vec();
+    let path = resolve_exec_path(AT_FDCWD, &raw, 0, handler)?;
+    let mut req = ExecRequest {
+        path,
+        raw,
+        argv,
+        envp,
+    };
+    splice_shebang(&mut req, handler)?;
+    Ok(req)
+}
+
 /// Format a `KEY=VALUE` environment entry (no trailing NUL; `build_stack` adds
 /// it).
 fn env_pair(key: &OsStr, value: &OsStr) -> Vec<u8> {
@@ -392,11 +402,11 @@ fn record_regions(
 /// is the pathname as the guest passed it, before namespace resolution: a
 /// shebang splice hands it to the interpreter, which re-resolves it under
 /// the same guest semantics.
-struct ExecRequest {
-    path: PathBuf,
-    raw: Vec<u8>,
-    argv: Vec<Vec<u8>>,
-    envp: Vec<Vec<u8>>,
+pub struct ExecRequest {
+    pub path: PathBuf,
+    pub raw: Vec<u8>,
+    pub argv: Vec<Vec<u8>>,
+    pub envp: Vec<Vec<u8>>,
 }
 
 /// Read an `execve`/`execveat` request out of guest memory. Chimera and the
@@ -537,7 +547,7 @@ unsafe fn push_str(p: &mut u64, s: &[u8]) -> u64 {
 /// Build the initial stack from already-formed `argv` and `envp` (each entry
 /// carrying no trailing NUL) and the `execfn` path for `AT_EXECFN`. Returns the
 /// guest `rsp` and the `(start, len)` of the stack mapping.
-fn build_stack(
+pub fn build_stack(
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
     execfn: &[u8],

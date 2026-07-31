@@ -124,6 +124,11 @@ pub struct FsPruneCmd {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "run")]
 pub struct RunCmd {
+    /// execution backend: dbt (dynamic binary translation, default) or sud
+    /// (native execution behind Linux syscall user dispatch)
+    #[argh(option)]
+    pub backend: Option<String>,
+
     /// translated-code cache capacity in MiB (default 256)
     #[argh(option)]
     pub code_cache_size: Option<usize>,

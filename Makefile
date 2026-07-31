@@ -34,3 +34,11 @@ conformance-native:
 conformance-unsafe: build
 	python3 testing/lit.py $(EXCLUDE) --runner "$(RUNNER) --unsafe"
 .PHONY: conformance-unsafe
+
+# The suite against the syscall-user-dispatch backend, which runs the guest
+# natively. Not part of `check`: the backend is a proof of concept and the
+# thread and signal groups are outside its scope, so a full pass is not yet
+# the expectation.
+conformance-sud: build
+	python3 testing/lit.py --runner "$(RUNNER) --backend sud"
+.PHONY: conformance-sud

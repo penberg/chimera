@@ -53,6 +53,22 @@ pub fn mpk_enabled() -> bool {
     arch::mpk_enabled()
 }
 
+/// How a [`Sandbox`] executes its guest and intercepts its system calls.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Backend {
+    /// Same-ISA dynamic binary translation, the default: every guest
+    /// instruction runs from the translated-code cache, so interception
+    /// covers control flow as well as system calls.
+    Translate,
+    /// Native execution behind Linux syscall user dispatch
+    /// (`prctl(PR_SET_SYSCALL_USER_DISPATCH)`, Linux 5.11): guest
+    /// instructions run unmodified on the CPU and each system call traps to
+    /// the same [`SystemCalls`] handler via `SIGSYS`. Native speed, but the
+    /// guest's control flow is not confined — see `sys::linux::sud` for the
+    /// trust model and the current proof-of-concept scope.
+    SyscallUserDispatch,
+}
+
 /// A sandboxed guest program, configured but not yet running.
 pub struct Sandbox {
     program: PathBuf,
@@ -60,6 +76,7 @@ pub struct Sandbox {
     envs: Option<Vec<(OsString, OsString)>>,
     handler: Box<dyn SystemCalls>,
     code_cache_size: usize,
+    backend: Backend,
 }
 
 impl Sandbox {
@@ -77,7 +94,15 @@ impl Sandbox {
             envs: None,
             handler: Box::new(Passthrough),
             code_cache_size: DEFAULT_CODE_CACHE_SIZE,
+            backend: Backend::Translate,
         })
+    }
+
+    /// Select the execution backend. Replaces the default
+    /// [`Backend::Translate`].
+    pub fn backend(&mut self, backend: Backend) -> &mut Self {
+        self.backend = backend;
+        self
     }
 
     /// Append a single argument to the guest's argv.
@@ -140,6 +165,11 @@ impl Sandbox {
             ));
         }
         let handler = std::mem::replace(&mut self.handler, Box::new(Passthrough));
+        if self.backend == Backend::SyscallUserDispatch {
+            let code =
+                sys::linux::sud::execv(&self.program, &self.args, self.envs.as_deref(), handler)?;
+            return Ok(ExitStatus { code });
+        }
         let code = sys::exec::execv(
             &self.program,
             &self.args,

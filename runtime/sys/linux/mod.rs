@@ -11,6 +11,7 @@ mod namespace;
 mod overlayfs;
 mod personality;
 pub mod signal;
+pub mod sud;
 pub mod syscall;
 mod vfs;
 
