@@ -8,6 +8,18 @@
 #
 # Agent CI hashes this file and caches the built image, so edits rebuild it
 # (~60-90s) and unchanged runs reuse the cache.
+#
+# Known local-only failures: Docker's default seccomp profile answers `clone3`
+# with ENOSYS, so `testing/conformance/threads/clone3-bad-args.c` and
+# `clone3-clear-sighand.c` fail under `make ci` in every mode — including the
+# native one, which runs no Chimera at all. GitHub's hosted runners are VMs
+# rather than containers and have the syscall, so these pass in real CI. To
+# confirm a failure is the sandbox and not the code, run the suite directly:
+#
+#   docker run --rm --security-opt seccomp=unconfined -v "$PWD":/w -w /w \
+#     <image> python3 testing/lit.py --runner ""
+#
+# Agent CI exposes no way to relax the profile for its own runs.
 FROM ghcr.io/actions/actions-runner:latest
 
 RUN sudo apt-get update \
