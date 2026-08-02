@@ -1,10 +1,10 @@
+mod fs;
 mod opts;
-mod workspace;
 
 use std::{
     env,
     ffi::OsString,
-    fs, io,
+    io,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -27,7 +27,7 @@ fn main() -> ExitCode {
     match opts.command {
         Command::Run(cmd) => run(cmd),
         Command::Version(_) => version(),
-        Command::Workspace(cmd) => workspace::command(cmd.action),
+        Command::Fs(cmd) => fs::command(cmd.action),
     }
 }
 
@@ -47,72 +47,72 @@ fn version() -> ExitCode {
 fn run(cmd: RunCmd) -> ExitCode {
     // Route the guest's filesystem syscalls through a userspace VFS mounted
     // at `/`. Copy-on-write is the default: every run mounts an overlay
-    // whose upper layer is a workspace's delta, so the guest works against
+    // whose upper layer is a filesystem's delta, so the guest works against
     // what looks like the live host while every mutation lands in the
-    // workspace. Only `--unsafe` touches the host directly. The host root
+    // filesystem. Only `--unsafe` touches the host directly. The host root
     // must exist, so its construction cannot fail.
     let host = Arc::new(HostFs::new("/").expect("host root / is a directory"));
     let selector = cmd
-        .workspace
+        .fs
         .clone()
         .map(OsString::from)
-        .or_else(|| env::var_os("CHIMERA_WORKSPACE"));
-    let (root, ws): (Arc<dyn Vfs>, Option<workspace::Workspace>) = if cmd.unsafe_ {
+        .or_else(|| env::var_os("CHIMERA_FS"));
+    let (root, fsys): (Arc<dyn Vfs>, Option<fs::Filesystem>) = if cmd.unsafe_ {
         // The explicit flags contradict --unsafe; the ambient environment
         // variable is merely inert, like any other env a script exports.
-        if cmd.workspace.is_some() || cmd.rm {
-            eprintln!("chimera: --unsafe runs without a workspace");
+        if cmd.fs.is_some() || cmd.rm {
+            eprintln!("chimera: --unsafe runs without a filesystem");
             return ExitCode::FAILURE;
         }
         (host, None)
     } else {
-        let ws = match &selector {
-            Some(sel) => workspace::attach(sel),
-            None => workspace::create(&describe(&cmd)),
+        let fsys = match &selector {
+            Some(sel) => fs::attach(sel),
+            None => fs::create(&describe(&cmd)),
         };
-        let ws = match ws {
-            Ok(ws) => ws,
+        let fsys = match fsys {
+            Ok(fsys) => fsys,
             Err(err) => {
-                eprintln!("chimera: cannot open workspace: {err}");
+                eprintln!("chimera: cannot open filesystem: {err}");
                 return ExitCode::FAILURE;
             }
         };
         // An attach the user typed is self-evident; one inherited from the
-        // environment is not, and a stale exported CHIMERA_WORKSPACE would
+        // environment is not, and a stale exported CHIMERA_FS would
         // otherwise resurrect old deletions with no visible cause.
-        if cmd.workspace.is_none() && selector.is_some() {
+        if cmd.fs.is_none() && selector.is_some() {
             eprintln!(
-                "chimera: attached to workspace {} (CHIMERA_WORKSPACE)",
-                ws.root.display(),
+                "chimera: attached to filesystem {} (CHIMERA_FS)",
+                fsys.root.display(),
             );
         }
-        match OverlayFs::new(host, &ws.root) {
-            Ok(overlay) => (Arc::new(overlay), Some(ws)),
+        match OverlayFs::new(host, &fsys.root) {
+            Ok(overlay) => (Arc::new(overlay), Some(fsys)),
             Err(err) => {
                 let err = io::Error::from_raw_os_error(err.raw());
                 let hint = if err.kind() == io::ErrorKind::Unsupported {
-                    " (the workspace needs a filesystem with user xattrs)"
+                    " (the delta directory needs a filesystem with user xattrs)"
                 } else {
                     ""
                 };
                 eprintln!(
-                    "chimera: cannot open workspace {}: {err}{hint}",
-                    ws.root.display(),
+                    "chimera: cannot open filesystem {}: {err}{hint}",
+                    fsys.root.display(),
                 );
                 return ExitCode::FAILURE;
             }
         }
     };
     // Resolve the initial executable through the same merged view the
-    // guest's own syscalls will see: an attached workspace may have replaced
+    // guest's own syscalls will see: an attached filesystem may have replaced
     // or deleted the program, its script, or its interpreter, and the session
     // must load the bytes the guest observes, not the lower host's.
     let program = match resolve_program(root.as_ref(), &cmd.program, &cmd.args) {
         Ok(program) => program,
         Err(err) => {
             eprintln!("chimera: {err}");
-            if let Some(ws) = ws {
-                ws.finish(cmd.rm);
+            if let Some(fsys) = fsys {
+                fsys.finish(cmd.rm);
             }
             return ExitCode::FAILURE;
         }
@@ -121,8 +121,8 @@ fn run(cmd: RunCmd) -> ExitCode {
         Ok(sandbox) => sandbox,
         Err(err) => {
             eprintln!("chimera: {err}");
-            if let Some(ws) = ws {
-                ws.finish(cmd.rm);
+            if let Some(fsys) = fsys {
+                fsys.finish(cmd.rm);
             }
             return ExitCode::FAILURE;
         }
@@ -136,8 +136,8 @@ fn run(cmd: RunCmd) -> ExitCode {
     sandbox.system_calls(personality);
 
     let result = sandbox.args(&program.args).run();
-    if let Some(ws) = ws {
-        ws.finish(cmd.rm);
+    if let Some(fsys) = fsys {
+        fsys.finish(cmd.rm);
     }
     match result {
         Ok(status) => ExitCode::from(status.code() as u8),
@@ -148,7 +148,7 @@ fn run(cmd: RunCmd) -> ExitCode {
     }
 }
 
-/// The command line a workspace's provenance records.
+/// The command line a filesystem's provenance records.
 fn describe(cmd: &RunCmd) -> String {
     let mut s = cmd.program.display().to_string();
     for arg in &cmd.args {
@@ -193,7 +193,7 @@ fn resolve_program(root: &dyn Vfs, program: &Path, args: &[String]) -> Result<Pr
 
 /// Resolve `program` to its guest-visible absolute path and the host file
 /// serving it. A bare name walks `PATH` with each candidate's existence
-/// judged in the merged view, so a workspace whiteout hides a candidate
+/// judged in the merged view, so a filesystem whiteout hides a candidate
 /// instead of letting the lower host file shadow through.
 fn resolve_path(root: &dyn Vfs, program: &Path) -> Result<(PathBuf, PathBuf), io::Error> {
     if program.is_absolute() || program.components().count() > 1 {
@@ -243,7 +243,7 @@ fn absolutize(path: &Path) -> Result<PathBuf, io::Error> {
 }
 
 fn read_shebang(path: &Path) -> Result<Option<(PathBuf, Vec<OsString>)>, io::Error> {
-    let bytes = fs::read(path)?;
+    let bytes = std::fs::read(path)?;
     if !bytes.starts_with(b"#!") {
         return Ok(None);
     }

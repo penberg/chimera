@@ -1,5 +1,5 @@
-//! The delta directory: the on-disk format of an overlay workspace's writable
-//! upper layer, and the copy-up engine that populates it.
+//! The delta directory: the on-disk format of a filesystem's writable upper
+//! layer, and the copy-up engine that populates it.
 //!
 //! `<delta>/data/` is the upper tree of real host files; `<delta>/tmp/` stages
 //! copy-ups so the final `rename` into `data/` is atomic on the same
@@ -41,7 +41,7 @@ const ORIGIN_XATTR: &CStr = c"user.chimera.origin";
 const APPLIED_XATTR: &CStr = c"user.chimera.applied";
 const PROBE_XATTR: &CStr = c"user.chimera.probe";
 
-/// A workspace's delta directory: the writable upper tree under `data/` and
+/// A filesystem's delta directory: the writable upper tree under `data/` and
 /// the `tmp/` staging area copy-ups rename in from.
 pub struct Delta {
     data: PathBuf,
@@ -53,7 +53,7 @@ pub struct Delta {
 
 impl Delta {
     /// Create or open the delta directory at `root`. Idempotent: an existing
-    /// delta is reopened as-is, which is how a workspace survives both `fork`
+    /// delta is reopened as-is, which is how a filesystem survives both `fork`
     /// (each process holds its own `Delta` over the same tree) and a later
     /// attach. Fails with `ENOTSUP` when the backing filesystem lacks user
     /// xattrs.

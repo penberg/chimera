@@ -17,67 +17,67 @@ pub struct Opts {
 pub enum Command {
     Run(RunCmd),
     Version(VersionCmd),
-    Workspace(WorkspaceCmd),
+    Fs(FsCmd),
 }
 
-/// Manage workspaces: the change-sets kept runs leave behind.
+/// Manage filesystems: the change-sets kept runs leave behind.
 #[derive(FromArgs)]
-#[argh(subcommand, name = "workspace")]
-pub struct WorkspaceCmd {
+#[argh(subcommand, name = "fs")]
+pub struct FsCmd {
     #[argh(subcommand)]
-    pub action: WorkspaceAction,
+    pub action: FsAction,
 }
 
-/// Workspace subcommands.
+/// `fs` subcommands.
 #[derive(FromArgs)]
 #[argh(subcommand)]
-pub enum WorkspaceAction {
-    List(WsListCmd),
-    Diff(WsDiffCmd),
-    Apply(WsApplyCmd),
-    Rm(WsRmCmd),
-    Prune(WsPruneCmd),
+pub enum FsAction {
+    List(FsListCmd),
+    Diff(FsDiffCmd),
+    Apply(FsApplyCmd),
+    Rm(FsRmCmd),
+    Prune(FsPruneCmd),
 }
 
-/// List kept workspaces.
+/// List kept filesystems.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "list")]
-pub struct WsListCmd {}
+pub struct FsListCmd {}
 
-/// Show what a workspace changed, relative to the live host: A added,
+/// Show what a filesystem changed, relative to the live host: A added,
 /// M modified, D deleted.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "diff")]
-pub struct WsDiffCmd {
-    /// workspace id or path
+pub struct FsDiffCmd {
+    /// filesystem id or path
     #[argh(positional)]
-    pub workspace: String,
+    pub filesystem: String,
 }
 
-/// Copy a workspace's changes onto the host — the adopt step. A file whose
-/// host copy changed since the workspace copied it up is refused, not
+/// Copy a filesystem's changes onto the host — the adopt step. A file whose
+/// host copy changed since the filesystem copied it up is refused, not
 /// clobbered.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "apply")]
-pub struct WsApplyCmd {
-    /// workspace id or path
+pub struct FsApplyCmd {
+    /// filesystem id or path
     #[argh(positional)]
-    pub workspace: String,
+    pub filesystem: String,
 }
 
-/// Remove workspaces.
+/// Remove filesystems.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "rm")]
-pub struct WsRmCmd {
-    /// workspace ids or paths
+pub struct FsRmCmd {
+    /// filesystem ids or paths
     #[argh(positional)]
-    pub workspaces: Vec<String>,
+    pub filesystems: Vec<String>,
 }
 
-/// Remove every workspace no live session is using, after confirmation.
+/// Remove every filesystem no live session is using, after confirmation.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "prune")]
-pub struct WsPruneCmd {
+pub struct FsPruneCmd {
     /// remove without asking for confirmation
     #[argh(switch, short = 'f')]
     pub force: bool,
@@ -91,16 +91,16 @@ pub struct RunCmd {
     #[argh(option)]
     pub code_cache_size: Option<usize>,
 
-    /// attach to an existing workspace: an id from a kept run, or a path to
-    /// a workspace directory (env: CHIMERA_WORKSPACE)
-    #[argh(option, short = 'w')]
-    pub workspace: Option<String>,
+    /// attach to an existing filesystem: an id from a kept run, or a path to
+    /// a filesystem directory (env: CHIMERA_FS)
+    #[argh(option, short = 'f')]
+    pub fs: Option<String>,
 
-    /// discard the workspace on exit instead of keeping it
+    /// discard the filesystem on exit instead of keeping it
     #[argh(switch)]
     pub rm: bool,
 
-    /// bypass the workspace overlay: the guest mutates the host filesystem
+    /// bypass the copy-on-write filesystem: the guest mutates the host
     /// directly
     #[argh(switch, long = "unsafe")]
     pub unsafe_: bool,

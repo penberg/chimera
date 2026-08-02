@@ -1,12 +1,12 @@
 // RUN: %cc %s -o %t && rm -rf %t.ws %t.probe
-// RUN: CHIMERA_WORKSPACE=%t.ws %runner %t write %t.probe
-// RUN: CHIMERA_WORKSPACE=%t.ws %runner %t read %t.probe
+// RUN: CHIMERA_FS=%t.ws %runner %t write %t.probe
+// RUN: CHIMERA_FS=%t.ws %runner %t read %t.probe
 // RUN: %t verify %t.ws %t.probe
 //
-// Attach: two sessions of one workspace. Run 1 writes a file; run 2, a
-// separate chimera invocation attached to the same workspace, reads it back
+// Attach: two sessions of one filesystem. Run 1 writes a file; run 2, a
+// separate chimera invocation attached to the same filesystem, reads it back
 // — the delta format is self-describing on disk, so reopening is the whole
-// mechanism. Verify then proves the file lives in the workspace and never
+// mechanism. Verify then proves the file lives in the filesystem and never
 // touched the host (natively the env var is inert and the file is simply on
 // disk, which verify accepts).
 
@@ -36,7 +36,7 @@ int main(int argc, char **argv) {
         struct stat st;
         snprintf(probe, sizeof(probe), "%s/data%s", argv[2], argv[3]);
         if (stat(probe, &st) == 0) {
-            // Overlay ran: the file is workspace-only.
+            // Overlay ran: the file is filesystem-only.
             return stat(argv[3], &st) == 0 || errno != ENOENT ? 41 : 0;
         }
         // Native runs: the writes landed directly on disk.

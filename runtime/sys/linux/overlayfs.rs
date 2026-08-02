@@ -1,5 +1,5 @@
 //! [`OverlayFs`]: copy-on-write over the live host. A read-only lower (the
-//! host tree) merges with a writable upper (a workspace's delta directory of
+//! host tree) merges with a writable upper (a filesystem's delta directory of
 //! real host files); lookup consults the upper, then whiteout markers, then
 //! the lower.
 //!
@@ -1015,7 +1015,7 @@ mod tests {
         );
     }
 
-    /// The workspace root's `data/` always exists and scaffolds appear as
+    /// The filesystem root's `data/` always exists and scaffolds appear as
     /// upper children land, yet the merged identity — inode, device, mode —
     /// must keep coming from the lower directory until a mutation aimed at
     /// the directory itself claims it.

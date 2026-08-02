@@ -1,9 +1,9 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
-// RUN: test -z "%runner" || CHIMERA_WORKSPACE=%t.fixture/ws %runner %t mutate %t.fixture
+// RUN: test -z "%runner" || CHIMERA_FS=%t.fixture/ws %runner %t mutate %t.fixture
 // RUN: test -z "%runner" || %t drive %t.fixture "%runner"
 //
 // Apply must reproduce the guest-visible metadata, not just the bytes. A
-// workspace holding only a chmod, a utimensat, or a user xattr change prints
+// filesystem holding only a chmod, a utimensat, or a user xattr change prints
 // a successful M line, so the host must actually end up with the set-id
 // bits, the timestamps, and the xattr — and a combined content-plus-metadata
 // change must land all of it together. Chimera's own user.chimera.*
@@ -100,7 +100,7 @@ static int drive(const char *fixture, const char *runner) {
     if (sscanf(runner, "%s", chim) != 1) return 32;
 
     char cmd[PATH_MAX * 2];
-    snprintf(cmd, sizeof(cmd), "%s workspace apply %s >/dev/null 2>&1", chim, ws);
+    snprintf(cmd, sizeof(cmd), "%s fs apply %s >/dev/null 2>&1", chim, ws);
     if (system(cmd) != 0) return 33;
 
     // Mode change landed, set-id bit included.

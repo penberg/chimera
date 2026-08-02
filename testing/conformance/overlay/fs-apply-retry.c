@@ -1,11 +1,11 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
-// RUN: test -z "%runner" || CHIMERA_WORKSPACE=%t.fixture/ws %runner %t mutate %t.fixture
+// RUN: test -z "%runner" || CHIMERA_FS=%t.fixture/ws %runner %t mutate %t.fixture
 // RUN: test -z "%runner" || %t drive %t.fixture "%runner"
 //
 // A partially successful apply must be safe to run again. The first apply
 // lands the applicable entries and reports the genuine conflict; after the
 // user resolves only that conflict (here by dropping the entry from the
-// workspace), the rerun must succeed — the entries that already applied must
+// filesystem), the rerun must succeed — the entries that already applied must
 // count as applied, not resurface as new conflicts against their own
 // post-apply host state. And the applied state must keep protecting the
 // host: an entry edited or recreated on the host after its successful apply
@@ -84,7 +84,7 @@ static int mutate(const char *fixture) {
 
 static int apply(const char *chim, const char *ws) {
     char cmd[PATH_MAX * 2];
-    snprintf(cmd, sizeof(cmd), "%s workspace apply %s >/dev/null 2>&1", chim, ws);
+    snprintf(cmd, sizeof(cmd), "%s fs apply %s >/dev/null 2>&1", chim, ws);
     return system(cmd);
 }
 
@@ -113,7 +113,7 @@ static int drive(const char *fixture, const char *runner) {
     snprintf(path, sizeof(path), "%s/gone", lower);
     if (stat(path, &st) == 0 || errno != ENOENT) return 36;
 
-    // Resolve only the original conflict: drop it from the workspace.
+    // Resolve only the original conflict: drop it from the filesystem.
     snprintf(path, sizeof(path), "%s/data%s/edit", ws, lower);
     if (unlink(path) != 0) return 37;
 
