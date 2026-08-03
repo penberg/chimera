@@ -84,6 +84,14 @@ impl Namespace {
         });
     }
 
+    /// Ask every mounted filesystem to re-resolve its anchored host state;
+    /// see [`Vfs::reanchor`].
+    pub fn reanchor(&self) {
+        for m in &self.mounts {
+            m.fs.reanchor();
+        }
+    }
+
     /// Resolve an absolute guest path. `follow_final` chooses whether a symlink
     /// in the last position is dereferenced (`open`/`stat`) or named as itself
     /// (`lstat`/`unlink`/`readlink`). Intermediate symlinks are always followed.

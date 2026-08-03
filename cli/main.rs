@@ -131,7 +131,23 @@ fn run(cmd: RunCmd) -> ExitCode {
         sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
     }
 
-    let personality = Personality::new(Namespace::with_root(root, MountFlags::NONE));
+    let mut ns = Namespace::with_root(root, MountFlags::NONE);
+    // /proc as its own mount, anchored to the real procfs. A dirfd the guest
+    // opened on /proc must keep answering after the guest reshapes its mount
+    // view — bwrap reads /proc/self/mountinfo through a descriptor it saved
+    // before pivoting into a root with no /proc — and a separate mount keeps
+    // its anchor when the root mount re-anchors to the new view. Procfs is
+    // live kernel state no overlay can meaningfully copy, so the mount
+    // bypasses the workspace: read-only unless `--unsafe` opts into writes.
+    let proc_flags = if cmd.unsafe_ {
+        MountFlags::NONE
+    } else {
+        MountFlags::RDONLY
+    };
+    if let Ok(proc) = HostFs::new("/proc") {
+        ns.mount("/proc", Arc::new(proc), proc_flags);
+    }
+    let personality = Personality::new(ns);
     personality.set_exe(&program.exec);
     sandbox.system_calls(personality);
 

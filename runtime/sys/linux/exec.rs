@@ -2,15 +2,15 @@
 //! dispatcher, and service `execve` by loading the new image and re-entering.
 
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::{CStr, OsStr, OsString},
     fs,
     os::{
-        fd::{AsRawFd, RawFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
     ptr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use crate::{
@@ -22,10 +22,39 @@ use crate::{
 
 use super::{
     elf::{LoadedElf, PAGE_SIZE, ParsedElf, load_elf, map_elf, parse_elf},
+    hostfs::BACKING_FLOOR,
     signal::HostMaskGuard,
 };
 
 const STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// The host's `/proc`, opened before any guest code runs and inherited across
+/// emulated forks. The exec-time close-on-exec sweep enumerates open
+/// descriptors through this handle (`openat(fd, "self/fd")`), which keeps
+/// working after the guest has entered a mount namespace where no `/proc` is
+/// mounted — bubblewrap pivots into exactly such a root before exec'ing the
+/// sandboxed command. Like a backing descriptor, the handle carries no
+/// `FD_CLOEXEC` (the sweep must not close its own eyes) and lives above the
+/// guest's low fd space.
+static PROC_FD: OnceLock<Option<OwnedFd>> = OnceLock::new();
+
+fn open_proc() -> Option<OwnedFd> {
+    let fd = unsafe {
+        libc::open(
+            c"/proc".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let high = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD, BACKING_FLOOR) };
+    if high < 0 {
+        return None;
+    }
+    Some(unsafe { OwnedFd::from_raw_fd(high) })
+}
 
 /// `execveat` special dirfd and flag values (from `<fcntl.h>`).
 const AT_FDCWD: i32 = -100;
@@ -38,6 +67,7 @@ pub fn execv(
     handler: Box<dyn SystemCalls>,
     code_cache_size: usize,
 ) -> Result<i32, Error> {
+    PROC_FD.get_or_init(open_proc);
     // The first image's argv and envp come from the embedder: argv[0] is the
     // program path, then the supplied args; the environment is the explicit set
     // if one was given, otherwise the host's.
@@ -176,16 +206,7 @@ pub fn drive(thread: &mut dispatch::Thread, mut reason: ExitReason) -> Result<i3
 /// (the replacement image's files, still to be mapped); any runtime fd held
 /// across an exec must be listed there, since Rust opens files `O_CLOEXEC`.
 fn close_cloexec_fds(keep: &[RawFd]) -> Result<(), Error> {
-    let entries = fs::read_dir("/proc/self/fd")
-        .map_err(|e| Error::io("execve: listing /proc/self/fd".to_string(), e))?;
-    // Collect before closing: the directory walk holds an fd of its own, and
-    // closing entries out from under it would corrupt the walk. By the time
-    // the sweep runs the iterator has been dropped, so its fd fails the
-    // `F_GETFD` below and is skipped.
-    let fds: Vec<RawFd> = entries
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-        .collect();
-    for fd in fds {
+    for fd in list_open_fds()? {
         if keep.contains(&fd) {
             continue;
         }
@@ -195,6 +216,60 @@ fn close_cloexec_fds(keep: &[RawFd]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Every open fd number in this process, collected before the caller closes
+/// any: the directory walk holds an fd of its own, and closing entries out
+/// from under it would corrupt the walk. The walk's fd is closed again by the
+/// time this returns, but its number may still appear in the result — the
+/// caller probes each entry (`F_GETFD`) before acting on it. Enumerates
+/// through [`PROC_FD`], falling back to the pathname when that handle is
+/// unavailable.
+fn list_open_fds() -> Result<Vec<RawFd>, Error> {
+    if let Some(fds) = PROC_FD
+        .get()
+        .and_then(|p| p.as_ref())
+        .and_then(list_proc_fds)
+    {
+        return Ok(fds);
+    }
+    let entries = fs::read_dir("/proc/self/fd")
+        .map_err(|e| Error::io("execve: listing /proc/self/fd".to_string(), e))?;
+    Ok(entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .collect())
+}
+
+fn list_proc_fds(proc_fd: &OwnedFd) -> Option<Vec<RawFd>> {
+    let fd = unsafe {
+        libc::openat(
+            proc_fd.as_raw_fd(),
+            c"self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // `fdopendir` adopts the fd it is given, and `closedir` closes it.
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        unsafe { libc::close(fd) };
+        return None;
+    }
+    let mut fds = Vec::new();
+    loop {
+        let ent = unsafe { libc::readdir64(dir) };
+        if ent.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if let Some(n) = name.to_str().ok().and_then(|s| s.parse().ok()) {
+            fds.push(n);
+        }
+    }
+    unsafe { libc::closedir(dir) };
+    Some(fds)
 }
 
 /// A validated, parsed `execve` replacement image: everything needed to

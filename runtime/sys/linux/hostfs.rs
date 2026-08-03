@@ -394,6 +394,33 @@ impl Vfs for HostFs {
     fn confines(&self) -> bool {
         true
     }
+
+    fn reanchor(&self) {
+        let croot = match cpath(&self.root) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let fresh = unsafe {
+            libc::open(
+                croot.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fresh < 0 {
+            return;
+        }
+        // Replace the root handle in place with `dup3`, which swaps the
+        // descriptor atomically: a concurrent operation that already copied
+        // the number sees either the old anchor or the new one, never a
+        // closed or recycled fd. The number never changes, so `root_fd`
+        // stays valid as an owner. `dup3` leaves the target without
+        // `FD_CLOEXEC`, which is what a backing descriptor wants (see
+        // `relocate_high`).
+        unsafe {
+            libc::dup3(fresh, self.root_fd.as_raw_fd(), 0);
+            libc::close(fresh);
+        }
+    }
 }
 
 /// An open host file or directory: a real fd, with the read/write offset held
