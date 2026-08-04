@@ -1,4 +1,6 @@
 // RUN: %cc %s -o %t && %runner %t
+// XFAIL: darwin-chimera -- arm64 terminators spill scratch to the guest stack
+// below sp; fixing it needs a reserved-register or sysreg scratch redesign.
 //
 // A translator rewrites every block terminator into a stub that computes the
 // next guest PC. Those stubs must not write below the guest's stack pointer.

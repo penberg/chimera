@@ -5,8 +5,9 @@
 // those labels in the same straight-line block as the indirect jump that later
 // consumes them. The translator must materialize the guest address; if it leaves
 // the encoder to relocate the block-internal RIP-relative operand into the code
-// cache, the indirect branch loses control flow and hangs. The `timeout` turns
-// that broken-runtime hang into a deterministic test failure.
+// cache, the indirect branch loses control flow and hangs. The runner's own
+// per-RUN-line timeout turns that broken-runtime hang into a deterministic
+// failure, so the RUN line needs no `timeout` utility (absent on macOS).
 
 int main(void) {
     static void *tab[2];

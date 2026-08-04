@@ -9,42 +9,15 @@
 //! address space.
 
 use std::sync::{
-    Condvar, Mutex, MutexGuard, Once,
+    Condvar, Mutex, MutexGuard,
     atomic::{AtomicBool, AtomicI32, Ordering},
 };
 
 use crate::{
     Error, SystemCalls,
     arch::dispatch::ThreadState,
-    sys::{
-        linux::{exec::PreparedExec, signal},
-        mmap::AddressSpace,
-    },
+    sys::{exec::PreparedExec, mmap::AddressSpace, signal},
 };
-
-/// Host signal Chimera reserves to interrupt a guest thread parked in a
-/// forwarded syscall (so it returns `EINTR` and re-checks the exit flag). The
-/// highest real-time signal is used as the one least likely to collide with a
-/// signal the guest itself installs. A do-nothing handler is installed for it,
-/// without `SA_RESTART`, purely so the kernel interrupts the blocking syscall.
-fn interrupt_signal() -> libc::c_int {
-    libc::SIGRTMAX()
-}
-
-extern "C" fn interrupt_noop(_sig: libc::c_int) {}
-
-static INSTALL_INTERRUPT: Once = Once::new();
-
-/// Install the no-op handler for [`interrupt_signal`] once per process.
-fn install_interrupt_handler() {
-    INSTALL_INTERRUPT.call_once(|| unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = interrupt_noop as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_flags = 0; // no SA_RESTART: a parked syscall must surface EINTR
-        libc::sigaction(interrupt_signal(), &sa, std::ptr::null_mut());
-    });
-}
 
 /// The shared state of a guest process: one per process, referenced by every
 /// thread through an `Arc`.
@@ -112,14 +85,68 @@ pub struct Process {
     /// `execve` validated it and consumed by the exec driver on the main host
     /// thread once the group has drained. Written before `execing` is set.
     exec_request: Mutex<Option<PreparedExec>>,
+    /// Exit handlers the guest registered with `atexit`/`__cxa_atexit`, in
+    /// registration order (they run in reverse). Held here rather than in the
+    /// C library the runtime shares with the guest, which would call these
+    /// guest pointers natively — see `Thread::escape`. Process-wide, like the
+    /// library's own list.
+    #[cfg(target_os = "macos")]
+    atexit: Mutex<Vec<(u64, u64)>>,
+}
+
+thread_local! {
+    /// How many address-space guards this thread currently holds. The fault
+    /// handler reads it to decide whether taking the lock could deadlock
+    /// against the faulting thread itself — see [`addr_space_held`].
+    static ADDR_SPACE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the calling thread already holds the address-space lock. A fault
+/// handler that wants the lock must not block when this is true — the holder
+/// is the faulting thread — and must block when it is false, because the
+/// holder is a sibling that will release it. Guessing from the faulting pc
+/// instead gets this wrong in both directions.
+#[cfg(target_os = "macos")]
+pub fn addr_space_held() -> bool {
+    ADDR_SPACE_DEPTH.with(|d| d.get() != 0)
+}
+
+/// The address-space lock, held with the depth counter maintained. Derefs to
+/// the [`AddressSpace`] like the raw guard it wraps.
+#[cfg(target_os = "macos")]
+pub struct AddrSpaceGuard<'a> {
+    inner: MutexGuard<'a, AddressSpace>,
+}
+
+#[cfg(target_os = "macos")]
+impl std::ops::Deref for AddrSpaceGuard<'_> {
+    type Target = AddressSpace;
+
+    fn deref(&self) -> &AddressSpace {
+        &self.inner
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::ops::DerefMut for AddrSpaceGuard<'_> {
+    fn deref_mut(&mut self) -> &mut AddressSpace {
+        &mut self.inner
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for AddrSpaceGuard<'_> {
+    fn drop(&mut self) {
+        ADDR_SPACE_DEPTH.with(|d| d.set(d.get() - 1));
+    }
 }
 
 impl Process {
     pub fn new(handler: Box<dyn SystemCalls>, code_cache_size: usize) -> Result<Self, Error> {
-        install_interrupt_handler();
+        crate::sys::thread::install_interrupt_handler();
         // Own the host SIGSEGV/SIGBUS slot so self-modifying-code write traps are
-        // caught synchronously (see [`crate::sys::linux::fault`]).
-        crate::sys::linux::fault::install();
+        // caught synchronously (see [`crate::sys::fault`]).
+        crate::sys::fault::install();
         Ok(Self {
             addr_space: Mutex::new(AddressSpace::new(code_cache_size)?),
             handler,
@@ -131,7 +158,19 @@ impl Process {
             last_exit_status: AtomicI32::new(0),
             execing: AtomicBool::new(false),
             exec_request: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            atexit: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Lock the guest address space, recording that this thread holds it so
+    /// a fault taken while holding can tell itself apart from a fault racing
+    /// a sibling (see [`addr_space_held`]).
+    #[cfg(target_os = "macos")]
+    pub fn lock_addr_space(&self) -> AddrSpaceGuard<'_> {
+        let inner = self.addr_space.lock().unwrap();
+        ADDR_SPACE_DEPTH.with(|d| d.set(d.get() + 1));
+        AddrSpaceGuard { inner }
     }
 
     /// Register a thread as running a guest, by the address of its
@@ -158,6 +197,24 @@ impl Process {
             threads.swap_remove(pos);
         }
         self.exit_cv.notify_all();
+    }
+
+    /// The guest PC each registered thread is currently at, for the sampling
+    /// profiler (see [`crate::trace::profile`]). Every exit stub stores the
+    /// next guest PC into its thread's `pc` before branching — including the
+    /// linked edges that never return to the run loop — so this names where a
+    /// guest is spending its time even inside a warm chain.
+    ///
+    /// The reads race with the threads writing those slots, deliberately: a
+    /// profiler wants a sample, not a barrier, and a `u64` slot yields one
+    /// value or the other. Nothing is dereferenced.
+    #[cfg(target_os = "macos")]
+    pub fn sample_guest_pcs(&self) -> Vec<u64> {
+        let threads = self.threads.lock().unwrap();
+        threads
+            .iter()
+            .map(|&t| unsafe { (*t).guest_pc() })
+            .collect()
     }
 
     /// Record `status` as the calling thread's guest exit status. Every run
@@ -201,10 +258,10 @@ impl Process {
     /// Record a process-wide exit (`exit_group`) requested by the thread whose
     /// safepoint slot is `self_slot`. The code is published before the flag, with
     /// release/acquire ordering, so any thread that later sees `is_exiting()`
-    /// reads this exact code. Every other thread is then interrupted with
-    /// [`interrupt_signal`] so one parked in a host syscall returns `EINTR` and
-    /// observes the exit at its run-loop boundary, rather than waiting for a
-    /// syscall that may never return on its own.
+    /// reads this exact code. Every other thread is then interrupted with the
+    /// reserved signal (see [`crate::sys::thread::interrupt`]) so one parked in
+    /// a host syscall returns `EINTR` and observes the exit at its run-loop
+    /// boundary, rather than waiting for a syscall that may never return.
     pub fn request_exit_group(&self, code: i32, self_state: &ThreadState) {
         self.exit_code.store(code, Ordering::Relaxed);
         self.exiting.store(true, Ordering::Release);
@@ -217,25 +274,31 @@ impl Process {
     /// dissolves, the way Linux's `de_thread` kills every sibling before a new
     /// image is installed. Every run loop observes the pending exec at its
     /// next boundary and stops; the main host thread then waits out the
-    /// stragglers and installs the image (see `crate::sys::linux::exec`).
+    /// stragglers and installs the image (see `crate::sys::exec`).
     ///
-    /// First committer wins: returns false — publishing nothing — when the
+    /// First committer wins: hands the request back unpublished when the
     /// group is already dissolving, under an earlier committed exec or an
     /// `exit_group`. Concurrent execs race natively too, but only one
     /// survives; the loser is killed by the winner's `de_thread` and never
-    /// observes a return value. A refused caller needs to do nothing: the
-    /// stop already pending takes its thread at the next boundary, exactly
-    /// like any other sibling.
-    pub fn request_exec(&self, prepared: PreparedExec, self_state: &ThreadState) -> bool {
+    /// observes a return value. A refused caller only disposes of its
+    /// prepared image: the stop already pending takes its thread at the next
+    /// boundary, exactly like any other sibling.
+    pub fn request_exec(
+        &self,
+        prepared: PreparedExec,
+        self_state: &ThreadState,
+    ) -> Result<(), Box<PreparedExec>> {
         let mut request = self.exec_request.lock().unwrap();
         if request.is_some() || self.exec_pending() || self.is_exiting() {
-            return false;
+            // Boxed: a prepared image is several hundred bytes, and every
+            // caller but the loser pays for it in the `Ok` path otherwise.
+            return Err(Box::new(prepared));
         }
         *request = Some(prepared);
         self.execing.store(true, Ordering::Release);
         drop(request);
         self.interrupt_others(self_state);
-        true
+        Ok(())
     }
 
     /// Whether a committed `execve` is waiting to be installed; every run loop
@@ -270,13 +333,12 @@ impl Process {
     /// `execve`) is observed. Two mechanisms, one per way a sibling can be
     /// away from its boundary: arming the thread's `exit_requested` safepoint
     /// slot pops one executing fully linked translated code out of the cache
-    /// (the back-edge and IB-hit polls read it), and [`interrupt_signal`]
-    /// makes one parked in a blocking host syscall return `EINTR`. Also wakes
-    /// a main thread parked in [`Process::wait_for_others`].
+    /// (the back-edge and IB-hit polls read it), and the reserved interrupt
+    /// signal (see [`crate::sys::thread::interrupt`]) makes one parked in a
+    /// blocking host syscall return `EINTR`. Also wakes a main thread parked in
+    /// [`Process::wait_for_others`].
     fn interrupt_others(&self, self_state: &ThreadState) {
         let self_state = self_state as *const ThreadState;
-        let pid = unsafe { libc::getpid() };
-        let sig = interrupt_signal();
         let threads = self.threads.lock().unwrap();
         for &t in threads.iter() {
             if t != self_state {
@@ -284,11 +346,11 @@ impl Process {
                 // guarantees the state outlives its entry in the set, and
                 // holding the lock keeps the entry alive; only the atomic
                 // `exit_requested` and `tid` fields are touched.
-                unsafe {
+                let tid = unsafe {
                     (*t).exit_requested.store(1, Ordering::Release);
-                    let tid = (*t).tid.load(Ordering::Acquire);
-                    libc::syscall(libc::SYS_tgkill, pid, tid, sig);
-                }
+                    (*t).tid.load(Ordering::Acquire)
+                };
+                crate::sys::thread::interrupt(tid);
             }
         }
         self.exit_cv.notify_all();
@@ -298,6 +360,36 @@ impl Process {
     /// [`Process::exit_code`] (read after a true result).
     pub fn is_exiting(&self) -> bool {
         self.exiting.load(Ordering::Acquire)
+    }
+
+    /// The status a process-wide `exit_group` published. Read only after
+    /// [`Process::is_exiting`] returns true, whose `Acquire` orders this load
+    /// after the requester's `Release` store.
+    #[cfg(target_os = "macos")]
+    pub fn group_exit_code(&self) -> i32 {
+        self.exit_code.load(Ordering::Relaxed)
+    }
+
+    /// Record a guest `atexit`/`__cxa_atexit` registration. Process-wide,
+    /// like the C library's own list: any thread's `exit` runs all of them.
+    #[cfg(target_os = "macos")]
+    pub fn push_atexit(&self, func: u64, arg: u64) {
+        self.atexit.lock().unwrap().push((func, arg));
+    }
+
+    /// Take the most recently registered exit handler, if any. Handlers run
+    /// in reverse order of registration, and taking them one at a time lets
+    /// a handler register another (which then runs first).
+    #[cfg(target_os = "macos")]
+    pub fn pop_atexit(&self) -> Option<(u64, u64)> {
+        self.atexit.lock().unwrap().pop()
+    }
+
+    /// Discard every registered exit handler: an `execve` replaces the image
+    /// that owns them, and POSIX says the new image starts with none.
+    #[cfg(target_os = "macos")]
+    pub fn clear_atexit(&self) {
+        self.atexit.lock().unwrap().clear();
     }
 
     /// Take every `Process` lock, to be held across a forwarded `fork`. fork
