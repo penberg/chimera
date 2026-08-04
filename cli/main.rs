@@ -45,6 +45,11 @@ fn version() -> ExitCode {
 }
 
 fn run(cmd: RunCmd) -> ExitCode {
+    let Some((program, args)) = cmd.argv.split_first() else {
+        eprintln!("chimera: no program to run");
+        return ExitCode::FAILURE;
+    };
+    let program = Path::new(program);
     // Route the guest's filesystem syscalls through a userspace VFS mounted
     // at `/`. Copy-on-write is the default: every run mounts an overlay
     // whose upper layer is a filesystem's delta, so the guest works against
@@ -107,7 +112,7 @@ fn run(cmd: RunCmd) -> ExitCode {
     // guest's own syscalls will see: an attached filesystem may have replaced
     // or deleted the program, its script, or its interpreter, and the session
     // must load the bytes the guest observes, not the lower host's.
-    let program = match resolve_program(root.as_ref(), &cmd.program, &cmd.args) {
+    let program = match resolve_program(root.as_ref(), program, args) {
         Ok(program) => program,
         Err(err) => {
             eprintln!("chimera: {err}");
@@ -150,12 +155,7 @@ fn run(cmd: RunCmd) -> ExitCode {
 
 /// The command line a filesystem's provenance records.
 fn describe(cmd: &RunCmd) -> String {
-    let mut s = cmd.program.display().to_string();
-    for arg in &cmd.args {
-        s.push(' ');
-        s.push_str(arg);
-    }
-    s
+    cmd.argv.join(" ")
 }
 
 struct Program {

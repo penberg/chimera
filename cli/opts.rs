@@ -1,7 +1,5 @@
 //! Command-line option parsing for the `chimera` program.
 
-use std::path::PathBuf;
-
 use argh::FromArgs;
 
 /// Run a command in zero-setup sandbox.
@@ -105,13 +103,10 @@ pub struct RunCmd {
     #[argh(switch, long = "unsafe")]
     pub unsafe_: bool,
 
-    /// path to the program
-    #[argh(positional)]
-    pub program: PathBuf,
-
-    /// arguments to pass to the guest
-    #[argh(positional)]
-    pub args: Vec<String>,
+    /// the program and its arguments. Greedy: option parsing stops at the
+    /// program token, so the guest's own flags need no `--` separator.
+    #[argh(positional, greedy)]
+    pub argv: Vec<String>,
 }
 
 /// Print version information.
