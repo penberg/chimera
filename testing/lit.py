@@ -18,10 +18,17 @@ carry no hyphen, so every segment after the first must name a condition — a
 segment that names nothing is an error, not a directory that quietly runs
 everywhere.
 
+A directory says where a test applies; it cannot say that a test is expected
+to fail, since the same directory runs both natively and under the runner.
+That is what `// XFAIL: <condition>…` is for, and only that: a known bug,
+tracked until it is fixed, at which point the run reports an `XPASS` and the
+marker comes out.
+
 Substitutions:
     %s        path to the test source file
     %t        path to a per-test scratch file (no extension)
     %cc       C compiler           (env: $CC,     default: `cc`)
+    %cxx      C++ compiler         (env: $CXX,    default: `c++`)
     %runner   command prefix used to invoke a built test binary
               (env: $RUNNER, default: empty)
 """
@@ -45,6 +52,7 @@ TEST_ROOT = REPO_ROOT / "testing" / "conformance"
 CONDITIONS = frozenset({"linux", "darwin", "x86", "arm64"})
 
 RUN_RE = re.compile(r"//\s*RUN:\s*(.+?)\s*$")
+XFAIL_RE = re.compile(r"//\s*XFAIL:\s*(.+?)\s*$")
 
 _USE_COLOR = sys.stdout.isatty()
 def _c(code: str, s: str) -> str:
@@ -63,8 +71,22 @@ def parse_runs(path: Path) -> list[str]:
     return runs
 
 
-def substitute(cmd: str, *, source: Path, tmp: Path, cc: str, runner: str) -> str:
+def expected_failures(path: Path) -> list[str]:
+    """The conditions the test's `XFAIL:` lines name, unioned."""
+    xfail: list[str] = []
+    for line in path.read_text().splitlines():
+        if m := XFAIL_RE.search(line):
+            # Everything after `--` is a human-readable reason, not a condition.
+            body = m.group(1).split("--", 1)[0]
+            xfail += [f.strip() for f in body.replace(",", " ").split() if f.strip()]
+    return xfail
+
+
+def substitute(
+    cmd: str, *, source: Path, tmp: Path, cc: str, cxx: str, runner: str
+) -> str:
     return (cmd
+        .replace("%cxx", cxx)
         .replace("%cc", cc)
         .replace("%runner", runner)
         .replace("%s", str(source))
@@ -73,14 +95,24 @@ def substitute(cmd: str, *, source: Path, tmp: Path, cc: str, runner: str) -> st
 
 @dataclass
 class Result:
-    status: str   # "pass" | "fail" | "skip"
+    status: str   # "pass" | "fail" | "skip" | "xfail" | "xpass"
     detail: str = ""
 
 
-def run_test(source: Path, *, cc: str, runner: str, timeout: float) -> Result:
+def run_test(
+    source: Path,
+    *,
+    cc: str,
+    cxx: str,
+    runner: str,
+    timeout: float,
+    failing: set[str],
+) -> Result:
+    expect_fail = [f for f in expected_failures(source) if f in failing]
     runs = parse_runs(source)
     if not runs:
         return Result("skip", "no RUN directives")
+    failure: str | None = None
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td) / source.stem
         # Fresh filesystems land under $XDG_STATE_HOME/chimera/fs;
@@ -89,7 +121,9 @@ def run_test(source: Path, *, cc: str, runner: str, timeout: float) -> Result:
         env = dict(os.environ)
         env["XDG_STATE_HOME"] = str(Path(td) / "state")
         for cmd in runs:
-            full = substitute(cmd, source=source, tmp=tmp, cc=cc, runner=runner)
+            full = substitute(
+                cmd, source=source, tmp=tmp, cc=cc, cxx=cxx, runner=runner
+            )
             try:
                 proc = subprocess.run(
                     ["sh", "-c", full],
@@ -102,15 +136,25 @@ def run_test(source: Path, *, cc: str, runner: str, timeout: float) -> Result:
             except subprocess.TimeoutExpired:
                 # A test that never returns (e.g. a deadlock) is a failure, not
                 # an excuse to hang the whole suite forever.
-                return Result("fail", f"timed out after {timeout:g}s\n  cmd: {full}")
+                failure = f"timed out after {timeout:g}s\n  cmd: {full}"
+                break
             if proc.returncode != 0:
                 detail = f"exit={proc.returncode}\n  cmd: {full}\n"
                 if proc.stdout.strip():
                     detail += f"  stdout:\n{_indent(proc.stdout, '    ')}\n"
                 if proc.stderr.strip():
                     detail += f"  stderr:\n{_indent(proc.stderr, '    ')}"
-                return Result("fail", detail.rstrip())
-    return Result("pass")
+                failure = detail.rstrip()
+                break
+
+    # A test marked `XFAIL` for an active condition is expected to fail: a failure
+    # is the tracked outcome (`xfail`), and a pass is an `xpass` — the bug got
+    # fixed, so the marker is now stale and the run is flagged so it gets removed.
+    if expect_fail:
+        if failure is None:
+            return Result("xpass", f"unexpectedly passed (drop the XFAIL: {', '.join(expect_fail)})")
+        return Result("xfail", f"expected failure on {', '.join(expect_fail)}")
+    return Result("fail", failure) if failure is not None else Result("pass")
 
 
 def host_conditions() -> set[str]:
@@ -162,6 +206,14 @@ def main() -> int:
         help="C compiler to substitute for %%cc (env: CC, default: cc)",
     )
     p.add_argument(
+        "--cxx",
+        default=os.environ.get("CXX", "c++"),
+        help="C++ compiler to substitute for %%cxx (env: CXX, default: c++). A "
+        "C++ test must link through this driver: compiling C++ with the C "
+        "driver leaves the C++ runtime out, and a `thread_local` destructor "
+        "then fails to link against `__cxa_thread_atexit`.",
+    )
+    p.add_argument(
         "--runner",
         default=os.environ.get("RUNNER", ""),
         help="command prefix to substitute for %%runner (env: RUNNER, default: empty)",
@@ -189,6 +241,16 @@ def main() -> int:
 
     satisfied = host_conditions()
     exclude = set(args.exclude)
+    # An `XFAIL` may name a host condition, but running under a runner also
+    # offers `chimera` and `<host>-chimera`: "expected to fail" is usually a
+    # property of the translator on one host rather than of the host itself,
+    # and a native run of the same test has no translator and would report a
+    # stale `XFAIL` as an `XPASS`.
+    failing = set(satisfied)
+    if args.runner:
+        host = "darwin" if "darwin" in satisfied else "linux"
+        failing |= {"chimera", f"{host}-chimera"}
+
     roots = args.paths if args.paths else [TEST_ROOT]
     tests: list[Path] = []
     for r in roots:
@@ -211,34 +273,55 @@ def main() -> int:
 
     print(
         DIM(
-            f"# cc={args.cc} runner={args.runner or '<none>'} "
+            f"# cc={args.cc} cxx={args.cxx} runner={args.runner or '<none>'} "
             f"conditions={','.join(sorted(satisfied))}"
             + (f" excluded={','.join(sorted(exclude))}" if exclude else "")
         ),
         file=sys.stderr,
     )
 
-    passed = failed = skipped = 0
+    passed = failed = skipped = xfailed = xpassed = 0
     for t in tests:
         rel = t.relative_to(REPO_ROOT)
-        res = run_test(t, cc=args.cc, runner=args.runner, timeout=args.timeout)
+        res = run_test(
+            t,
+            cc=args.cc,
+            cxx=args.cxx,
+            runner=args.runner,
+            timeout=args.timeout,
+            failing=failing,
+        )
         if res.status == "pass":
             passed += 1
             print(f"{GREEN('PASS')}  {rel}")
         elif res.status == "skip":
             skipped += 1
             print(f"{DIM('SKIP')}  {rel}  ({res.detail})")
+        elif res.status == "xfail":
+            xfailed += 1
+            print(f"{DIM('XFAIL')} {rel}  ({res.detail})")
+        elif res.status == "xpass":
+            # An unexpected pass is a failure of the suite: the marker is stale.
+            xpassed += 1
+            print(f"{RED('XPASS')} {rel}  ({res.detail})")
         else:
             failed += 1
             print(f"{RED('FAIL')}  {rel}")
             if res.detail:
                 print(_indent(res.detail, "    "))
 
-    total = passed + failed + skipped
-    summary = f"{passed} passed, {failed} failed, {skipped} skipped, {total} total"
+    total = passed + failed + skipped + xfailed + xpassed
+    parts = [f"{passed} passed", f"{failed} failed", f"{skipped} skipped"]
+    if xfailed:
+        parts.append(f"{xfailed} xfailed")
+    if xpassed:
+        parts.append(f"{xpassed} xpassed")
+    parts.append(f"{total} total")
+    summary = ", ".join(parts)
+    bad = failed + xpassed
     print()
-    print(summary if failed == 0 else RED(summary))
-    return 0 if failed == 0 else 1
+    print(summary if bad == 0 else RED(summary))
+    return 0 if bad == 0 else 1
 
 
 if __name__ == "__main__":

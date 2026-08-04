@@ -17,7 +17,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          # Add macos-latest once the Darwin port builds end-to-end.
+          - macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -29,7 +29,12 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all -- --check
 
+      # Strict clippy runs on Linux only: the Darwin backend is mid-port, so the
+      # OS-neutral fork/exec/guest-memory machinery the Linux backend drives is
+      # still unwired there and trips `dead_code` under `-D warnings`. It gets
+      # enforced on macOS once those phases land.
       - name: clippy
+        if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: build
@@ -39,5 +44,4 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: conformance
-        if: runner.os == 'Linux'
         run: make conformance
