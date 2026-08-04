@@ -1,4 +1,5 @@
 // RUN: %cc %s -pthread -o %t && %runner %t
+// UNSUPPORTED: darwin -- exercises Linux exit_group / raw-exit process semantics.
 //
 // exit_group must terminate a sibling that is pure computation — spinning in
 // a fully linked guest loop that never issues a syscall and so never reaches

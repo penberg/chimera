@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Linux-only host interfaces
 //
 // open(2)'s mode argument is meaningless unless the call creates a file
 // (O_CREAT or O_TMPFILE): the parameter is variadic, so callers routinely

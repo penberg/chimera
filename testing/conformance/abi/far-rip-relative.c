@@ -1,4 +1,5 @@
 // RUN: %cc -O2 %s -static -nostdlib -Wl,-Ttext-segment=0x35f50000000 -o %t && %runner %t; test $? = 42
+// UNSUPPORTED: darwin -- x86 inline asm
 //
 // Guest code can sit tens of terabytes away from the translated-code cache --
 // a JIT region placed at a randomized high address, or (as here) an image

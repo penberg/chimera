@@ -1,4 +1,5 @@
 // RUN: %cc %s -pthread -o %t && %runner %t
+// UNSUPPORTED: darwin -- uses a pthread primitive or shape absent on macOS (pthread_barrier, reader/writer rwlock, __thread, pthread_once, or SysV/unnamed semaphores).
 //
 // Stress a rwlock's writer path across the thread-startup window.
 //

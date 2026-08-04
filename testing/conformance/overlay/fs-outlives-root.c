@@ -1,8 +1,9 @@
 // RUN: %cc %s -o %t && rm -rf %t.probeA %t.probeB %t.childA %t.childB %t.ws2
-// RUN: timeout 15 %runner %t scenario %t.probeA > %t.childA
+// RUN: %runner %t scenario %t.probeA > %t.childA
 // RUN: %t await %t.childA
 // RUN: %t verify-kept "$XDG_STATE_HOME/chimera/fs" %t.probeA
-// RUN: case "%runner" in *--unsafe*) : ;; *chimera*) CHIMERA_FS=%t.ws2 timeout 15 %runner --rm %t scenario %t.probeB > %t.childB && %t await %t.childB && %t verify-rm %t.ws2 %t.probeB ;; *) : ;; esac
+// RUN: case "%runner" in *--unsafe*) : ;; *chimera*) CHIMERA_FS=%t.ws2 %runner --rm %t scenario %t.probeB > %t.childB && %t await %t.childB && %t verify-rm %t.ws2 %t.probeB ;; *) : ;; esac
+// UNSUPPORTED: darwin -- drives the workspace CLI, a Linux-only feature
 //
 // The session lifetime is the guest process tree, not the root command: a
 // forked guest that outlives the session root must keep a usable filesystem.

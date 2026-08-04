@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Linux-only host interfaces
 //
 // POSIX gives every new descriptor the lowest available number, and real
 // programs depend on it: bash indexes a per-fd array by the number (a sparse

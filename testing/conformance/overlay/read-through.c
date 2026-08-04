@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && rm -rf %t.delta && CHIMERA_FS=%t.delta %runner %t
+// UNSUPPORTED: darwin -- the workspace overlay is a Linux-only feature (xattrs, sysmacros.h, st_atim)
 //
 // The overlay over nothing is indistinguishable from the host: with a fresh,
 // empty delta the guest must see the lower tree — read its own binary, stat

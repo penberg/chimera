@@ -1,4 +1,5 @@
 // RUN: %cc %s -pthread -o %t && %runner %t
+// UNSUPPORTED: darwin -- gettid/tgkill are Linux-specific.
 //
 // gettid is per-thread; getpid is per-process. Each guest thread runs on its own
 // host thread, so gettid (forwarded to the host) returns a distinct kernel TID,

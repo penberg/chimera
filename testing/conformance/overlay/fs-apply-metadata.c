@@ -1,6 +1,7 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
 // RUN: test -z "%runner" || CHIMERA_FS=%t.fixture/ws %runner %t mutate %t.fixture
 // RUN: test -z "%runner" || %t drive %t.fixture "%runner"
+// UNSUPPORTED: darwin -- the workspace overlay is a Linux-only feature (xattrs, sysmacros.h, st_atim)
 //
 // Apply must reproduce the guest-visible metadata, not just the bytes. A
 // filesystem holding only a chmod, a utimensat, or a user xattr change prints

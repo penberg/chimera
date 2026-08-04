@@ -1,4 +1,5 @@
-// RUN: %cc %s -o %t && timeout 10 %runner %t
+// RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- x86 inline asm
 //
 // A guest must never be able to smuggle a raw host syscall past the embedder's
 // syscall handler by writing into Chimera's translated-code cache. The cache

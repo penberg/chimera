@@ -1,6 +1,7 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
-// RUN: CHIMERA_FS=%t.fixture/delta timeout 10 %runner %t check %t.fixture
+// RUN: CHIMERA_FS=%t.fixture/delta %runner %t check %t.fixture
 // RUN: %t verify %t.fixture
+// UNSUPPORTED: darwin -- the workspace overlay is a Linux-only feature (xattrs, sysmacros.h, st_atim)
 //
 // Exec coherence: a guest that rewrites a binary and execve's the path must
 // run the rewritten version — host_path() answers from the serving layer, so

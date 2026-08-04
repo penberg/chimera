@@ -1,4 +1,5 @@
 // RUN: %cc %s -pthread -o %t && %runner %t
+// UNSUPPORTED: darwin -- exercises Linux exit_group / raw-exit process semantics.
 //
 // exit_group must end the whole process even when other threads — including the
 // main thread — are parked indefinitely in a host syscall. Here main blocks in

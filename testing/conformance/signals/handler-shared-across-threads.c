@@ -1,4 +1,4 @@
-// RUN: %cc %s -pthread -o %t && timeout 10 %runner %t
+// RUN: %cc %s -pthread -o %t && %runner %t
 //
 // Signal dispositions are process-wide (POSIX): a handler one thread installs
 // with sigaction is in force for every thread, including a thread-directed
@@ -10,8 +10,8 @@
 // With a per-thread disposition table the worker started with SIGUSR1 at its
 // default, so the delivered signal terminated the whole group — exactly how
 // JSC's SIGPWR stop-the-world (a handler installed on the main thread, fired
-// thread-directed at each mutator) brought the process down. The `timeout`
-// turns a lost-signal hang into a failure too.
+// thread-directed at each mutator) brought the process down. The runner's own
+// timeout turns a lost-signal hang into a failure too.
 
 #include <pthread.h>
 #include <signal.h>

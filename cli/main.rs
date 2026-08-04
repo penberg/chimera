@@ -1,4 +1,7 @@
 mod fs;
+
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 mod opts;
 
 use std::{
@@ -7,10 +10,12 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::Arc,
 };
 
-use chimera::{HostFs, MountFlags, Namespace, OverlayFs, Personality, Sandbox, Vfs};
+use argh::FromArgs;
+use chimera::Sandbox;
+#[cfg(target_os = "linux")]
+use chimera::{HostFs, MountFlags, Namespace, OverlayFs, Personality, Vfs};
 use mimalloc::MiMalloc;
 
 use opts::{Command, Opts, RunCmd};
@@ -23,7 +28,32 @@ use opts::{Command, Opts, RunCmd};
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() -> ExitCode {
-    let opts: Opts = argh::from_env();
+    let args = insert_guest_separator(env::args().collect());
+    let strs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let cmd_name = Path::new(strs.first().copied().unwrap_or("chimera"))
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("chimera");
+    let opts: Opts = match Opts::from_args(&[cmd_name], strs.get(1..).unwrap_or(&[])) {
+        Ok(opts) => opts,
+        // Mirror `argh::from_env`: help goes to stdout with success, parse
+        // errors to stderr with failure.
+        Err(early) => {
+            return match early.status {
+                Ok(()) => {
+                    println!("{}", early.output);
+                    ExitCode::SUCCESS
+                }
+                Err(()) => {
+                    eprintln!(
+                        "{}\nRun {cmd_name} --help for more information.",
+                        early.output
+                    );
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    };
     match opts.command {
         Command::Run(cmd) => run(cmd),
         Command::Version(_) => version(),
@@ -31,10 +61,37 @@ fn main() -> ExitCode {
     }
 }
 
+/// Insert `--` after the `run` subcommand's program path so the guest's own
+/// flags (`chimera run /bin/ls -l`) reach it verbatim instead of being parsed as
+/// `chimera`'s options. argh's greedy positional cannot do this alone: it only
+/// stops option parsing *after* consuming a non-flag argument, so a guest whose
+/// first argument is a flag would still error. The program is the first token
+/// after `run` that is neither a `chimera` option nor an option value.
+fn insert_guest_separator(mut args: Vec<String>) -> Vec<String> {
+    let Some(run_idx) = args.iter().position(|a| a == "run") else {
+        return args;
+    };
+    let mut i = run_idx + 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--" => return args,               // already separated by the user
+            "--code-cache-size" => i += 2,     // `run` option that takes a value
+            a if a.starts_with('-') => i += 1, // any other flag (e.g. --help)
+            _ => {
+                args.insert(i + 1, "--".to_string());
+                return args;
+            }
+        }
+    }
+    args
+}
+
 fn version() -> ExitCode {
     println!(
-        "chimera version {} linux x86-64 {}",
+        "chimera version {} {} {} {}",
         env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
         if chimera::mpk_enabled() {
             "mpk"
         } else {
@@ -44,6 +101,7 @@ fn version() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[cfg(target_os = "linux")]
 fn run(cmd: RunCmd) -> ExitCode {
     // Route the guest's filesystem syscalls through a userspace VFS mounted
     // at `/`. Copy-on-write is the default: every run mounts an overlay
@@ -149,6 +207,7 @@ fn run(cmd: RunCmd) -> ExitCode {
 }
 
 /// The command line a filesystem's provenance records.
+#[cfg(target_os = "linux")]
 fn describe(cmd: &RunCmd) -> String {
     let mut s = cmd.program.display().to_string();
     for arg in &cmd.args {
@@ -158,6 +217,7 @@ fn describe(cmd: &RunCmd) -> String {
     s
 }
 
+#[cfg(target_os = "linux")]
 struct Program {
     /// The guest-visible executable path — what `/proc/self/exe` reports.
     exec: PathBuf,
@@ -167,6 +227,7 @@ struct Program {
     args: Vec<OsString>,
 }
 
+#[cfg(target_os = "linux")]
 fn resolve_program(root: &dyn Vfs, program: &Path, args: &[String]) -> Result<Program, io::Error> {
     let (exec, host_exec) = resolve_path(root, program)?;
     if let Some((interpreter, interpreter_args)) = read_shebang(&host_exec)? {
@@ -195,6 +256,7 @@ fn resolve_program(root: &dyn Vfs, program: &Path, args: &[String]) -> Result<Pr
 /// serving it. A bare name walks `PATH` with each candidate's existence
 /// judged in the merged view, so a filesystem whiteout hides a candidate
 /// instead of letting the lower host file shadow through.
+#[cfg(target_os = "linux")]
 fn resolve_path(root: &dyn Vfs, program: &Path) -> Result<(PathBuf, PathBuf), io::Error> {
     if program.is_absolute() || program.components().count() > 1 {
         let exec = absolutize(program)?;
@@ -225,6 +287,82 @@ fn resolve_path(root: &dyn Vfs, program: &Path) -> Result<(PathBuf, PathBuf), io
 
 /// The lexically absolute form of `path`, anchored at the current directory:
 /// the merged view is indexed by absolute guest paths.
+#[cfg(not(target_os = "linux"))]
+fn run(cmd: RunCmd) -> ExitCode {
+    let program = match resolve_program(&cmd.program, &cmd.args) {
+        Ok(program) => program,
+        Err(err) => {
+            eprintln!("chimera: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut sandbox = match Sandbox::new(&program.exec) {
+        Ok(sandbox) => sandbox,
+        Err(err) => {
+            eprintln!("chimera: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(mib) = cmd.code_cache_size {
+        sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
+    }
+    match sandbox.args(&program.args).run() {
+        Ok(status) => ExitCode::from(status.code() as u8),
+        Err(err) => {
+            eprintln!("chimera: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct Program {
+    exec: PathBuf,
+    args: Vec<OsString>,
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_program(program: &Path, args: &[String]) -> Result<Program, io::Error> {
+    let program = resolve_path(program)?;
+    if let Some((interpreter, interpreter_args)) = read_shebang(&program)? {
+        let mut exec_args = interpreter_args;
+        // Run shebang scripts through their interpreter so the runtime still
+        // only has to execute ELF binaries.
+        exec_args.push(program.as_os_str().to_os_string());
+        exec_args.extend(args.iter().map(OsString::from));
+        return Ok(Program {
+            exec: resolve_path(&interpreter)?,
+            args: exec_args,
+        });
+    }
+
+    Ok(Program {
+        exec: program,
+        args: args.iter().map(OsString::from).collect(),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_path(program: &Path) -> Result<PathBuf, io::Error> {
+    if program.is_absolute() || program.components().count() > 1 {
+        return Ok(program.to_path_buf());
+    }
+
+    let path = env::var_os("PATH").unwrap_or_default();
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(program);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("program {:?} not found in PATH", program.display()),
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn absolutize(path: &Path) -> Result<PathBuf, io::Error> {
     use std::path::Component;
 

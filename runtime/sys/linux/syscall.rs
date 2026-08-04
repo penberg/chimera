@@ -4,7 +4,10 @@
 
 use std::arch::asm;
 
-use crate::{SyscallResult, SystemCall};
+use crate::{
+    SyscallResult, SystemCall,
+    arch::dispatch::{RAX, ThreadState},
+};
 
 /// Issue the host kernel's `syscall` instruction with `call`'s number in `rax`
 /// and the six argument registers in Linux x86-64 syscall ABI order. Decodes
@@ -36,4 +39,15 @@ pub fn host_syscall(call: &SystemCall) -> SyscallResult {
     } else {
         SyscallResult::Ok(ret)
     }
+}
+
+/// Commit a serviced syscall's result to the guest register file in the Linux
+/// syscall-return ABI. Linux carries the outcome in the return register alone —
+/// a value in the kernel's `[-4095, -1]` range is `-errno`, anything else is
+/// success — with no separate error flag, so the already-encoded return value
+/// is a single store into `rax`. The dispatcher calls this once per serviced
+/// syscall; a host with a flag-based convention (Darwin's NZCV carry) supplies
+/// its own writeback behind the same `sys::write_syscall_result` name.
+pub fn write_syscall_result(state: &mut ThreadState, call: &SystemCall) {
+    state.regs[RAX] = call.return_value() as u64;
 }

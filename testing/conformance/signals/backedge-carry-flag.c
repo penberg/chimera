@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- x86-64 inline asm with no arm64/Apple equivalent.
 //
 // The safepoint poll on a linked conditional back-edge must not perturb the
 // guest's arithmetic flags. A multi-limb add carries the carry flag (CF) across

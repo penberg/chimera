@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- clone is a Linux thread primitive; Darwin uses bsdthread_create.
 //
 // clone(CLONE_VM): a new thread that shares the creator's address space.
 // Chimera cannot forward such a clone to the host (the new task would run guest

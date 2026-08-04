@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- mremap(2) is Linux-only
 //
 // Grow an anonymous mapping with mremap(MREMAP_MAYMOVE). The existing contents
 // must survive and the grown tail must be writable.

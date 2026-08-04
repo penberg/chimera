@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Darwin has no POSIX real-time signals.
 //
 // sigqueue() attaches a value to a real-time signal, delivered to an SA_SIGINFO
 // handler as si_value with si_code == SI_QUEUE. Because real-time signals queue,

@@ -4,6 +4,7 @@
 // RUN: CHIMERA_FS=%t.ws %runner %t.d/script; test $? -eq 77
 // RUN: CHIMERA_FS=%t.ws %runner %t unlink %t.d/prog
 // RUN: CHIMERA_FS=%t.ws %runner %t.d/prog; c=$?; test $c -ne 0 && test $c -ne 11
+// UNSUPPORTED: darwin -- the workspace overlay is a Linux-only feature (xattrs, sysmacros.h, st_atim)
 //
 // Initial-exec coherence: the executable that starts a session must come
 // from the same merged view the guest's own syscalls see. One session

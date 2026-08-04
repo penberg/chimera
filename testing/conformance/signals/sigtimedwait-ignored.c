@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Darwin has no sigtimedwait syscall.
 //
 // A signal that would be ignored on delivery does not interrupt
 // sigtimedwait(): the kernel discards it and keeps waiting. Wait on {SIGUSR1}

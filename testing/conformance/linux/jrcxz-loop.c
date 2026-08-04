@@ -1,4 +1,5 @@
 // RUN: %cc -O2 %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- x86 inline asm (rel8-only jrcxz/loop have no arm64 analogue)
 //
 // The rel8-only conditional branches: jrcxz/jecxz (branch if rcx/ecx is zero)
 // and the loop family (decrement rcx/ecx, branch while nonzero; loope/loopne

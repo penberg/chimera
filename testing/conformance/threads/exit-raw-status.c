@@ -1,4 +1,5 @@
 // RUN: %cc %s -pthread -o %t && %runner %t
+// UNSUPPORTED: darwin -- exercises Linux exit_group / raw-exit process semantics.
 //
 // A raw SYS_exit must terminate the process with the right status. Absent an
 // exit_group, the kernel reports the status of the *last* thread to exit as the

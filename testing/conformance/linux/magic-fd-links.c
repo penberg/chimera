@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Linux-only host interfaces
 //
 // The kernel resolves /dev/fd/N and /proc/self/fd/N as magic links to the
 // open file itself, not through the filesystem — their readlink target

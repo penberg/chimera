@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Linux-only host interfaces
 //
 // close_range is how spawn paths scrub "every fd from N up" before an
 // exec — Bun marks 3.. CLOSE_RANGE_CLOEXEC before every subprocess. The

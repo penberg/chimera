@@ -1,4 +1,5 @@
 // RUN: %cc %s -pthread -o %t && %runner %t
+// UNSUPPORTED: darwin -- uses a pthread primitive or shape absent on macOS (pthread_barrier, reader/writer rwlock, __thread, pthread_once, or SysV/unnamed semaphores).
 //
 // pthread_once must run its init routine exactly once no matter how many threads
 // race to call it, with the losers blocking until the winner finishes. Sixteen

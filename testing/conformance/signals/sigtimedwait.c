@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Darwin has no sigtimedwait syscall.
 //
 // sigtimedwait() synchronously accepts a signal from a set without running its
 // handler. Block SIGUSR1, raise it (now pending), and dequeue it with

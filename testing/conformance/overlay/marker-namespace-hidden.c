@@ -1,6 +1,7 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
 // RUN: CHIMERA_FS=%t.fixture/delta %runner %t check %t.fixture
 // RUN: %t verify %t.fixture
+// UNSUPPORTED: darwin -- the workspace overlay is a Linux-only feature (xattrs, sysmacros.h, st_atim)
 //
 // The overlay's bookkeeping xattr namespace (user.chimera.*) is the guest's
 // blind spot: a copied-up file carries user.chimera.origin, but getxattr

@@ -1,6 +1,7 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture && %t prep %t.fixture
 // RUN: CHIMERA_FS=%t.fixture/delta %runner %t check %t.fixture
 // RUN: %t verify %t.fixture
+// UNSUPPORTED: darwin -- the workspace overlay is a Linux-only feature (xattrs, sysmacros.h, st_atim)
 //
 // Attribute changes route through the overlay: chmod and utimensat of a
 // lower file copy it up and apply in the delta, the guest observes the new

@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- clone is a Linux thread primitive; Darwin uses bsdthread_create.
 //
 // clone(CLONE_SETTLS): the new thread gets its own thread pointer (%fs base),
 // taken from the `tls` clone argument — this is how each pthread gets a private

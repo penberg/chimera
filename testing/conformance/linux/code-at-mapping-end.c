@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Linux-only host interfaces
 //
 // Code whose last byte is the last byte of its mapping must still run: the
 // translator's fixed-size decode window straddles past the function into the

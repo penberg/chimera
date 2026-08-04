@@ -1,4 +1,4 @@
-// RUN: %cc %s -o %t && timeout 5 %runner %t
+// RUN: %cc %s -o %t && %runner %t
 //
 // A genuine guest fault (a write to an unmapped address) must terminate the
 // process by SIGSEGV, faithfully. Chimera owns the host SIGSEGV slot for its

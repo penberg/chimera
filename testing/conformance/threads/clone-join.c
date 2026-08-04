@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- clone is a Linux thread primitive; Darwin uses bsdthread_create.
 //
 // The join mechanism, on which pthread_join is built. CLONE_PARENT_SETTID
 // delivers the child's TID into a parent word at clone time; CLONE_CHILD_CLEARTID

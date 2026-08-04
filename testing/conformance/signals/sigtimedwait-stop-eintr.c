@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Darwin has no sigtimedwait syscall.
 //
 // A default-disposition stop signal both stops the process and interrupts
 // sigtimedwait() with EINTR: the kernel wakes the sleep to perform the stop,

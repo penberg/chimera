@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Darwin has no POSIX real-time signals.
 //
 // Real-time signals queue: unlike standard signals, multiple instances raised
 // while blocked are not coalesced. Block SIGRTMIN, raise it three times, then

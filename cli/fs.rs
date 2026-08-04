@@ -28,6 +28,7 @@ use std::{
 
 /// One filesystem: its short id and the directory holding `data/`, `tmp/`,
 /// and the metadata file.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct Filesystem {
     pub id: String,
     pub root: PathBuf,
@@ -64,6 +65,7 @@ fn filesystems_dir() -> PathBuf {
 }
 
 /// A fresh filesystem with a collision-free generated id.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn create(command: &str) -> io::Result<Filesystem> {
     let base = filesystems_dir();
     fs::create_dir_all(&base)?;
@@ -92,6 +94,7 @@ pub fn create(command: &str) -> io::Result<Filesystem> {
 /// names the filesystem directory itself (created if missing — the escape
 /// hatch scripts and the conformance suite use); anything else is an id
 /// under the state directory, which must exist.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn attach(selector: &OsStr) -> io::Result<Filesystem> {
     if selector.as_bytes().contains(&b'/') {
         let root = PathBuf::from(selector);
@@ -131,6 +134,7 @@ pub fn attach(selector: &OsStr) -> io::Result<Filesystem> {
 /// progress (which holds it exclusively) refuses, so an attach cannot land
 /// on a tree that is being removed. The descriptor sits above the runtime's
 /// backing-fd floor, out of reach of guest descriptor operations.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn hold(root: &std::path::Path) -> io::Result<OwnedFd> {
     let file = fs::OpenOptions::new()
         .read(true)
@@ -157,6 +161,7 @@ fn hold(root: &std::path::Path) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl Filesystem {
     /// End-of-session disposition. `discard` removes the filesystem outright
     /// (`--rm`). Otherwise a fresh filesystem whose delta is empty vanishes
@@ -271,20 +276,33 @@ fn write_meta(root: &std::path::Path, id: &str, command: &str) -> io::Result<()>
 
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
 use chimera::delta::{
     Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin,
 };
 
-use crate::opts::{FsAction, FsApplyCmd, FsDiffCmd, FsPruneCmd, FsRmCmd};
+use crate::opts::{FsAction, FsPruneCmd, FsRmCmd};
+#[cfg(target_os = "linux")]
+use crate::opts::{FsApplyCmd, FsDiffCmd};
 
 /// Entry point for `chimera fs <action>`.
 pub fn command(action: FsAction) -> std::process::ExitCode {
     let result = match action {
         FsAction::List(_) => list(),
-        FsAction::Diff(FsDiffCmd { filesystem }) => diff(&filesystem),
-        FsAction::Apply(FsApplyCmd { filesystem }) => apply(&filesystem),
         FsAction::Rm(FsRmCmd { filesystems }) => rm(&filesystems),
         FsAction::Prune(FsPruneCmd { force }) => prune(force),
+        // Reading a delta means reading its whiteout and origin markers, which
+        // are xattrs; replaying one means restoring them. Listing, removing and
+        // pruning are directory work and need no such thing.
+        #[cfg(target_os = "linux")]
+        FsAction::Diff(FsDiffCmd { filesystem }) => diff(&filesystem),
+        #[cfg(target_os = "linux")]
+        FsAction::Apply(FsApplyCmd { filesystem }) => apply(&filesystem),
+        #[cfg(not(target_os = "linux"))]
+        FsAction::Diff(_) | FsAction::Apply(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "reading and applying a delta needs the xattrs only a Linux host has",
+        )),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -389,6 +407,7 @@ fn human_size(bytes: u64) -> String {
 }
 
 /// One entry of a filesystem's change-set, keyed by the guest-visible path.
+#[cfg(target_os = "linux")]
 struct Change {
     kind: Kind,
     /// The absolute path the guest saw (and the host path the change is
@@ -399,12 +418,14 @@ struct Change {
 }
 
 #[derive(PartialEq, Copy, Clone)]
+#[cfg(target_os = "linux")]
 enum Kind {
     Added,
     Modified,
     Deleted,
 }
 
+#[cfg(target_os = "linux")]
 impl Kind {
     fn letter(self) -> char {
         match self {
@@ -419,6 +440,7 @@ impl Kind {
 /// children. Directories themselves are listed only when opaque (they
 /// replace the lower directory wholesale); an ordinary upper directory is
 /// just the scaffolding under its children.
+#[cfg(target_os = "linux")]
 fn changes(root: &Path) -> io::Result<Vec<Change>> {
     let data = root.join("data");
     let mut out = Vec::new();
@@ -426,6 +448,7 @@ fn changes(root: &Path) -> io::Result<Vec<Change>> {
     Ok(out)
 }
 
+#[cfg(target_os = "linux")]
 fn walk(upper_dir: &Path, guest_dir: &Path, out: &mut Vec<Change>) -> io::Result<()> {
     let mut entries: Vec<_> = fs::read_dir(upper_dir)?.filter_map(Result::ok).collect();
     entries.sort_by_key(|e| e.file_name());
@@ -462,6 +485,7 @@ fn walk(upper_dir: &Path, guest_dir: &Path, out: &mut Vec<Change>) -> io::Result
 }
 
 /// Added or Modified, judged against the live host.
+#[cfg(target_os = "linux")]
 fn kind_against_host(guest: &Path) -> Kind {
     if fs::symlink_metadata(guest).is_ok() {
         Kind::Modified
@@ -470,10 +494,12 @@ fn kind_against_host(guest: &Path) -> Kind {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn errno_to_io(e: chimera::Errno) -> io::Error {
     io::Error::from_raw_os_error(e.raw())
 }
 
+#[cfg(target_os = "linux")]
 fn diff(selector: &str) -> io::Result<()> {
     let root = resolve(selector)?;
     for change in changes(&root)? {
@@ -574,6 +600,7 @@ fn prune(force: bool) -> io::Result<()> {
 /// copy no longer matches the origin recorded at copy-up is refused rather
 /// than clobbered; everything else applies, and any conflict makes the whole
 /// command report failure.
+#[cfg(target_os = "linux")]
 fn apply(selector: &str) -> io::Result<()> {
     let root = resolve(selector)?;
     let mut conflicts = 0u32;
@@ -603,11 +630,13 @@ fn apply(selector: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 enum ApplyError {
     Conflict,
     Io(io::Error),
 }
 
+#[cfg(target_os = "linux")]
 impl From<io::Error> for ApplyError {
     fn from(e: io::Error) -> Self {
         ApplyError::Io(e)
@@ -615,6 +644,7 @@ impl From<io::Error> for ApplyError {
 }
 
 /// `CString` from a path's bytes; an embedded NUL is invalid input.
+#[cfg(target_os = "linux")]
 fn cpath(path: &std::path::Path) -> io::Result<std::ffi::CString> {
     std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
@@ -623,12 +653,14 @@ fn cpath(path: &std::path::Path) -> io::Result<std::ffi::CString> {
 /// The xattrs apply replays onto the host: the guest-visible user namespace
 /// and the POSIX ACL attributes. Chimera's reserved `user.chimera.*`
 /// bookkeeping is delta state and never reaches the host.
+#[cfg(target_os = "linux")]
 fn replayable_xattr(name: &[u8]) -> bool {
     (name.starts_with(b"user.") && !name.starts_with(b"user.chimera."))
         || name == b"system.posix_acl_access"
         || name == b"system.posix_acl_default"
 }
 
+#[cfg(target_os = "linux")]
 fn copy_xattrs(upper: &std::ffi::CStr, host: &std::ffi::CStr) -> io::Result<()> {
     let mut names = vec![0u8; 1024];
     let len = loop {
@@ -697,6 +729,7 @@ fn copy_xattrs(upper: &std::ffi::CStr, host: &std::ffi::CStr) -> io::Result<()> 
 /// the content transfer: reading the upper for the copy already disturbs
 /// its atime. A failure here is the command's failure; a partial apply
 /// never reads as success.
+#[cfg(target_os = "linux")]
 fn replay_metadata(
     md: &fs::Metadata,
     upper: &std::path::Path,
@@ -746,6 +779,7 @@ fn replay_metadata(
 /// itself, only a real directory is removed recursively. An absent target is
 /// already removed. A target that changes type between inspection and
 /// removal surfaces as the resulting I/O error, not a mis-typed deletion.
+#[cfg(target_os = "linux")]
 fn remove_host(path: &std::path::Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(md) if md.is_dir() => fs::remove_dir_all(path),
@@ -755,6 +789,7 @@ fn remove_host(path: &std::path::Path) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn apply_change(change: &Change) -> Result<(), ApplyError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 

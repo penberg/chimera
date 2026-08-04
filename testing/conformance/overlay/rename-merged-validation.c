@@ -1,5 +1,6 @@
 // RUN: %cc %s -o %t && rm -rf %t.d && %t prep %t.d
-// RUN: timeout 20 %runner %t check %t.d
+// RUN: %runner %t check %t.d
+// UNSUPPORTED: darwin -- the workspace overlay is a Linux-only feature (xattrs, sysmacros.h, st_atim)
 //
 // Rename preconditions are merged-view questions. A directory renamed over a
 // lower regular file must fail ENOTDIR and over a non-empty lower directory

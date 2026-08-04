@@ -1,4 +1,5 @@
-// RUN: %cc %s -o %t && timeout 10 %runner %t
+// RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- clone3(2) is Linux-only
 //
 // clone3's CLONE_CLEAR_SIGHAND resets the child's signal dispositions the way
 // execve does: caught handlers revert to SIG_DFL, SIG_IGN survives, and the

@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- clone is a Linux thread primitive; Darwin uses bsdthread_create.
 //
 // Bogus TID words must not crash the runtime — and must not fail the clone.
 // The kernel's put_user for CLONE_PARENT_SETTID / CLONE_CHILD_SETTID is

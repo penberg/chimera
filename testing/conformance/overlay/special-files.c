@@ -1,5 +1,6 @@
 // RUN: %cc %s -o %t && rm -rf %t.delta %t.fifo && CHIMERA_FS=%t.delta %runner %t check %t.fifo
 // RUN: %t verify %t.delta %t.fifo
+// UNSUPPORTED: darwin -- the workspace overlay is a Linux-only feature (xattrs, sysmacros.h, st_atim)
 //
 // Special files under the overlay: opening a device passes through to the
 // lower without copy-up — writing /dev/null sends bytes to the object behind

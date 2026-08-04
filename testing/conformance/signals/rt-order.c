@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Darwin has no POSIX real-time signals.
 //
 // When several different real-time signals are pending, they are delivered
 // starting with the lowest-numbered. Block SIGRTMIN and SIGRTMIN+1, raise the

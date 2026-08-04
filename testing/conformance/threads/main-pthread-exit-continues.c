@@ -1,4 +1,5 @@
 // RUN: %cc %s -pthread -o %t && %runner %t; test $? -eq 7
+// UNSUPPORTED: darwin -- exercises Linux exit_group / raw-exit process semantics.
 //
 // pthread_exit from the main thread does not terminate the process: POSIX keeps
 // it alive until the last thread exits. Here main spawns a worker and then calls

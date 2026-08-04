@@ -1,4 +1,5 @@
 // RUN: %cc %s -pthread -o %t && %runner %t
+// UNSUPPORTED: darwin -- exercises Linux exit_group / raw-exit process semantics.
 //
 // exit_group terminates the whole thread group, not just the calling thread.
 // A worker thread calling _exit (which is exit_group) must end the entire

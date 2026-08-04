@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Linux-only host interfaces
 //
 // Attribute mutators must route through the VFS. The test discovers which
 // world it runs in by trying to create a scratch file: in a writable world

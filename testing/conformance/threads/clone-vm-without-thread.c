@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- clone is a Linux thread primitive; Darwin uses bsdthread_create.
 //
 // clone(CLONE_VM) without CLONE_THREAD asks for a *separate process* that
 // shares the caller's memory: it has its own PID and is reaped with

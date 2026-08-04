@@ -1,4 +1,4 @@
-// RUN: %cc %s -o %t -pthread && timeout 5 %runner %t
+// RUN: %cc %s -o %t -pthread && %runner %t
 //
 // A thread-directed signal (pthread_kill) must be delivered ON the thread it
 // targets, even while another thread is busy passing through delivery points.
@@ -7,21 +7,35 @@
 // tgkill'd signal -- JavaScriptCore's SIGPWR suspend/resume protocol deadlocked
 // exactly that way, the resume swallowed by a busy sibling while the suspended
 // thread waited in sigsuspend holding the heap lock. The handler records which
-// thread it ran on; it must be the targeted worker, never main.
+// thread it ran on; it must be the targeted worker, never main. The runner's
+// own timeout turns a lost delivery into a deterministic failure.
 
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
-#include <sys/syscall.h>
+#include <stdint.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+static long self_tid(void) {
+    uint64_t tid = 0;
+    pthread_threadid_np(0, &tid);
+    return (long) tid;
+}
+#else
+#include <sys/syscall.h>
+static long self_tid(void) {
+    return (long) syscall(SYS_gettid);
+}
+#endif
 
 static atomic_long handler_tid = 0;
 static atomic_int worker_ready = 0;
 
 static void on_usr1(int sig) {
     (void) sig;
-    atomic_store(&handler_tid, (long) syscall(SYS_gettid));
+    atomic_store(&handler_tid, self_tid());
 }
 
 static void *worker(void *arg) {
@@ -57,6 +71,6 @@ int main(void) {
     if (pthread_join(t, 0) != 0) return 4;
     worker_tid = atomic_load(&handler_tid);
     if (worker_tid == 0) return 5; // never delivered
-    if (worker_tid == (long) syscall(SYS_gettid)) return 6; // stolen by main
+    if (worker_tid == self_tid()) return 6; // stolen by main
     return 0;
 }

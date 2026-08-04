@@ -1,6 +1,7 @@
 // RUN: %cc %s -o %t && rm -rf %t.d && %t prep %t.d
-// RUN: CHIMERA_FS=%t.ws timeout 20 %runner %t check %t.d
+// RUN: CHIMERA_FS=%t.ws %runner %t check %t.d
 // RUN: %t verify %t.ws %t.d
+// UNSUPPORTED: darwin -- the workspace overlay is a Linux-only feature (xattrs, sysmacros.h, st_atim)
 //
 // Opening a lower file with write intent copies it up — and that must not
 // change what the guest sees. The copy has to carry every attribute

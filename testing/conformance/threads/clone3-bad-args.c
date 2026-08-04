@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- clone is a Linux thread primitive; Darwin uses bsdthread_create.
 //
 // clone3 argument validation must come from the kernel, not crash the runtime.
 // A guest handing clone3 a bogus `clone_args` pointer must get EFAULT — the

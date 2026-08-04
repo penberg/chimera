@@ -1,5 +1,6 @@
 // RUN: %cc %s -o %t && rm -rf %t.fixture
 // RUN: test -z "%runner" || %t drive %t.fixture "%runner"
+// UNSUPPORTED: darwin -- drives the workspace CLI, a Linux-only feature
 //
 // `fs prune` sweeps the state directory: a filesystem no session
 // holds is removed (including one from before the lock file existed), a

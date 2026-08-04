@@ -17,7 +17,7 @@ use crate::{
     Error, SystemCalls,
     arch::dispatch::{self, ExitReason},
     process::Process,
-    sys::mmap::{AddressSpace, copy_from_guest},
+    sys::mmap::{AddressSpace, read_guest_cstr, read_guest_ptr_array},
 };
 
 use super::{
@@ -214,7 +214,7 @@ pub struct PreparedExec {
 /// thread disturbed.
 pub fn prepare_exec(
     number: u64,
-    args: &[u64; 6],
+    args: &[u64; 8],
     handler: &dyn SystemCalls,
 ) -> Result<PreparedExec, Error> {
     let req = read_request(number, args, handler)?;
@@ -261,14 +261,14 @@ fn record_regions(
 ) {
     addr_space.set_program_break(current_program_break());
     for &(start, len) in &main.regions {
-        addr_space.add_region(start as usize, len as usize);
+        addr_space.add_runtime_region(start as usize, len as usize);
     }
     if let Some(interp) = interp {
         for &(start, len) in &interp.regions {
-            addr_space.add_region(start as usize, len as usize);
+            addr_space.add_runtime_region(start as usize, len as usize);
         }
     }
-    addr_space.add_region(stack_start, stack_len);
+    addr_space.add_runtime_region(stack_start, stack_len);
 }
 
 fn current_program_break() -> usize {
@@ -296,7 +296,7 @@ struct ExecRequest {
 /// `/proc/self/fd` handling stands in for [`Passthrough`].
 fn read_request(
     number: u64,
-    args: &[u64; 6],
+    args: &[u64; 8],
     handler: &dyn SystemCalls,
 ) -> Result<ExecRequest, Error> {
     let (dirfd, rawptr, flags, argv_ptr, envp_ptr) = if number == libc::SYS_execveat as u64 {
@@ -317,8 +317,8 @@ fn read_request(
     };
     Ok(ExecRequest {
         path,
-        argv: read_guest_ptr_array(argv_ptr)?,
-        envp: read_guest_ptr_array(envp_ptr)?,
+        argv: read_guest_ptr_array(argv_ptr, MAX_ARG_COUNT, MAX_ARG_STRLEN)?,
+        envp: read_guest_ptr_array(envp_ptr, MAX_ARG_COUNT, MAX_ARG_STRLEN)?,
     })
 }
 
@@ -331,67 +331,6 @@ const MAX_ARG_STRLEN: usize = 32 * PAGE_SIZE as usize;
 /// at least a stack pointer, so more entries than `ARG_MAX / 8` could never
 /// fit on the guest stack anyway; reject them with `E2BIG` up front.
 const MAX_ARG_COUNT: usize = STACK_SIZE / 4 / 8;
-
-/// A guest-memory read failed or overran its bound while decoding an exec
-/// request. Carried as an [`Error::Io`] so [`exec_errno`] hands the errno to
-/// the caller exactly as the kernel's user-copy path would.
-fn arg_error(errno: i32, what: &str) -> Error {
-    Error::io(
-        format!("execve: {what}"),
-        std::io::Error::from_raw_os_error(errno),
-    )
-}
-
-/// Copy a NUL-terminated string out of guest memory without trusting the
-/// pointer (see `copy_from_guest`), in chunks that stop at page boundaries so
-/// a string ending just before an unmapped page is not failed by over-reading
-/// past it. `cap` is the kernel's limit for this kind of string: filling it
-/// without a NUL fails with `toolong` (`ENAMETOOLONG` for a pathname, `E2BIG`
-/// for an argv/envp entry), and an unreadable byte fails with `EFAULT`, the
-/// way the kernel's user-copy would.
-fn read_guest_cstr(ptr: u64, cap: usize, toolong: i32) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::new();
-    let mut addr = ptr;
-    while out.len() < cap {
-        let page_left = (PAGE_SIZE - (addr % PAGE_SIZE)) as usize;
-        let mut chunk = vec![0u8; page_left.min(cap - out.len())];
-        if !copy_from_guest(addr, &mut chunk) {
-            return Err(arg_error(libc::EFAULT, "unreadable string"));
-        }
-        if let Some(nul) = chunk.iter().position(|&b| b == 0) {
-            chunk.truncate(nul);
-            out.extend_from_slice(&chunk);
-            return Ok(out);
-        }
-        addr += chunk.len() as u64;
-        out.extend_from_slice(&chunk);
-    }
-    Err(arg_error(toolong, "string exceeds its limit"))
-}
-
-/// Copy a NULL-terminated array of C-string pointers (an argv or envp) and
-/// its strings out of guest memory, trusting none of the pointers. A null
-/// array pointer is Linux's "no arguments" degenerate case, not a fault.
-fn read_guest_ptr_array(ptr: u64) -> Result<Vec<Vec<u8>>, Error> {
-    if ptr == 0 {
-        return Ok(Vec::new());
-    }
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    loop {
-        if out.len() >= MAX_ARG_COUNT {
-            return Err(arg_error(libc::E2BIG, "argument list too long"));
-        }
-        let mut raw = [0u8; 8];
-        if !copy_from_guest(ptr + (out.len() as u64) * 8, &mut raw) {
-            return Err(arg_error(libc::EFAULT, "unreadable argument pointer"));
-        }
-        let entry = u64::from_ne_bytes(raw);
-        if entry == 0 {
-            return Ok(out);
-        }
-        out.push(read_guest_cstr(entry, MAX_ARG_STRLEN, libc::E2BIG)?);
-    }
-}
 
 /// Default resolution of an exec pathname against its `dirfd` and flags, used
 /// when the handler does not resolve it itself. An absolute path or `AT_FDCWD`

@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- relies on Linux siginfo si_code semantics.
 //
 // An SA_SIGINFO handler receives a populated siginfo_t. For a signal sent with
 // kill(2), si_code is SI_USER and si_pid/si_uid identify the sender. Sending to

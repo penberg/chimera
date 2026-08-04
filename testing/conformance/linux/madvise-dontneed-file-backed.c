@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- x86 host only -- the source #errors elsewhere
 //
 // madvise(MADV_DONTNEED) on an initialized data segment must not lose the
 // segment's contents. On a private file-backed mapping DONTNEED drops the

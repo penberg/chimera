@@ -1,4 +1,4 @@
-// RUN: %cc %s -o %t && timeout 10 %runner %t
+// RUN: %cc %s -o %t && %runner %t
 //
 // posix_spawnp resolves the program inside the spawned child: glibc's spawn
 // child walks $PATH issuing one execve per candidate, so early ENOENT

@@ -1,4 +1,5 @@
 // RUN: %cc -O2 %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- x86 inline asm (`ret imm16` has no arm64 analogue)
 //
 // `ret imm16`: pops the return address, then releases imm16 more bytes of
 // stack — the callee-cleans-arguments convention V8's builtins use. A

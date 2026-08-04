@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- x86 host only -- the source #errors elsewhere
 //
 // Self-modifying code: a guest overwrites already-executed machine code in
 // place and runs it again, expecting the new behavior. A dynamic translator

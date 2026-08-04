@@ -1,4 +1,5 @@
 // RUN: %cc %s -o %t && %runner %t
+// UNSUPPORTED: darwin -- Linux-only host interfaces
 //
 // /proc/self/exe names the process's executed image. Under an emulated
 // execve the kernel's own link points at the runtime binary, so a sandbox

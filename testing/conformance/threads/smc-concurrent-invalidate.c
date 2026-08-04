@@ -1,4 +1,5 @@
 // RUN: %cc %s -pthread -o %t && %runner %t
+// UNSUPPORTED: darwin -- x86 host only -- the source #errors elsewhere
 //
 // Concurrent code-page writes while a sibling thread executes from the page.
 // A concurrent JIT (JavaScriptCore compiling on worker threads) routinely

@@ -3,6 +3,7 @@
 // that through /proc/self/fd and translates the new image like any other target.
 //
 // RUN: %cc %s -o %t && %runner %t; test $? = 55
+// UNSUPPORTED: darwin -- execveat is a Linux syscall; Darwin names an exec target by path only.
 
 #define _GNU_SOURCE
 #include <fcntl.h>

@@ -30,7 +30,13 @@ int main(void) {
 
     // A real program must spawn, run, and report its status normally.
     pid = -1;
+#if defined(__APPLE__)
+    // macOS has no /bin/true; /usr/bin/true is a real (arm64e, shared-cache
+    // linked) system binary, spawned here as a guest.
+    char *ok[] = {(char *) "/usr/bin/true", NULL};
+#else
     char *ok[] = {(char *) "/bin/true", NULL};
+#endif
     rc = posix_spawn(&pid, ok[0], NULL, NULL, ok, environ);
     if (rc != 0) {
         fprintf(stderr, "/bin/true: posix_spawn returned %d (%s)\n", rc, strerror(rc));
