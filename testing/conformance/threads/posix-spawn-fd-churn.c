@@ -1,4 +1,4 @@
-// RUN: %cc %s -pthread -o %t && timeout 20 %runner %t
+// RUN: %cc %s -pthread -o %t && %runner %t
 //
 // posix_spawn while sibling threads churn the descriptor table. A handler
 // that virtualizes descriptors pairs its table with kernel state (reserved

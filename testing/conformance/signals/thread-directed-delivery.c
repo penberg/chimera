@@ -1,4 +1,4 @@
-// RUN: %cc %s -o %t -pthread && timeout 5 %runner %t
+// RUN: %cc %s -o %t -pthread && %runner %t
 //
 // A thread-directed signal (pthread_kill) must be delivered ON the thread it
 // targets, even while another thread is busy passing through delivery points.

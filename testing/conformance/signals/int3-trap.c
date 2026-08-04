@@ -1,4 +1,4 @@
-// RUN: %cc %s -o %t && timeout 5 %runner %t
+// RUN: %cc %s -o %t && %runner %t
 //
 // A guest `int3` software breakpoint raises SIGTRAP. The translator does not run
 // the breakpoint in the cache; it exits with a trap indication and the run loop

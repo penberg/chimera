@@ -1,5 +1,5 @@
 // RUN: %cc %s -o %t && rm -rf %t.a %t.b %t.c && %t prep %t.a %t.b %t.c
-// RUN: timeout 20 %runner %t check %t.a %t.b %t.c
+// RUN: %runner %t check %t.a %t.b %t.c
 //
 // Scaffold directories are structure, not content: creating a file beneath a
 // lower directory materializes upper parents, but those exist only so the

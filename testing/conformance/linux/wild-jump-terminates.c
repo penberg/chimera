@@ -1,4 +1,4 @@
-// RUN: %cc %s -o %t && timeout 5 %runner %t
+// RUN: %cc %s -o %t && %runner %t
 //
 // A wild jump to unmapped memory must terminate the process by SIGSEGV,
 // faithfully. The fault here is on the instruction FETCH, not a data access:

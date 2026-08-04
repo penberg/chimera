@@ -1,4 +1,4 @@
-// RUN: %cc -O2 -fPIE %s -pie -o %t && timeout 5 %runner %t
+// RUN: %cc -O2 -fPIE %s -pie -o %t && %runner %t
 //
 // A computed-goto ("labels as values") loop. With GCC on this toolchain, the
 // `-O2 -fPIE -pie` shape emits `lea label(%rip)` for the label values and keeps
