@@ -21,6 +21,20 @@ pub fn run(cmd: RunCmd) -> ExitCode {
         eprintln!("chimera: no program to run");
         return ExitCode::FAILURE;
     };
+    // Same contradiction the overlay path rejects, reported the same way.
+    if cmd.unsafe_ && (cmd.from.is_some() || cmd.in_.is_some() || cmd.rm) {
+        eprintln!("chimera: --unsafe runs without a filesystem");
+        return ExitCode::FAILURE;
+    }
+    // Refuse rather than proceed: this host has no filesystem to put behind
+    // these flags, and running the guest straight against the host as though
+    // isolation had been arranged is the one outcome the user did not ask for.
+    if cmd.from.is_some() || cmd.in_.is_some() || cmd.rm {
+        eprintln!(
+            "chimera: --from, --in and --rm need the copy-on-write filesystem, which is built for Linux only"
+        );
+        return ExitCode::FAILURE;
+    }
     let program = match resolve_program(Path::new(program), args) {
         Ok(program) => program,
         Err(err) => {
