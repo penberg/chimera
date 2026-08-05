@@ -29,12 +29,7 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all -- --check
 
-      # Strict clippy runs on Linux only: the Darwin backend is mid-port, so the
-      # OS-neutral fork/exec/guest-memory machinery the Linux backend drives is
-      # still unwired there and trips `dead_code` under `-D warnings`. It gets
-      # enforced on macOS once those phases land.
       - name: clippy
-        if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: build
