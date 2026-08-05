@@ -9,6 +9,15 @@ The runner walks `testing/conformance/`, parses RUN lines from each `.c`
 file, expands a small set of substitutions, and runs each command under
 `sh -c`. A test passes when every RUN line exits 0.
 
+Where a test runs is a property of where it lives, not of anything written
+inside it. Every directory under `testing/conformance/` is named
+`<topic>[-<condition>...]`, where a condition is one of `linux`, `darwin`,
+`x86` or `arm64`: `signals/` runs everywhere, `signals-linux/` only on a
+Linux host, `isolation-linux-x86/` only on an x86-64 Linux one. Topic names
+carry no hyphen, so every segment after the first must name a condition — a
+segment that names nothing is an error, not a directory that quietly runs
+everywhere.
+
 Substitutions:
     %s        path to the test source file
     %t        path to a per-test scratch file (no extension)
@@ -21,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -30,6 +40,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_ROOT = REPO_ROOT / "testing" / "conformance"
+
+# The conditions a directory name may carry, after its topic.
+CONDITIONS = frozenset({"linux", "darwin", "x86", "arm64"})
 
 RUN_RE = re.compile(r"//\s*RUN:\s*(.+?)\s*$")
 
@@ -100,6 +113,43 @@ def run_test(source: Path, *, cc: str, runner: str, timeout: float) -> Result:
     return Result("pass")
 
 
+def host_conditions() -> set[str]:
+    """The conditions this host satisfies. Chimera translates same-ISA, so the
+    guest's architecture is the host's."""
+    machine = platform.machine()
+    return {
+        "darwin" if platform.system() == "Darwin" else "linux",
+        "x86" if machine in ("x86_64", "AMD64") else "arm64",
+    }
+
+
+def conditions_of(name: str) -> set[str]:
+    """The conditions a directory's name imposes."""
+    _topic, *conds = name.split("-")
+    unknown = [c for c in conds if c not in CONDITIONS]
+    if unknown:
+        raise ValueError(
+            f"conformance directory {name!r}: {', '.join(unknown)} names no "
+            f"condition (have: {', '.join(sorted(CONDITIONS))})"
+        )
+    return set(conds)
+
+
+def collect(root: Path, satisfied: set[str], exclude: set[str]) -> list[Path]:
+    """Every test under `root` whose directory conditions all hold. A directory
+    this host does not satisfy is not descended into, so its tests are absent
+    rather than skipped — they do not apply here at all."""
+    tests: list[Path] = []
+    for entry in sorted(root.iterdir()):
+        if entry.is_dir():
+            if entry.name in exclude or not conditions_of(entry.name) <= satisfied:
+                continue
+            tests.extend(collect(entry, satisfied, exclude))
+        elif entry.suffix == ".c":
+            tests.append(entry)
+    return tests
+
+
 def _indent(text: str, prefix: str) -> str:
     return "\n".join(prefix + line for line in text.rstrip("\n").splitlines())
 
@@ -123,6 +173,13 @@ def main() -> int:
         help="per-RUN-line timeout in seconds; a slower run fails (env: LIT_TIMEOUT, default: 120)",
     )
     p.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="skip this test directory by name; repeatable",
+    )
+    p.add_argument(
         "paths",
         nargs="*",
         type=Path,
@@ -130,14 +187,21 @@ def main() -> int:
     )
     args = p.parse_args()
 
+    satisfied = host_conditions()
+    exclude = set(args.exclude)
     roots = args.paths if args.paths else [TEST_ROOT]
     tests: list[Path] = []
     for r in roots:
         r = r.resolve()
         if r.is_file():
+            # An explicitly named file runs: the caller has already decided.
             tests.append(r)
         elif r.is_dir():
-            tests.extend(sorted(r.rglob("*.c")))
+            try:
+                tests.extend(collect(r, satisfied, exclude))
+            except ValueError as err:
+                print(f"error: {err}", file=sys.stderr)
+                return 1
         else:
             print(f"warning: {r} does not exist", file=sys.stderr)
 
@@ -145,7 +209,14 @@ def main() -> int:
         print("no tests found", file=sys.stderr)
         return 1
 
-    print(DIM(f"# cc={args.cc} runner={args.runner or '<none>'}"), file=sys.stderr)
+    print(
+        DIM(
+            f"# cc={args.cc} runner={args.runner or '<none>'} "
+            f"conditions={','.join(sorted(satisfied))}"
+            + (f" excluded={','.join(sorted(exclude))}" if exclude else "")
+        ),
+        file=sys.stderr,
+    )
 
     passed = failed = skipped = 0
     for t in tests:
