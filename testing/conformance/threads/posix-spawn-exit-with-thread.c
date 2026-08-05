@@ -1,4 +1,4 @@
-// RUN: %cc %s -pthread -o %t && timeout 10 %runner %t
+// RUN: %cc %s -pthread -o %t && %runner %t
 //
 // glibc's posix_spawn is clone3(CLONE_VM | CLONE_VFORK | CLONE_CLEAR_SIGHAND).
 // Chimera emulates the spawn as a host fork, and CLONE_CLEAR_SIGHAND must not

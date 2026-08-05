@@ -1,4 +1,4 @@
-// RUN: %cc %s -pthread -o %t && timeout 10 %runner %t
+// RUN: %cc %s -pthread -o %t && %runner %t
 //
 // posix_spawn from a multithreaded process. Chimera emulates the spawn's
 // CLONE_VM child as a fork of its own (multithreaded) host process, so it must

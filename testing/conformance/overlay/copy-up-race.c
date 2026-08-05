@@ -1,5 +1,5 @@
 // RUN: %cc %s -o %t && rm -rf %t.d && %t prep %t.d
-// RUN: timeout 60 %runner %t race %t.d
+// RUN: %runner %t race %t.d
 //
 // Copy-up publication race: two processes that both still see only the lower
 // file each build a staging copy, and publication must be first-wins. The

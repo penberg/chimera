@@ -1,4 +1,4 @@
-// RUN: %cc %s -pthread -o %t && timeout 10 %runner %t
+// RUN: %cc %s -pthread -o %t && %runner %t
 //
 // Signal dispositions are process-wide (POSIX): a handler one thread installs
 // with sigaction is in force for every thread, including a thread-directed

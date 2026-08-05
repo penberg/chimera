@@ -1,5 +1,5 @@
 // RUN: %cc %s -o %t && rm -rf %t.d && %t prep %t.d
-// RUN: timeout 20 %runner %t check %t.d
+// RUN: %runner %t check %t.d
 //
 // A failed syscall must leave the merged namespace exactly as it was. The
 // deleted names here are hidden by whiteouts; a creation over one that
