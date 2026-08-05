@@ -415,6 +415,13 @@ pub fn translate(
 /// Push the guest x16/x17 to the guest stack, then load the ctx pointer
 /// into x17. After this sequence, x16 and x17 are scratch and `[sp, #0]`
 /// / `[sp, #8]` hold the guest values of x16 / x17.
+///
+/// The push writes below the guest's sp. AAPCS64 reserves nothing there and
+/// XNU itself pushes signal frames into it, so this breaks no guarantee — but
+/// a guest whose sp sits within 16 bytes of a guard page would not have taken
+/// the fault this can. Freeing a register without first having one is not
+/// possible on arm64, so the spill stays; `abi/red-zone.c` tracks the
+/// divergence and records what was ruled out.
 fn emit_save_x16_x17_and_load_ctx(out: &mut Vec<u32>) {
     // stp x16, x17, [sp, #-16]!
     out.push(enc_stp_pre_index(16, 17, 31, -16));
