@@ -30,6 +30,24 @@ use crate::{
 
 const STACK_SIZE: usize = 8 * 1024 * 1024;
 
+/// Ceiling on an image's `LC_MAIN.stacksize` request. Any image can name any
+/// value, and a reservation past this would fail or thrash rather than help.
+const MAX_STACK_SIZE: usize = 512 * 1024 * 1024;
+
+/// The main-thread stack to reserve for an image requesting `requested` bytes
+/// through `LC_MAIN.stacksize`, which is zero when it expresses no preference.
+/// The kernel honours that field, and so must Chimera: a language runtime that
+/// computes its stack-overflow limit from the stack it actually got will trip
+/// that check straight away if it was linked expecting more.
+fn main_stack_size(requested: u64) -> usize {
+    let want = (requested as usize).min(MAX_STACK_SIZE);
+    if want <= STACK_SIZE {
+        return STACK_SIZE;
+    }
+    let page = crate::sys::darwin::macho::PAGE_SIZE as usize;
+    want.div_ceil(page) * page
+}
+
 /// Darwin's whole-argument-block limit (`ARG_MAX`, 1 MiB) bounds any single
 /// argv/envp string too.
 const MAX_ARG_STRLEN: usize = 1024 * 1024;
@@ -67,7 +85,12 @@ pub fn execv(
     } else {
         None
     };
-    let frame = build_main_frame(&argv, &envp, program.as_os_str().as_bytes())?;
+    let frame = build_main_frame(
+        &argv,
+        &envp,
+        program.as_os_str().as_bytes(),
+        image.stack_size,
+    )?;
 
     super::set_executable_path(program);
     super::set_image_slide(image.slide);
@@ -147,7 +170,8 @@ pub fn drive(thread: &mut Thread, mut reason: ExitReason) -> Result<i32, Error> 
                 };
                 super::set_executable_path(&path);
                 super::set_image_slide(image.slide);
-                let frame = build_main_frame(&argv, &envp, path.as_os_str().as_bytes())?;
+                let frame =
+                    build_main_frame(&argv, &envp, path.as_os_str().as_bytes(), image.stack_size)?;
                 super::set_guest_args(frame.argc as i32, frame.argv, frame.envp, frame.apple);
                 record_regions(thread, &image, &frame);
                 thread.enter(image.entry, frame.sp);
@@ -510,11 +534,13 @@ fn build_main_frame(
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
     exec_path: &[u8],
+    requested_stack: u64,
 ) -> Result<MainFrame, Error> {
+    let stack_size = main_stack_size(requested_stack);
     let stack = unsafe {
         libc::mmap(
             ptr::null_mut(),
-            STACK_SIZE,
+            stack_size,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             -1,
@@ -524,7 +550,7 @@ fn build_main_frame(
     if stack == libc::MAP_FAILED {
         return Err(Error::last_os_error("stack mmap"));
     }
-    let mut p = (stack as u64) + STACK_SIZE as u64;
+    let mut p = (stack as u64) + stack_size as u64;
 
     // The `apple[]` array is dyld's per-process metadata channel. The only entry
     // synthesized here is `executable_path=`, which `_NSGetExecutablePath` and a
@@ -584,7 +610,7 @@ fn build_main_frame(
             argv: argv_base,
             envp: envp_base,
             apple: apple_base,
-            stack: (stack as usize, STACK_SIZE),
+            stack: (stack as usize, stack_size),
         })
     }
 }
