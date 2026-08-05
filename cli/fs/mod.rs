@@ -18,47 +18,20 @@
 //! coordination here.
 
 use std::{
-    env,
-    ffi::OsStr,
-    fmt::Write as _,
-    fs, io,
-    os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::ffi::OsStrExt,
-    },
+    env, fs, io,
+    os::fd::{AsRawFd, OwnedFd},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// One filesystem: its short id and the directory holding `data/`, `tmp/`,
-/// and the metadata file.
-pub struct Filesystem {
-    pub id: String,
-    pub root: PathBuf,
-    /// Created fresh by this run — eligible for empty-delta removal and the
-    /// kept notice. An attached filesystem is the user's to manage.
-    fresh: bool,
-    /// The session root's pid. Guest fork is a host fork, so every guest
-    /// child's host process carries a copy of this struct and returns
-    /// through the CLI when its guest exits. The root alone speaks for the
-    /// session (the kept notice); disposal belongs to whoever releases the
-    /// hold last.
-    owner: u32,
-    /// This process's share of the tree-wide hold: a shared `flock` on
-    /// `<root>/lock`, one open file description inherited by every host
-    /// process of the guest tree. The lock outlives any single process and
-    /// ends only when the last inherited descriptor closes, which is
-    /// exactly the lifetime disposal must wait for — a counter in process
-    /// memory would tear at the first host fork.
-    hold: Option<OwnedFd>,
-    /// The CLI's stderr, duplicated above the guest fd floor before the
-    /// guest runs. The initial process's guest stdio is backed by the CLI's
-    /// own descriptors, so a guest that closes its stderr at exit (as every
-    /// coreutils program does via `close_stdout`) takes the CLI's fd 2 with
-    /// it — and the kept notice must outlive that. `None` when stderr was
-    /// already closed at startup: the caller asked for silence.
-    stderr: Option<OwnedFd>,
-}
+// A session hands the runtime a mounted overlay, which is built for Linux
+// alone; on any other host `run` works against the real host and never
+// constructs one. The tooling below stays available everywhere: inspecting
+// and removing filesystems needs no overlay.
+#[cfg(target_os = "linux")]
+mod session;
+#[cfg(target_os = "linux")]
+pub use session::{Filesystem, attach, branch, create, resume, scheme};
 
 /// Where filesystems live: `$XDG_STATE_HOME/chimera/fs`, defaulting
 /// to `~/.local/state`.
@@ -74,216 +47,10 @@ fn filesystems_dir() -> PathBuf {
     state.join("chimera/fs")
 }
 
-/// A fresh filesystem with a collision-free generated id.
-pub fn create(command: &str) -> io::Result<Filesystem> {
-    let base = filesystems_dir();
-    fs::create_dir_all(&base)?;
-    loop {
-        let id = fresh_id()?;
-        let root = base.join(&id);
-        match fs::create_dir(&root) {
-            Ok(()) => {
-                write_meta(&root, &id, command)?;
-                let hold = hold(&root)?;
-                return Ok(Filesystem {
-                    id,
-                    root,
-                    fresh: true,
-                    owner: std::process::id(),
-                    hold: Some(hold),
-                    stderr: stash_stderr(),
-                });
-            }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Resume a filesystem named by a path: `selector` is the change-set
-/// directory itself, created on first use — how `--in <path>` (and
-/// `CHIMERA_FS`, its environment default) pins one change-set across
-/// invocations; the conformance suite works this way. A path names raw
-/// state, the caller's to manage.
-pub fn attach(selector: &OsStr) -> io::Result<Filesystem> {
-    let root = PathBuf::from(selector);
-    fs::create_dir_all(&root)?;
-    let hold = hold(&root)?;
-    Ok(Filesystem {
-        id: selector.to_string_lossy().into_owned(),
-        root,
-        fresh: false,
-        owner: std::process::id(),
-        hold: Some(hold),
-        stderr: stash_stderr(),
-    })
-}
-
-/// Resume a kept filesystem by id: the change-set itself becomes the run's
-/// working state, so unlike a branch point it must already exist.
-pub fn resume(id: &str) -> io::Result<Filesystem> {
-    let root = resolve(id)?;
-    let hold = hold(&root)?;
-    Ok(Filesystem {
-        id: id.to_string(),
-        root,
-        fresh: false,
-        owner: std::process::id(),
-        hold: Some(hold),
-        stderr: stash_stderr(),
-    })
-}
-
-/// The reserved scheme of a locator: `<word>:...` names a filesystem that
-/// does not live on this machine. A scheme is recognized before path or id —
-/// only the first path component is inspected — so introducing one later
-/// cannot change how an existing path or id is read; a path whose first
-/// component contains a colon needs a leading `./`.
-pub fn scheme(selector: &OsStr) -> Option<String> {
-    let bytes = selector.as_bytes();
-    let first = bytes.split(|&b| b == b'/').next().unwrap_or(b"");
-    let colon = first.iter().position(|&b| b == b':')?;
-    Some(String::from_utf8_lossy(&first[..colon]).into_owned())
-}
-
-/// Duplicate stderr above the guest fd floor. No `FD_CLOEXEC`: emulated
-/// guest execve sweeps CLOEXEC-marked host descriptors, and this one must
-/// last the session.
-fn stash_stderr() -> Option<OwnedFd> {
-    let fd = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD, 512) };
-    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// A fresh filesystem seeded with a copy of an existing one's delta: the
-/// change-set forks, and the source is left exactly as it was. The copy is
-/// marker-exact — whiteouts, opaque marks, and origins carry over — so the
-/// branch diffs and applies just as its source would have. A shared hold on
-/// the source keeps it from being removed mid-copy; a live session still
-/// writing into it can tear the snapshot, so branch from a quiesced source.
-pub fn branch(selector: &str, command: &str) -> io::Result<Filesystem> {
-    let src = resolve(selector)?;
-    let _share = hold(&src)?;
-    let fsys = create(command)?;
-    let seed = copy_entry(&src.join("data"), &fsys.root.join("data"))
-        .and_then(|()| record_parent(&fsys.root, selector));
-    if let Err(e) = seed {
-        let _ = fs::remove_dir_all(&fsys.root);
-        return Err(io::Error::new(
-            e.kind(),
-            format!("branching {selector}: {e}"),
-        ));
-    }
-    Ok(fsys)
-}
-
-/// Acquire this session's share of the tree-wide hold on `root`. The shared
-/// lock never contends with other sessions' shares; only a disposal in
-/// progress (which holds it exclusively) refuses, so an attach cannot land
-/// on a tree that is being removed. The descriptor sits above the runtime's
-/// backing-fd floor, out of reach of guest descriptor operations.
-fn hold(root: &std::path::Path) -> io::Result<OwnedFd> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(root.join("lock"))?;
-    // No host FD_CLOEXEC: Chimera emulates guest execve in-process and
-    // sweeps CLOEXEC-marked host descriptors as part of it; the hold must
-    // survive every guest exec in the tree.
-    let high = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 512) };
-    if high < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(high) };
-    if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
-        let e = io::Error::last_os_error();
-        return Err(if e.kind() == io::ErrorKind::WouldBlock {
-            io::Error::new(io::ErrorKind::WouldBlock, "filesystem is being removed")
-        } else {
-            e
-        });
-    }
-    Ok(fd)
-}
-
-impl Filesystem {
-    /// End-of-session disposition. `discard` (`--rm`) removes the
-    /// filesystem, and is the only thing that does: a fresh filesystem is
-    /// kept even when its change-set is empty — the badged prompt advertised
-    /// its id for the whole session, and a branch may exist precisely to be
-    /// somewhere to stand. A kept fresh filesystem prints the one-line
-    /// notice; a resumed one is the user's and is left without comment.
-    /// Disposal itself belongs to the last process out of the guest tree
-    /// (across every session), so a backgrounded guest keeps its filesystem
-    /// usable after the session root has exited.
-    pub fn finish(mut self, discard: bool) {
-        let owner = std::process::id() == self.owner;
-        // Release this process's share before probing: while any other
-        // process still holds one, disposal is eventually theirs, not ours.
-        drop(self.hold.take());
-        if discard {
-            if let Some(_disposing) = self.last_out() {
-                let _ = fs::remove_dir_all(&self.root);
-            }
-            return;
-        }
-        if owner && self.fresh {
-            self.notice();
-        }
-    }
-
-    /// The disposal probe: taking the lock exclusively succeeds only when
-    /// every share of every session's process tree is gone. The returned
-    /// guard is held through the removal so a concurrent attach cannot
-    /// acquire a share on the tree mid-deletion.
-    fn last_out(&self) -> Option<OwnedFd> {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.root.join("lock"))
-            .ok()?;
-        let fd = OwnedFd::from(file);
-        (unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0).then_some(fd)
-    }
-
-    fn notice(&self) {
-        let Some(stderr) = &self.stderr else {
-            return;
-        };
-        // No program: `run` starts the shell by itself, so the pasted line
-        // lands the user straight back in the filesystem they just left.
-        let no_changes = if self.delta_is_empty() {
-            " (no changes)"
-        } else {
-            ""
-        };
-        let msg = format!(
-            "chimera: filesystem kept{no_changes}; continue with:\n  chimera run --in {}\n",
-            self.id,
-        );
-        let _ = unsafe {
-            libc::write(
-                stderr.as_raw_fd(),
-                msg.as_ptr() as *const libc::c_void,
-                msg.len(),
-            )
-        };
-    }
-
-    /// An empty delta means the guest changed nothing: no upper entries at
-    /// all. (Staging leftovers in `tmp/` are garbage, not changes.)
-    fn delta_is_empty(&self) -> bool {
-        match fs::read_dir(self.root.join("data")) {
-            Ok(mut entries) => entries.next().is_none(),
-            Err(_) => true,
-        }
-    }
-}
-
 /// 8 hex characters of kernel randomness.
+#[cfg(target_os = "linux")]
 pub fn fresh_id() -> io::Result<String> {
-    use std::io::Read;
+    use std::{fmt::Write as _, io::Read};
 
     let mut bytes = [0u8; 4];
     // /dev/urandom cannot reasonably fail, but a pid+time fallback keeps
@@ -309,37 +76,6 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// The provenance record: which command created the filesystem, from where,
-/// and when.
-fn write_meta(root: &std::path::Path, id: &str, command: &str) -> io::Result<()> {
-    let cwd = env::current_dir()
-        .map(|d| d.display().to_string())
-        .unwrap_or_default();
-    fs::write(
-        root.join("meta"),
-        format!(
-            "id = {id}\ncommand = {command}\ncwd = {cwd}\ncreated = {}\n",
-            now_secs(),
-        ),
-    )
-}
-
-/// Extend a branch's provenance with the filesystem it forked from.
-fn record_parent(root: &std::path::Path, parent: &str) -> io::Result<()> {
-    use std::io::Write as _;
-
-    let mut meta = fs::OpenOptions::new()
-        .append(true)
-        .open(root.join("meta"))?;
-    writeln!(meta, "parent = {parent}")
-}
-
-// --- `chimera fs` tooling --------------------------------------------------
-//
-// All of it reads the self-describing on-disk format directly — no daemon,
-// no index. The marker predicates and the origin record come from the
-// runtime crate, which owns the format.
-
 use std::path::Path;
 
 // Reading and replaying a delta means reading its whiteout and origin
@@ -360,7 +96,16 @@ pub fn command(action: FsAction) -> std::process::ExitCode {
         FsAction::List(_) => list(),
         FsAction::Diff(FsDiffCmd { filesystem }) => delta::diff(&filesystem),
         FsAction::Apply(FsApplyCmd { filesystem }) => delta::apply(&filesystem),
+        #[cfg(target_os = "linux")]
         FsAction::Branch(FsBranchCmd { filesystem }) => branch_cmd(&filesystem),
+        #[cfg(not(target_os = "linux"))]
+        FsAction::Branch(FsBranchCmd { filesystem }) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "branching {filesystem} needs the copy-on-write filesystem, \
+                 which is built for Linux only"
+            ),
+        )),
         FsAction::Rm(FsRmCmd { filesystems }) => rm(&filesystems),
         FsAction::Prune(FsPruneCmd { force }) => prune(force),
     };
@@ -494,122 +239,12 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// The id on stdout is the whole interface:
 /// `chimera run -f $(chimera fs branch <src>) ...` scripts cleanly.
 fn branch_cmd(selector: &str) -> io::Result<()> {
     let fsys = branch(selector, &format!("branch of {selector}"))?;
     println!("{}", fsys.id);
-    Ok(())
-}
-
-/// Duplicate one delta entry (a directory recursively) for `branch`. The
-/// copy carries everything the format encodes — type, content, ownership,
-/// mode, timestamps, and every xattr, the `user.chimera.*` bookkeeping
-/// included, since in a branch the bookkeeping is the payload. A directory's
-/// metadata lands after its children, whose creation would otherwise disturb
-/// its timestamps.
-fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-
-    let md = fs::symlink_metadata(from)?;
-    let ft = md.file_type();
-    if ft.is_dir() {
-        fs::create_dir(to)?;
-        for entry in fs::read_dir(from)?.filter_map(Result::ok) {
-            copy_entry(&entry.path(), &to.join(entry.file_name()))?;
-        }
-    } else if ft.is_file() {
-        fs::copy(from, to)?;
-    } else if ft.is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(from)?, to)?;
-    } else if ft.is_fifo() {
-        let cto = cpath(to)?;
-        if unsafe { libc::mkfifo(cto.as_ptr(), 0o600) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    } else {
-        // A socket, or a device node from a privileged guest; recreating a
-        // device needs the same privilege the original creation did.
-        let cto = cpath(to)?;
-        if unsafe {
-            libc::mknod(
-                cto.as_ptr(),
-                md.mode() as libc::mode_t,
-                md.rdev() as libc::dev_t,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    replay_metadata(&md, from, to, |_| true)
-}
-
-/// `CString` from a path's bytes; an embedded NUL is invalid input.
-fn cpath(path: &std::path::Path) -> io::Result<std::ffi::CString> {
-    std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
-}
-
-/// The xattrs apply replays onto the host: the guest-visible user namespace
-/// and the POSIX ACL attributes. Chimera's reserved `user.chimera.*`
-/// bookkeeping is delta state and never reaches the host.
-pub(super) fn replayable_xattr(name: &[u8]) -> bool {
-    (name.starts_with(b"user.") && !name.starts_with(b"user.chimera."))
-        || name == b"system.posix_acl_access"
-        || name == b"system.posix_acl_default"
-}
-
-/// Reproduce the guest-visible metadata of the upper entry on the object at
-/// `host`: ownership first (`chown` may clear set-id bits), then the
-/// permission bits, then the xattrs `keep` selects — apply replays only the
-/// guest-visible set, a branch copies the `user.chimera.*` bookkeeping too —
-/// and timestamps last because every earlier step can disturb them. Symlinks
-/// take the no-follow subset — ownership and timestamps. `md` is the upper's
-/// metadata captured before the content transfer: reading the upper for the
-/// copy already disturbs its atime. A failure here is the command's failure;
-/// a partial apply never reads as success.
-fn replay_metadata(
-    md: &fs::Metadata,
-    upper: &std::path::Path,
-    host: &std::path::Path,
-    keep: fn(&[u8]) -> bool,
-) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    let cupper = cpath(upper)?;
-    let chost = cpath(host)?;
-    if unsafe { libc::lchown(chost.as_ptr(), md.uid(), md.gid()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let symlink = md.file_type().is_symlink();
-    if !symlink {
-        if unsafe { libc::chmod(chost.as_ptr(), (md.mode() & 0o7777) as libc::mode_t) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        delta::copy_xattrs(&cupper, &chost, keep)?;
-    }
-    let times = [
-        libc::timespec {
-            tv_sec: md.atime(),
-            tv_nsec: md.atime_nsec(),
-        },
-        libc::timespec {
-            tv_sec: md.mtime(),
-            tv_nsec: md.mtime_nsec(),
-        },
-    ];
-    if unsafe {
-        libc::utimensat(
-            libc::AT_FDCWD,
-            chost.as_ptr(),
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
     Ok(())
 }
 

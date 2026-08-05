@@ -84,14 +84,19 @@ impl AddressSpace {
         Ok(host_pc)
     }
 
+    // The three code-cache wrappers below are reached only from the Linux
+    // syscall policy and the x86 backend's W^X toggle.
+    #[cfg(target_os = "linux")]
     pub fn code_contains_range(&self, start: usize, len: usize) -> bool {
         self.code.code_contains_range(start, len)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn code_allow_writes(&self) {
         self.code.code_allow_writes()
     }
 
+    #[cfg(target_os = "linux")]
     pub fn code_deny_writes(&self) {
         self.code.code_deny_writes()
     }
@@ -323,6 +328,7 @@ impl AddressSpace {
         self.add_region(new_start, new_len);
     }
 
+    #[cfg(target_os = "linux")]
     pub fn contains_region(&self, start: usize, len: usize) -> bool {
         let len = round_mapping_len(len);
         if len == 0 {
@@ -360,10 +366,13 @@ impl AddressSpace {
         self.clear_regions();
     }
 
+    // The program break is a Linux concept; nothing else has a `brk`.
+    #[cfg(target_os = "linux")]
     pub fn set_program_break(&mut self, brk: usize) {
         self.program_break = Some(brk);
     }
 
+    #[cfg(target_os = "linux")]
     pub fn update_program_break(&mut self, brk: usize) {
         if let Some(old_brk) = self.program_break {
             let old_end = round_mapping_len(old_brk);
@@ -461,6 +470,7 @@ pub fn init() -> Result<(), Error> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn own_pid() -> libc::pid_t {
     let pid = CACHED_PID.load(Ordering::Relaxed);
     if pid != 0 {

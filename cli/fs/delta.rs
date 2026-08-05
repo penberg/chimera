@@ -11,7 +11,9 @@ use chimera::delta::{
     Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin,
 };
 
-use super::{cpath, replay_metadata, replayable_xattr, resolve};
+use std::os::unix::ffi::OsStrExt;
+
+use super::resolve;
 
 /// One entry of a filesystem's change-set, keyed by the guest-visible path.
 struct Change {
@@ -278,7 +280,7 @@ fn apply_change(change: &Change) -> Result<(), ApplyError> {
     Ok(())
 }
 
-pub(super) fn copy_xattrs(
+fn copy_xattrs(
     upper: &std::ffi::CStr,
     host: &std::ffi::CStr,
     keep: fn(&[u8]) -> bool,
@@ -338,6 +340,117 @@ pub(super) fn copy_xattrs(
         {
             return Err(io::Error::last_os_error());
         }
+    }
+    Ok(())
+}
+
+/// Duplicate one delta entry (a directory recursively) for `branch`. The
+/// copy carries everything the format encodes — type, content, ownership,
+/// mode, timestamps, and every xattr, the `user.chimera.*` bookkeeping
+/// included, since in a branch the bookkeeping is the payload. A directory's
+/// metadata lands after its children, whose creation would otherwise disturb
+/// its timestamps.
+pub(super) fn copy_entry(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let md = fs::symlink_metadata(from)?;
+    let ft = md.file_type();
+    if ft.is_dir() {
+        fs::create_dir(to)?;
+        for entry in fs::read_dir(from)?.filter_map(Result::ok) {
+            copy_entry(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else if ft.is_file() {
+        fs::copy(from, to)?;
+    } else if ft.is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(from)?, to)?;
+    } else if ft.is_fifo() {
+        let cto = cpath(to)?;
+        if unsafe { libc::mkfifo(cto.as_ptr(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    } else {
+        // A socket, or a device node from a privileged guest; recreating a
+        // device needs the same privilege the original creation did.
+        let cto = cpath(to)?;
+        if unsafe {
+            libc::mknod(
+                cto.as_ptr(),
+                md.mode() as libc::mode_t,
+                md.rdev() as libc::dev_t,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    replay_metadata(&md, from, to, |_| true)
+}
+
+/// `CString` from a path's bytes; an embedded NUL is invalid input.
+fn cpath(path: &std::path::Path) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// The xattrs apply replays onto the host: the guest-visible user namespace
+/// and the POSIX ACL attributes. Chimera's reserved `user.chimera.*`
+/// bookkeeping is delta state and never reaches the host.
+pub(super) fn replayable_xattr(name: &[u8]) -> bool {
+    (name.starts_with(b"user.") && !name.starts_with(b"user.chimera."))
+        || name == b"system.posix_acl_access"
+        || name == b"system.posix_acl_default"
+}
+
+/// Reproduce the guest-visible metadata of the upper entry on the object at
+/// `host`: ownership first (`chown` may clear set-id bits), then the
+/// permission bits, then the xattrs `keep` selects — apply replays only the
+/// guest-visible set, a branch copies the `user.chimera.*` bookkeeping too —
+/// and timestamps last because every earlier step can disturb them. Symlinks
+/// take the no-follow subset — ownership and timestamps. `md` is the upper's
+/// metadata captured before the content transfer: reading the upper for the
+/// copy already disturbs its atime. A failure here is the command's failure;
+/// a partial apply never reads as success.
+fn replay_metadata(
+    md: &fs::Metadata,
+    upper: &std::path::Path,
+    host: &std::path::Path,
+    keep: fn(&[u8]) -> bool,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let cupper = cpath(upper)?;
+    let chost = cpath(host)?;
+    if unsafe { libc::lchown(chost.as_ptr(), md.uid(), md.gid()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let symlink = md.file_type().is_symlink();
+    if !symlink {
+        if unsafe { libc::chmod(chost.as_ptr(), (md.mode() & 0o7777) as libc::mode_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        copy_xattrs(&cupper, &chost, keep)?;
+    }
+    let times = [
+        libc::timespec {
+            tv_sec: md.atime(),
+            tv_nsec: md.atime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: md.mtime(),
+            tv_nsec: md.mtime_nsec(),
+        },
+    ];
+    if unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            chost.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

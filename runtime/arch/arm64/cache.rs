@@ -305,6 +305,8 @@ unsafe fn jit_write_protect(enabled: bool) {
 impl CodeCache {
     /// Whether `[start, start+len)` overlaps the code buffer at all. A guest
     /// `mprotect` over the cache is the runtime's to service, not the host's.
+    // Serves the Linux-only `AddressSpace` wrapper of the same name.
+    #[cfg(target_os = "linux")]
     pub fn contains_range(&self, start: usize, len: usize) -> bool {
         let end = start.saturating_add(len);
         let lo = self.base as usize;
@@ -518,6 +520,8 @@ impl BlockCache {
         }
     }
 
+    // Serves the Linux-only `AddressSpace` wrapper of the same name.
+    #[cfg(target_os = "linux")]
     pub fn code_contains_range(&self, start: usize, len: usize) -> bool {
         self.cache.contains_range(start, len)
     }
