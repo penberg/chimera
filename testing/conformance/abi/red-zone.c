@@ -1,6 +1,6 @@
 // RUN: %cc %s -o %t && %runner %t
-// XFAIL: darwin-chimera -- arm64 terminators spill scratch to the guest stack
-// below sp; fixing it needs a reserved-register or sysreg scratch redesign.
+// XFAIL: darwin-chimera -- every arm64 block terminator spills x16/x17 below
+// sp; see the arm64 note below for why that is not cheaply fixable.
 //
 // A translator rewrites every block terminator into a stub that computes the
 // next guest PC. Those stubs must not write below the guest's stack pointer.
@@ -57,6 +57,24 @@ int main(void) {
 // the guest's sp when it rewrites a branch, since a guest may park sp one word
 // above a guard page. Stash a sentinel below sp, branch in each direction, and
 // confirm it survives.
+//
+// Under Chimera on Darwin this fails, and is expected to. Every arm64
+// terminator opens with `stp x16,x17,[sp,#-16]!` to free the two registers it
+// needs before it can reach the thread context, and arm64 offers no way around
+// that bootstrap: there is no store that works without a base register (x86-64
+// spills to `gs:[128]`), no PC-relative store, and every GPR belongs to the
+// guest. `mrs` can clobber a register without needing a free one, but only by
+// destroying the value that had to be saved first. The alternatives were tried
+// and rejected -- libSystem and the kernel clobber `x18`, and XNU rewrites
+// `TPIDR_EL0` on every context switch. A real fix means reserving a register
+// from the guest and rewriting every instruction that could name it, across the
+// whole instruction set.
+//
+// It stays expected-to-fail rather than being narrowed away, because it is a
+// genuine divergence. The exposure is small, though: the spill is transient,
+// and the platform makes no promise about this memory either -- XNU pushes
+// signal frames below sp. What is left is a guest whose sp sits within 16 bytes
+// of a guard page and which makes no call of its own, one already out of stack.
 int main(void) {
     uint64_t acc = 0;
     asm volatile(
