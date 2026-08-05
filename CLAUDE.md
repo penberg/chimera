@@ -28,6 +28,7 @@ The workspace is shaped to accept a future `chimera-linux` crate alongside `chim
 
 - **Conformance**: `make conformance` builds Chimera and runs each test under it; `make conformance-native` runs the same tests directly without Chimera.
 - The runner is `testing/lit.py`, modeled after LLVM's LIT: each test source carries `// RUN:` directives the runner expands and executes. Tests live under `testing/conformance/`, organized by topic.
+- **Where a test runs is decided by where it lives, never by a marker inside it.** Every directory is named `<topic>[-<condition>…]`, with conditions drawn from `linux`, `darwin`, `x86`, `arm64`: `signals/` runs everywhere, `signals-linux/` only on Linux, `isolation-linux-x86/` only on x86-64 Linux. Topic names carry no hyphen, so an unrecognized segment is an error rather than a directory that quietly runs everywhere. Adding a test that only makes sense on one host or one ISA means naming its directory, not annotating the test. See `testing/conformance/README.md`.
 - **CI locally**: `make ci` runs the GitHub Actions workflow (`.github/workflows/ci.yml` — rustfmt, clippy, build, test, conformance) with [Agent CI](https://agent-ci.dev/). It uses a custom runner image, `.github/agent-ci.Dockerfile`; keep its pinned toolchain in sync with `rust-toolchain.toml`.
 
 ## Coding Style
