@@ -39,6 +39,11 @@ host's — `XFAIL: darwin-chimera` expects the failure under `make conformance` 
 macOS while still demanding a pass from `make conformance-native`. When the bug
 is fixed the run reports an `XPASS` and the marker comes out.
 
+`XFAIL` says *deterministically* fails, so it is the wrong tool for a flake: a
+test that fails one run in ten would report `XPASS` — and fail the suite — the
+other nine times. An intermittent failure has to be fixed or left failing where
+it is visible; there is no marker that makes it quiet and honest at once.
+
 ## The filesystem
 
 `fs/` is the standing example. The copy-on-write filesystem exists only on
