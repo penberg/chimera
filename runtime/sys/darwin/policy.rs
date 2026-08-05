@@ -229,10 +229,16 @@ pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &dyn SystemC
             // No guest code runs here. By the time a thread reaches this
             // syscall its own libpthread has already released its
             // thread-local storage — measured: the thread faults on its own
-            // thread pointer inside any guest call made from this arm. The
-            // destructors run earlier, from `chimera_tlv_finalize`, which
-            // libpthread's own TSD cleanup reaches while the storage is
-            // still there.
+            // thread pointer inside any guest call made from this arm.
+            //
+            // The thread-local destructors are therefore meant to have run
+            // earlier, from `chimera_tlv_finalize`, which libpthread's own TSD
+            // cleanup would reach while the storage is still there. Measured,
+            // that hook does not fire: every observed drain happens at the
+            // end-of-run-loop backstop instead, which is *after* the joiner
+            // wake below — so a `pthread_join` can return before the thread's
+            // destructors have run. That is the `abi/tls-dtor.c` flake, and
+            // the reason this arm cannot simply drain them itself.
             thread.tearing_down = true;
             if thread.is_main() {
                 let status = thread.process().wait_for_others(&thread.state);
