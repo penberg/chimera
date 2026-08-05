@@ -153,6 +153,12 @@ pub struct LoadedMachO {
     /// inside it. Recorded in the address space so an `execve` teardown can
     /// unmap the old image.
     pub region: (u64, usize),
+    /// `LC_MAIN.stacksize`: the main-thread stack the image asks the kernel
+    /// for, or zero when it expresses no preference. Honouring it is not a
+    /// courtesy — a runtime that derives a stack-overflow limit from its own
+    /// stack bounds trips that check immediately on a stack smaller than the
+    /// one it was linked to expect.
+    pub stack_size: u64,
 }
 
 pub fn load_macho(path: &Path) -> Result<LoadedMachO, Error> {
@@ -309,6 +315,7 @@ fn load_macho_slice(bytes: &[u8], path: &Path) -> Result<LoadedMachO, Error> {
     let mut segments: Vec<SegmentCommand64> = Vec::new();
     let mut entry_pc: Option<u64> = None;
     let mut entry_file_offset: Option<u64> = None;
+    let mut stack_size: u64 = 0;
     let mut dylinker: Option<PathBuf> = None;
 
     for _ in 0..header.ncmds {
@@ -366,6 +373,7 @@ fn load_macho_slice(bytes: &[u8], path: &Path) -> Result<LoadedMachO, Error> {
                 let ep: EntryPointCommand =
                     unsafe { ptr::read_unaligned(bytes.as_ptr().add(off) as *const _) };
                 entry_file_offset = Some(ep.entryoff);
+                stack_size = ep.stacksize;
             }
             LC_LOAD_DYLINKER => {
                 let dc: DylinkerCommand =
@@ -511,6 +519,7 @@ fn load_macho_slice(bytes: &[u8], path: &Path) -> Result<LoadedMachO, Error> {
         entry,
         is_dynamic,
         region: (vm_lo.wrapping_add(slide), total),
+        stack_size,
     })
 }
 
