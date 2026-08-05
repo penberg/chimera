@@ -2,13 +2,21 @@
 //! `MAP_JIT`-backed host code buffer ([`CodeCache`]), a guest-PC → host-PC map,
 //! and the page → blocks index that drives self-modifying-code invalidation.
 //!
-//! This is the dispatcher-only cache: every translated block ends by returning
-//! the next guest PC to the run loop, so no block is ever linked directly into
-//! another and the map needs only a host PC per block — no deopt stub and no
-//! inline indirect-branch table. The direct-branch linking and inline IB probe
-//! the x86 backend carries are deferred to a later Darwin-port phase (see the
-//! sequencing note in `DARWIN.md`), where the safepoint poll they require is
-//! added alongside them.
+//! Blocks branch straight into their successors and indirect branches probe a
+//! table inline, yet neither mechanism ever rewrites an emitted instruction: an
+//! edge branches through a link slot, a probe reads a table entry, and both
+//! tables live in ordinary memory outside the JIT buffer. That is what makes
+//! linking affordable on Apple Silicon, where a `MAP_JIT` mapping is writable
+//! or executable per thread and never both — patching a branch in place would
+//! mean toggling the mapping out from under every other thread executing from
+//! it. Publishing a link or a table entry is instead one aligned store, which
+//! translated code reads with no synchronization beyond the architecture's
+//! single-copy atomicity.
+//!
+//! A linked loop stops returning to the run loop on every iteration, so
+//! loop-closing edges carry the `exit_requested` safepoint poll (see
+//! `translate::emit_exit_tail_linked`) — that is the only place a process-wide
+//! stop can still be observed.
 
 use std::{
     collections::{BTreeMap, HashMap},
