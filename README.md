@@ -47,7 +47,9 @@ Then wrap any command:
 chimera run /bin/echo hello
 ```
 
-With no command, `chimera run` starts `/bin/bash`.
+With no command, `chimera run` starts `/bin/bash` with a compact prompt naming
+its filesystem id. `--unsafe` replaces the id with `unsafe`; pass
+`--no-prompt` to leave the normal Bash prompt unchanged.
 
 By default Chimera forwards every system call to the host kernel, so the
 wrapped process behaves like a native one.

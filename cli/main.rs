@@ -1,5 +1,6 @@
 mod fs;
 mod opts;
+mod prompt;
 
 use std::{
     env,
@@ -45,9 +46,12 @@ fn version() -> ExitCode {
 }
 
 fn run(mut cmd: RunCmd) -> ExitCode {
-    default_program(&mut cmd.argv);
-    let (program, args) = cmd.argv.split_first().expect("default program is present");
-    let program = Path::new(program);
+    // Only a shell Chimera starts on its own gets a badged prompt; a program
+    // the user named runs exactly as typed.
+    let implicit_shell = cmd.argv.is_empty();
+    if implicit_shell {
+        cmd.argv.push("/bin/bash".into());
+    }
     // Route the guest's filesystem syscalls through a userspace VFS mounted
     // at `/`. Copy-on-write is the default: every run mounts an overlay
     // whose upper layer is a filesystem's delta, so the guest works against
@@ -106,6 +110,25 @@ fn run(mut cmd: RunCmd) -> ExitCode {
             }
         }
     };
+    // Held for the whole run: dropping the prompt removes the rc file.
+    let _prompt = if implicit_shell && !cmd.no_prompt {
+        match prompt::Prompt::new(fsys.as_ref()) {
+            Ok(prompt) => {
+                cmd.argv.push("--rcfile".into());
+                cmd.argv
+                    .push(prompt.rcfile().to_string_lossy().into_owned());
+                Some(prompt)
+            }
+            Err(err) => {
+                eprintln!("chimera: cannot configure prompt: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (program, args) = cmd.argv.split_first().expect("argv names a program");
+    let program = Path::new(program);
     // Resolve the initial executable through the same merged view the
     // guest's own syscalls will see: an attached filesystem may have replaced
     // or deleted the program, its script, or its interpreter, and the session
@@ -148,12 +171,6 @@ fn run(mut cmd: RunCmd) -> ExitCode {
             eprintln!("chimera: {err}");
             ExitCode::FAILURE
         }
-    }
-}
-
-fn default_program(argv: &mut Vec<String>) {
-    if argv.is_empty() {
-        argv.push("/bin/bash".into());
     }
 }
 
