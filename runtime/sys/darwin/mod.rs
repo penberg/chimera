@@ -48,6 +48,40 @@ pub fn set_image_slide(slide: u64) {
     IMAGE_SLIDE.store(slide, Ordering::Release);
 }
 
+/// The guest main thread's stack — the runtime-allocated mapping it actually
+/// runs on — and the host `pthread_t` of the thread running it. libpthread
+/// records the *host* main stack for that thread, so a guest asking
+/// `pthread_get_stackaddr_np`/`pthread_get_stacksize_np` about it would get
+/// bounds its own stack pointer lies outside; JavaScriptCore's stack
+/// sanitizer release-asserts on exactly that. The dispatch loop answers those
+/// queries from here instead. Worker threads need no override: their host
+/// pthreads are created with `pthread_attr_setstack` on the guest stack, so
+/// libpthread's answer is already the guest's.
+static MAIN_STACK_LO: AtomicU64 = AtomicU64::new(0);
+static MAIN_STACK_LEN: AtomicU64 = AtomicU64::new(0);
+static MAIN_PTHREAD: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_main_stack(lo: u64, len: u64) {
+    MAIN_STACK_LO.store(lo, Ordering::Release);
+    MAIN_STACK_LEN.store(len, Ordering::Release);
+    MAIN_PTHREAD.store(unsafe { libc::pthread_self() } as u64, Ordering::Release);
+}
+
+/// `pthread_get_stackaddr_np`: a stack's base is its highest address.
+pub fn guest_stackaddr(thread: u64) -> u64 {
+    if thread == MAIN_PTHREAD.load(Ordering::Acquire) {
+        return MAIN_STACK_LO.load(Ordering::Acquire) + MAIN_STACK_LEN.load(Ordering::Acquire);
+    }
+    unsafe { libc::pthread_get_stackaddr_np(thread as usize as libc::pthread_t) as u64 }
+}
+
+pub fn guest_stacksize(thread: u64) -> u64 {
+    if thread == MAIN_PTHREAD.load(Ordering::Acquire) {
+        return MAIN_STACK_LEN.load(Ordering::Acquire);
+    }
+    unsafe { libc::pthread_get_stacksize_np(thread as usize as libc::pthread_t) as u64 }
+}
+
 /// The guest's view of the malloc zone list, kept apart from the real one: a
 /// zone the guest registers carries *guest* function pointers, and on the
 /// shared list the runtime's own malloc would call them natively (observed as

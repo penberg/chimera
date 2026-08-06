@@ -96,6 +96,7 @@ pub fn execv(
     super::set_executable_path(program);
     super::set_image_slide(image.slide);
     super::set_guest_args(frame.argc as i32, frame.argv, frame.envp, frame.apple);
+    super::set_main_stack(frame.stack.0 as u64, frame.stack.1 as u64);
     let process = Arc::new(Process::new(handler, code_cache_size)?);
     super::fault::set_process(&process);
     super::callback::set_process(&process);
@@ -174,6 +175,7 @@ pub fn drive(thread: &mut Thread, mut reason: ExitReason) -> Result<i32, Error> 
                 let frame =
                     build_main_frame(&argv, &envp, path.as_os_str().as_bytes(), image.stack_size)?;
                 super::set_guest_args(frame.argc as i32, frame.argv, frame.envp, frame.apple);
+                super::set_main_stack(frame.stack.0 as u64, frame.stack.1 as u64);
                 record_regions(thread, &image, &frame);
                 thread.enter(image.entry, frame.sp);
                 enter_frame(thread, &frame);
