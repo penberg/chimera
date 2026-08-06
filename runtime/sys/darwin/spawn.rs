@@ -211,6 +211,18 @@ pub fn spawn(thread: &mut Thread, args: &[u64; 8]) -> Result<(), i32> {
 /// brackets the trap translated, so bracketing again here would deadlock on
 /// the (non-recursive) libSystem locks.
 pub fn forked(thread: &mut Thread) -> (SyscallResult, u64) {
+    // The guest's atfork handlers live on the runtime's list (see
+    // `sys::darwin::GUEST_ATFORK`), so its own translated wrapper never sees
+    // them; they are owed here, translated, in POSIX order — prepare in
+    // reverse registration order, parent/child in registration order. A
+    // handler's error is swallowed the way a native handler's misbehaviour
+    // would be: atfork has no failure channel.
+    let handlers = crate::sys::darwin::guest_atfork_handlers();
+    for h in handlers.iter().rev() {
+        if h.prepare != 0 {
+            let _ = thread.run_guest_call(h.prepare, 0);
+        }
+    }
     let call = crate::SystemCall::new(2, [0; 8]);
     let fork_locks = thread.process().lock_for_fork();
     let (result, is_child) = super::syscall::host_syscall2(&call);
@@ -218,6 +230,19 @@ pub fn forked(thread: &mut Thread) -> (SyscallResult, u64) {
     if matches!(result, SyscallResult::Ok(_)) && is_child != 0 {
         thread.signals_mut().reset_pending_after_fork();
         thread.reset_after_fork();
+        for h in &handlers {
+            if h.child != 0 {
+                let _ = thread.run_guest_call(h.child, 0);
+            }
+        }
+    } else {
+        // fork returned in the parent — on failure too, which is when POSIX
+        // still owes the parent handlers.
+        for h in &handlers {
+            if h.parent != 0 {
+                let _ = thread.run_guest_call(h.parent, 0);
+            }
+        }
     }
     (result, is_child)
 }
