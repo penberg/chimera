@@ -18,7 +18,7 @@
 
 use std::{arch::global_asm, mem::offset_of};
 
-use super::dispatch::{EXIT_KIND_SYSCALL, ThreadState};
+use super::dispatch::{EXIT_KIND_SYSCALL, EXIT_KIND_TRAP, ThreadState};
 
 /// Byte offset of `ThreadState::regs[idx]`.
 const fn reg_off(idx: usize) -> usize {
@@ -35,12 +35,15 @@ global_asm!(
     TS_HOST_PC     = const offset_of!(ThreadState, host_pc_target),
     TS_EXIT_KIND   = const offset_of!(ThreadState, exit_kind),
     EXIT_KIND_SYSCALL = const EXIT_KIND_SYSCALL,
+    EXIT_KIND_TRAP = const EXIT_KIND_TRAP,
 );
 
 unsafe extern "C" {
     pub fn dispatch(ctx: *mut ThreadState, host_pc: u64);
     pub fn exit_block();
     pub fn exit_syscall_no_stack();
+    /// Tail for a guest `BRK`: records `exit_kind = TRAP` and unwinds.
+    pub fn exit_trap();
     /// Re-entry after a synchronous fault redirected into a guest handler: the
     /// fault handler saved the guest state into `ctx` and points the interrupted
     /// context here (with x17 = ctx) to unwind back to the run loop.
