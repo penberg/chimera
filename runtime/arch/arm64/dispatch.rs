@@ -24,7 +24,7 @@ use std::sync::{
 
 use crate::{Error, SystemCall, process::Process, sys::darwin::signal::Signals};
 
-use super::trampoline::{dispatch, exit_block, exit_syscall_no_stack};
+use super::trampoline::{dispatch, exit_block, exit_syscall_no_stack, exit_trap};
 
 // Not exposed by the `libc` crate on macOS, but a standard pthread entry: set
 // the thread's stack (lowest address + size) so libpthread does not allocate one.
@@ -209,6 +209,11 @@ pub fn current_ctx() -> *mut ThreadState {
 
 pub const EXIT_KIND_BLOCK: u64 = 0;
 pub const EXIT_KIND_SYSCALL: u64 = 1;
+/// A guest `BRK` exited the cache: the run loop raises `SIGTRAP`.
+pub const EXIT_KIND_TRAP: u64 = 2;
+
+/// `SIGTRAP`, raised on a guest `BRK`.
+const SIGTRAP: u32 = 5;
 
 /// Link register seeded at guest entry. A top-level return (the C `start` glue
 /// calling `exit(main(...))`, or a `main` that just returns) jumps here, and the
@@ -617,7 +622,7 @@ impl Thread {
         let syscall_exit = exit_syscall_no_stack as *const () as u64;
         // No BRK/undefined-instruction terminator yet; the translator ignores
         // this trampoline, so any value is harmless.
-        let trap_exit = 0u64;
+        let trap_exit = exit_trap as *const () as u64;
 
         // `CHIMERA_TRACE` logs the guest PC entering each block — the last line
         // before a crash localizes the faulting block during bring-up. Sampled
@@ -735,6 +740,9 @@ impl Thread {
             }
             if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL {
                 self.handle_syscall();
+            }
+            if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_TRAP {
+                self.raise_trap();
             }
         }
         // The main thread's stack outlives its run, so this is the right
@@ -1151,6 +1159,18 @@ impl Thread {
         self.running = was_running;
     }
 
+    /// A guest `BRK` left the cache with `ctx.pc` still at the trapping
+    /// instruction. Raise `SIGTRAP`: it enters the guest's handler, or, with
+    /// none, terminates the process with a faithful `SIGTRAP` status. A
+    /// handler that returns re-executes the `BRK`, which is what the guest
+    /// would see natively — AArch64 takes it as a fault, not a trap.
+    fn raise_trap(&mut self) {
+        let restart = self.restart.take();
+        let state = &mut *self.state;
+        let info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        self.signals.deliver(state, SIGTRAP, &info, restart);
+    }
+
     pub fn run_tlv_destructors(&mut self) {
         // The run loop has stopped, so re-arm it for the duration: a guest
         // call needs a running thread to drive it.
@@ -1220,7 +1240,7 @@ impl Thread {
         let ts_ptr: *mut ThreadState = &mut *self.state;
         let block_exit = exit_block as *const () as u64;
         let syscall_exit = exit_syscall_no_stack as *const () as u64;
-        let trap_exit = 0u64;
+        let trap_exit = exit_trap as *const () as u64;
         let escapes = Escapes::resolve();
         let trace = crate::trace::trace();
 
@@ -1304,6 +1324,13 @@ impl Thread {
             }
             if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_SYSCALL {
                 self.handle_syscall();
+            }
+            // A `BRK` inside a guest call: end the call and let the outer
+            // run loop raise the trap, for the same reason a fault does —
+            // a guest call runs on a borrowed stack, and a handler frame
+            // built there would corrupt the call in progress.
+            if unsafe { (*ts_ptr).exit_kind } == EXIT_KIND_TRAP {
+                break;
             }
         }
 

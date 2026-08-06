@@ -106,15 +106,13 @@ pub struct OutEdge {
 /// prefix into the code cache (fixing up ADR/ADRP/LDR-literal to their absolute
 /// guest targets) and rewrite the terminator into an exit stub that computes
 /// the next guest PC into `ctx.pc` and branches to `exit_tramp` (an ordinary
-/// boundary) or `syscall_tramp` (an SVC). `_trap_exit` is accepted for symmetry
-/// with the block-cache contract; the BRK/undefined-instruction terminator that
-/// would use it is a later Darwin-port addition.
+/// boundary), `syscall_tramp` (an SVC), or `trap_exit` (a `BRK`).
 pub fn translate(
     cache: &mut CodeCache,
     guest_pc: u64,
     exit_tramp: u64,
     syscall_tramp: u64,
-    _trap_exit: u64,
+    trap_exit: u64,
 ) -> Result<Translation, Error> {
     let ib_table = cache.ib_table_addr();
     let mut out: Vec<u32> = Vec::new();
@@ -379,6 +377,10 @@ pub fn translate(
                 }
                 pc += 4;
                 count += 1;
+            }
+            InsnKind::Brk => {
+                emit_terminator_brk(&mut out, pc, trap_exit);
+                break;
             }
             InsnKind::Svc { next_ip } => {
                 emit_terminator_svc(&mut out, next_ip, syscall_tramp);
@@ -740,6 +742,16 @@ fn emit_ib_probe(out: &mut Vec<u32>, exit_tramp: u64, ib_table: u64) {
     out.extend_from_slice(&cold);
 }
 
+/// `BRK`: leave the cache with `ctx.pc` at the `BRK` itself. AArch64 takes it
+/// as a synchronous fault, so the architectural PC is the trapping
+/// instruction — a guest handler that returns re-executes it, exactly as it
+/// would natively.
+fn emit_terminator_brk(out: &mut Vec<u32>, pc: u64, trap_exit: u64) {
+    emit_save_x16_x17_and_load_ctx(out);
+    emit_imm64_compact(out, 16, pc);
+    emit_exit_tail(out, trap_exit);
+}
+
 fn emit_terminator_svc(out: &mut Vec<u32>, next_ip: u64, syscall_tramp: u64) {
     // SVC: real kernels switch to their own kernel stack and never touch
     // the user stack — `testing/conformance/abi/syscall-no-stack-touch.c`
@@ -843,6 +855,13 @@ enum InsnKind {
     Svc {
         next_ip: u64,
     },
+    /// `BRK #imm` — a software breakpoint. It must not run from the cache:
+    /// the host would take the exception against Chimera's own execution
+    /// state, with no guest handler consulted. Exiting instead lets the run
+    /// loop raise `SIGTRAP` for the guest. Terminating the block also stops
+    /// the decoder walking through the trap padding compilers place between
+    /// functions and merging the next one into this block.
+    Brk,
     /// A standalone PAC sign/authenticate op (`pacia`, `autda`, `paciasp`, …).
     /// Chimera is PAC-oblivious, so these translate to nothing.
     PacNop,
@@ -945,6 +964,9 @@ fn classify_at(insn: u32, pc: u64) -> InsnKind {
     }
     if (insn & 0xFFE0001F) == 0xD4000001 {
         return InsnKind::Svc { next_ip: pc + 4 };
+    }
+    if (insn & 0xFFE0001F) == 0xD4200000 {
+        return InsnKind::Brk;
     }
     if (insn & 0x1F000000) == 0x10000000 {
         let immlo = ((insn >> 29) & 0x3) as i64;

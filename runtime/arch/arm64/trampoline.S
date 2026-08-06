@@ -24,6 +24,7 @@
 .globl _dispatch
 .globl _exit_block
 .globl _exit_syscall
+.globl _exit_trap
 .globl _exit_syscall_no_stack
 
 // fn dispatch(ctx: *mut ThreadState /* x0 */, host_pc: u64 /* x1 */)
@@ -194,6 +195,17 @@ _fault_resume:
     ldp     x21, x22, [sp], #16
     ldp     x19, x20, [sp], #16
     ret
+
+// A guest `BRK` exited the cache. Same flow as _exit_block, but record
+// exit_kind = TRAP so the run loop raises SIGTRAP for the guest. `ctx.pc`
+// was set by the stub to the address of the `BRK` itself, not past it:
+// AArch64 takes BRK as a synchronous *fault*, so the saved PC points at the
+// trapping instruction and a handler that returns re-executes it. That is
+// what the hardware does natively, and the guest is entitled to see it.
+_exit_trap:
+    mov     x16, #{EXIT_KIND_TRAP}
+    str     x16, [x17, #{TS_EXIT_KIND}]
+    EXIT_TAIL_COMMON
 
 _exit_syscall:
     // Same flow as _exit_block, but record exit_kind = SYSCALL before
