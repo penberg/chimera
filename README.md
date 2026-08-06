@@ -47,6 +47,8 @@ Then wrap any command:
 chimera run /bin/echo hello
 ```
 
+With no command, `chimera run` starts `/bin/bash`.
+
 By default Chimera forwards every system call to the host kernel, so the
 wrapped process behaves like a native one.
 

@@ -44,11 +44,9 @@ fn version() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run(cmd: RunCmd) -> ExitCode {
-    let Some((program, args)) = cmd.argv.split_first() else {
-        eprintln!("chimera: no program to run");
-        return ExitCode::FAILURE;
-    };
+fn run(mut cmd: RunCmd) -> ExitCode {
+    default_program(&mut cmd.argv);
+    let (program, args) = cmd.argv.split_first().expect("default program is present");
     let program = Path::new(program);
     // Route the guest's filesystem syscalls through a userspace VFS mounted
     // at `/`. Copy-on-write is the default: every run mounts an overlay
@@ -150,6 +148,12 @@ fn run(cmd: RunCmd) -> ExitCode {
             eprintln!("chimera: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn default_program(argv: &mut Vec<String>) {
+    if argv.is_empty() {
+        argv.push("/bin/bash".into());
     }
 }
 
