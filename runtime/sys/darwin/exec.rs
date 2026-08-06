@@ -157,6 +157,7 @@ pub fn drive(thread: &mut Thread, mut reason: ExitReason) -> Result<i32, Error> 
                 sync_host_environ(&envp);
                 reset_getopt();
                 super::clear_guest_zones();
+                super::clear_guest_atfork();
                 // Tear down the old image: its recorded regions (image
                 // reservation, stack, guest mmaps) are unmapped and every
                 // stale translation dropped. The replacement was mapped at
