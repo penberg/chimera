@@ -61,6 +61,12 @@ The project name is **Chimera** in prose, comments, and doc comments. Lowercase 
 
 Options live in `opts.rs`, derived with [`argh`](https://github.com/google/argh). `Opts` carries a `Command` subcommand enum so new tools (`translate`, …) slot in alongside `run` without reshaping the top level. Do not switch to `clap` or another arg-parsing crate. Note: this version of `argh` accepts options only as `--name value`, not `--name=value`.
 
+## Commit Messages
+
+Write the subject as `<area>: <change>` when one subsystem owns the change (`runtime`, `cli`, `testing`, or `perf`). Keep the text after the colon lowercase, phrase it as what the patch does, and omit the trailing period. For example: `cli: run the current shell by default`. Use a concise unscoped imperative subject for a repository-wide change that has no honest subsystem prefix. Do not add a pull-request number; GitHub supplies that when it creates a merge commit.
+
+Every commit must have a body that makes sense without the diff or review conversation. Follow the subject with a blank line and flowing prose, hard-wrapped at 78 columns. Begin with the concrete failure or limitation that motivated the patch, then explain the change and the behavior or invariant it establishes. Call out meaningful tradeoffs and finish with the regression coverage or other verification. Prefer specific paths, commands, error values, and before/after behavior over a generic summary of the diff. Never omit the body on the grounds that the change is small or self-evident: the purpose of the log is to preserve why the change was worth making.
+
 ## Writing for ARCHITECTURE.md
 
 Flowing Sun/DEC-style prose paragraphs. Bullets are reserved for genuine enumerations — auxv field names, lifecycle stages, layout entries — never as a substitute for explanatory sentences. Use numerals for technical quantities (`64-byte`, `16 bytes`). Citations are short: full first names, italicized venue abbreviation (e.g., *VEE '12*), DOI on its own at the end.
