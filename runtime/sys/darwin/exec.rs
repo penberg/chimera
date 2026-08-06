@@ -77,6 +77,7 @@ pub fn execv(
     };
 
     let image = load_macho(program)?;
+    warn_unhonoured_entitlements(program, &image);
     // A dynamic image carries imports and rebases that must be applied before
     // it runs; Chimera links it in-process rather than handing control to
     // Apple's dyld (see dyld.rs). A static image is dispatched as mapped.
@@ -402,12 +403,26 @@ pub fn prepare_exec(args: &[u64; 8]) -> Result<PreparedExec, Error> {
     let argv = read_guest_ptr_array(args[1], MAX_ARG_COUNT, MAX_ARG_STRLEN)?;
     let envp = read_guest_ptr_array(args[2], MAX_ARG_COUNT, MAX_ARG_STRLEN)?;
     let image = load_macho(&path)?;
+    warn_unhonoured_entitlements(&path, &image);
     Ok(PreparedExec {
         path,
         argv,
         envp,
         image,
     })
+}
+
+/// See [`LoadedMachO::entitlements`] for why these can never be honoured.
+fn warn_unhonoured_entitlements(path: &Path, image: &LoadedMachO) {
+    if image.entitlements.is_empty() {
+        return;
+    }
+    eprintln!(
+        "chimera: warning: {} is signed with entitlements the kernel will not grant \
+         under Chimera ({}); syscalls gated on them will fail as permission errors",
+        path.display(),
+        image.entitlements.join(", "),
+    );
 }
 
 /// The errno a failed [`prepare_exec`] reports to the guest. `None` for
