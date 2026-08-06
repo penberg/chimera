@@ -205,9 +205,8 @@ impl Filesystem {
     }
 
     fn notice(&self) {
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         eprintln!("chimera: filesystem kept; continue with:");
-        eprintln!("  chimera run -f {} {}", self.id, shell);
+        eprintln!("  chimera run -f {}", self.id);
     }
 
     /// An empty delta means the guest changed nothing: no upper entries at

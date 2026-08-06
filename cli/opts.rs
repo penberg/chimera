@@ -103,8 +103,9 @@ pub struct RunCmd {
     #[argh(switch, long = "unsafe")]
     pub unsafe_: bool,
 
-    /// the program and its arguments. Greedy: option parsing stops at the
-    /// program token, so the guest's own flags need no `--` separator.
+    /// the program and its arguments (default: /bin/bash). Greedy: option
+    /// parsing stops at the program token, so the guest's own flags need no `--`
+    /// separator.
     #[argh(positional, greedy)]
     pub argv: Vec<String>,
 }
