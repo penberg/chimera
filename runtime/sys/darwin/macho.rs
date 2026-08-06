@@ -43,7 +43,13 @@ const CPU_SUBTYPE_MASK: i32 = 0x00ffffff;
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_UNIXTHREAD: u32 = 0x5;
 const LC_LOAD_DYLINKER: u32 = 0xe;
+const LC_CODE_SIGNATURE: u32 = 0x1d;
 const LC_MAIN: u32 = 0x80000028;
+
+// Code-signature blob framing (all fields big-endian).
+const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade0cc0;
+const CSMAGIC_EMBEDDED_ENTITLEMENTS: u32 = 0xfade7171;
+const CSSLOT_ENTITLEMENTS: u32 = 5;
 
 const ARM_THREAD_STATE64: u32 = 6;
 
@@ -133,6 +139,15 @@ struct DylinkerCommand {
     // followed by the path string padded to cmdsize.
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinkeditDataCommand {
+    cmd: u32,
+    cmdsize: u32,
+    dataoff: u32,
+    datasize: u32,
+}
+
 pub struct LoadedMachO {
     /// Slide applied to the binary's virtual addresses. Zero for non-PIE
     /// binaries that were mapped at their requested vmaddr.
@@ -159,6 +174,12 @@ pub struct LoadedMachO {
     /// stack bounds trips that check immediately on a stack smaller than the
     /// one it was linked to expect.
     pub stack_size: u64,
+    /// Entitlement keys from the image's code signature. The kernel grants
+    /// entitlements against the signature of the *executing process* — under
+    /// Chimera that is the host binary, never the guest image — so a guest
+    /// that depends on one hits a denial that masquerades as a plain
+    /// permission error. Recorded so exec can warn up front.
+    pub entitlements: Vec<String>,
 }
 
 pub fn load_macho(path: &Path) -> Result<LoadedMachO, Error> {
@@ -317,6 +338,7 @@ fn load_macho_slice(bytes: &[u8], path: &Path) -> Result<LoadedMachO, Error> {
     let mut entry_file_offset: Option<u64> = None;
     let mut stack_size: u64 = 0;
     let mut dylinker: Option<PathBuf> = None;
+    let mut code_signature: Option<(usize, usize)> = None;
 
     for _ in 0..header.ncmds {
         if off + std::mem::size_of::<LoadCommand>() > cmds_end {
@@ -392,6 +414,17 @@ fn load_macho_slice(bytes: &[u8], path: &Path) -> Result<LoadedMachO, Error> {
                 }
                 let s = &bytes[name_off..name_off + n];
                 dylinker = Some(PathBuf::from(OsStr::from_bytes(s)));
+            }
+            LC_CODE_SIGNATURE => {
+                let led: LinkeditDataCommand =
+                    unsafe { ptr::read_unaligned(bytes.as_ptr().add(off) as *const _) };
+                let (data_off, data_len) = (led.dataoff as usize, led.datasize as usize);
+                if data_off
+                    .checked_add(data_len)
+                    .is_some_and(|end| end <= bytes.len())
+                {
+                    code_signature = Some((data_off, data_len));
+                }
             }
             _ => {}
         }
@@ -520,7 +553,63 @@ fn load_macho_slice(bytes: &[u8], path: &Path) -> Result<LoadedMachO, Error> {
         is_dynamic,
         region: (vm_lo.wrapping_add(slide), total),
         stack_size,
+        entitlements: code_signature
+            .map(|(off, len)| parse_entitlements(&bytes[off..off + len]))
+            .unwrap_or_default(),
     })
+}
+
+/// Extract the entitlement keys from an embedded code-signature superblob.
+/// Malformed or absent framing yields an empty list — the signature is the
+/// kernel's to enforce, not ours to validate.
+fn parse_entitlements(blob: &[u8]) -> Vec<String> {
+    let be32 = |off: usize| {
+        blob.get(off..off + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if be32(0) != Some(CSMAGIC_EMBEDDED_SIGNATURE) {
+        return Vec::new();
+    }
+    let Some(count) = be32(8) else {
+        return Vec::new();
+    };
+    for i in 0..count as usize {
+        let index = 12 + i * 8;
+        if be32(index) != Some(CSSLOT_ENTITLEMENTS) {
+            continue;
+        }
+        let Some(off) = be32(index + 4).map(|v| v as usize) else {
+            break;
+        };
+        // The blob length includes its own 8-byte (magic, length) header;
+        // the remainder is the entitlements plist XML.
+        if be32(off) != Some(CSMAGIC_EMBEDDED_ENTITLEMENTS) {
+            break;
+        }
+        let Some(len) = be32(off + 4).map(|v| v as usize) else {
+            break;
+        };
+        let Some(xml) = blob.get(off + 8..off + len) else {
+            break;
+        };
+        return plist_keys(xml);
+    }
+    Vec::new()
+}
+
+fn plist_keys(xml: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(xml);
+    let mut keys = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(start) = rest.find("<key>") {
+        rest = &rest[start + 5..];
+        let Some(end) = rest.find("</key>") else {
+            break;
+        };
+        keys.push(rest[..end].to_string());
+        rest = &rest[end + 6..];
+    }
+    keys
 }
 
 fn segments_range(segs: &[SegmentCommand64]) -> (u64, u64) {
