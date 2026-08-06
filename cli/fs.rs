@@ -220,7 +220,7 @@ impl Filesystem {
 }
 
 /// 8 hex characters of kernel randomness.
-fn fresh_id() -> io::Result<String> {
+pub fn fresh_id() -> io::Result<String> {
     use std::io::Read;
 
     let mut bytes = [0u8; 4];
