@@ -13,6 +13,7 @@ use std::{
 use chimera::Sandbox;
 
 use crate::opts::RunCmd;
+use crate::prompt;
 
 use super::read_shebang;
 
@@ -20,11 +21,11 @@ pub fn run(mut cmd: RunCmd) -> ExitCode {
     // An empty command line starts the user's shell, the way the overlay
     // path starts bash: `$SHELL` when the environment names one, the
     // platform's default shell otherwise.
-    if cmd.argv.is_empty() {
+    let implicit_shell = cmd.argv.is_empty();
+    if implicit_shell {
         cmd.argv
             .push(env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into()));
     }
-    let (program, args) = cmd.argv.split_first().expect("argv names a program");
     // Same contradiction the overlay path rejects, reported the same way.
     if cmd.unsafe_ && (cmd.fs.is_some() || cmd.rm) {
         eprintln!("chimera: --unsafe runs without a filesystem");
@@ -39,6 +40,36 @@ pub fn run(mut cmd: RunCmd) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    // Badge the shell Chimera started itself. There is no filesystem here,
+    // so every session is what `--unsafe` is on Linux — writes reach the
+    // host — and the prompt says so. Held for the whole run: dropping the
+    // prompt removes its startup files.
+    let mut zdotdir: Option<PathBuf> = None;
+    let _prompt = if implicit_shell && !cmd.no_prompt {
+        match prompt::shell_kind(Path::new(&cmd.argv[0])) {
+            Some(shell) => match prompt::Prompt::new(&shell, None) {
+                Ok(prompt) => {
+                    match shell {
+                        prompt::Shell::Bash => {
+                            cmd.argv.push("--rcfile".into());
+                            cmd.argv
+                                .push(prompt.rcfile().to_string_lossy().into_owned());
+                        }
+                        prompt::Shell::Zsh => zdotdir = Some(prompt.dir().to_path_buf()),
+                    }
+                    Some(prompt)
+                }
+                Err(err) => {
+                    eprintln!("chimera: cannot configure prompt: {err}");
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    let (program, args) = cmd.argv.split_first().expect("argv names a program");
     let program = match resolve_program(Path::new(program), args) {
         Ok(program) => program,
         Err(err) => {
@@ -55,6 +86,16 @@ pub fn run(mut cmd: RunCmd) -> ExitCode {
     };
     if let Some(mib) = cmd.code_cache_size {
         sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
+    }
+    // zsh finds its startup files where `$ZDOTDIR` points. `Sandbox::env`
+    // replaces inheritance, so the host environment is replayed around it.
+    if let Some(dir) = &zdotdir {
+        for (key, value) in env::vars_os() {
+            if key != "ZDOTDIR" {
+                sandbox.env(key, value);
+            }
+        }
+        sandbox.env("ZDOTDIR", dir);
     }
     match sandbox.args(&program.args).run() {
         Ok(status) => ExitCode::from(status.code() as u8),

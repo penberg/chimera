@@ -103,11 +103,7 @@ pub struct RunCmd {
     #[argh(switch, long = "unsafe")]
     pub unsafe_: bool,
 
-    /// leave the default Bash prompt unchanged
-    // The prompt badges a filesystem-backed session, which only the overlay
-    // `run` path constructs; elsewhere the option would be accepted and
-    // ignored, so it does not exist there.
-    #[cfg(target_os = "linux")]
+    /// leave the shell's default prompt unchanged
     #[argh(switch)]
     pub no_prompt: bool,
 

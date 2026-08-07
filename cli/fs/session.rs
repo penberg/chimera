@@ -16,7 +16,6 @@
 use std::{
     env,
     ffi::OsStr,
-    fmt::Write as _,
     fs, io,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -25,7 +24,7 @@ use std::{
     path::PathBuf,
 };
 
-use super::{filesystems_dir, now_secs};
+use super::{filesystems_dir, fresh_id, now_secs};
 
 /// One filesystem: its short id and the directory holding `data/`, `tmp/`,
 /// and the metadata file.
@@ -204,27 +203,6 @@ impl Filesystem {
             Err(_) => true,
         }
     }
-}
-
-/// 8 hex characters of kernel randomness.
-pub fn fresh_id() -> io::Result<String> {
-    use std::io::Read;
-
-    let mut bytes = [0u8; 4];
-    // /dev/urandom cannot reasonably fail, but a pid+time fallback keeps
-    // even a degenerate environment running.
-    if fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .is_err()
-    {
-        let seed = u64::from(std::process::id()) ^ now_secs().wrapping_mul(0x9e3779b97f4a7c15);
-        bytes.copy_from_slice(&seed.to_ne_bytes()[..4]);
-    }
-    let mut id = String::with_capacity(8);
-    for b in bytes {
-        let _ = write!(id, "{b:02x}");
-    }
-    Ok(id)
 }
 
 /// The provenance record: which command created the filesystem, from where,

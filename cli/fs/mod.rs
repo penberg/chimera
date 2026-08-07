@@ -6,7 +6,9 @@
 //! filesystem does.
 
 use std::{
-    env, fs, io,
+    env,
+    fmt::Write,
+    fs, io,
     os::fd::{AsRawFd, OwnedFd},
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -19,7 +21,28 @@ use std::{
 #[cfg(target_os = "linux")]
 mod session;
 #[cfg(target_os = "linux")]
-pub use session::{Filesystem, attach, create, fresh_id};
+pub use session::{Filesystem, attach, create};
+
+/// 8 hex characters of kernel randomness.
+pub fn fresh_id() -> io::Result<String> {
+    use std::io::Read;
+
+    let mut bytes = [0u8; 4];
+    // /dev/urandom cannot reasonably fail, but a pid+time fallback keeps
+    // even a degenerate environment running.
+    if fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_err()
+    {
+        let seed = u64::from(std::process::id()) ^ now_secs().wrapping_mul(0x9e3779b97f4a7c15);
+        bytes.copy_from_slice(&seed.to_ne_bytes()[..4]);
+    }
+    let mut id = String::with_capacity(8);
+    for b in bytes {
+        let _ = write!(id, "{b:02x}");
+    }
+    Ok(id)
+}
 
 /// Where filesystems live: `$XDG_STATE_HOME/chimera/fs`, defaulting
 /// to `~/.local/state`.
