@@ -30,7 +30,13 @@
 //!   thunk into each descriptor's `thunk` slot, and stash the TLS image
 //!   template so first-touch threads can allocate fresh per-thread storage.
 
-use std::{collections::HashMap, ffi::CString, path::Path, ptr, sync::Mutex};
+use std::{
+    collections::HashMap,
+    ffi::CString,
+    path::Path,
+    ptr,
+    sync::{Mutex, OnceLock},
+};
 
 use crate::Error;
 
@@ -1306,8 +1312,30 @@ fn read_host_tsd_base() -> u64 {
 unsafe extern "C" fn chimera_tlv_finalize(_block: *mut libc::c_void) {}
 
 /// Address of [`chimera_tlv_finalize`], for the dispatcher to match against.
+///
+/// The address is taken ONCE and cached, and every consumer — the escape
+/// table's comparand and the `pthread_key_create` registration — must go
+/// through this accessor. A Rust `fn` item has no guaranteed unique address:
+/// under release ThinLTO the compiler clones an internal function into other
+/// codegen units, and this binary really did carry two bodies of
+/// `chimera_tlv_finalize`. With one coercion site per consumer, the key was
+/// registered with one copy while the dispatcher compared against the other,
+/// so the guest's TSD cleanup branched to an address no escape matched — the
+/// branch was translated as guest code (an empty function; one `ret`) and the
+/// thread-local destructors silently never ran there. That was the
+/// `abi/tls-dtor.c` release-only flake.
 pub fn tlv_finalize_addr() -> u64 {
-    chimera_tlv_finalize as unsafe extern "C" fn(*mut libc::c_void) as usize as u64
+    static ADDR: OnceLock<u64> = OnceLock::new();
+    *ADDR.get_or_init(|| {
+        chimera_tlv_finalize as unsafe extern "C" fn(*mut libc::c_void) as usize as u64
+    })
+}
+
+/// The [`tlv_finalize_addr`] value as the function pointer
+/// `pthread_key_create` takes: the registration must name the same body the
+/// dispatcher's escape comparand holds (see [`tlv_finalize_addr`]).
+fn tlv_finalize_fn() -> unsafe extern "C" fn(*mut libc::c_void) {
+    unsafe { std::mem::transmute(tlv_finalize_addr() as usize) }
 }
 
 /// Native address of the TLV first-touch thunk. `setup_tlv` rewrites every TLV
@@ -1316,8 +1344,15 @@ pub fn tlv_finalize_addr() -> u64 {
 /// dispatcher recognizes a guest branch to this address and runs it natively
 /// rather than translating Chimera's runtime as guest code (which would corrupt
 /// the returned thread-local pointer).
+///
+/// Cached once for the same reason as [`tlv_finalize_addr`]: the descriptor
+/// writes and the escape comparand must hold the same body's address.
 pub fn tlv_thunk_addr() -> u64 {
-    chimera_tlv_get_addr as unsafe extern "C" fn(*const TlvDescriptor) -> *mut u8 as usize as u64
+    static ADDR: OnceLock<u64> = OnceLock::new();
+    *ADDR.get_or_init(|| {
+        chimera_tlv_get_addr as unsafe extern "C" fn(*const TlvDescriptor) -> *mut u8 as usize
+            as u64
+    })
 }
 
 /// Run the TLV first-touch thunk natively for a guest call: `desc` is the
@@ -1401,7 +1436,7 @@ fn setup_tlv(image: &LoadedMachO, cmds: &LoadCommands) -> Result<(), Error> {
     // run this image's thread-local destructors, and crucially *before*
     // libpthread releases a joiner. See [`chimera_tlv_finalize`].
     let mut key: libc::pthread_key_t = 0;
-    let rc = unsafe { libc::pthread_key_create(&mut key, Some(chimera_tlv_finalize)) };
+    let rc = unsafe { libc::pthread_key_create(&mut key, Some(tlv_finalize_fn())) };
     if rc != 0 {
         return Err(Error::io(
             "pthread_key_create",
@@ -1421,8 +1456,7 @@ fn setup_tlv(image: &LoadedMachO, cmds: &LoadCommands) -> Result<(), Error> {
         );
     }
 
-    let thunk = chimera_tlv_get_addr as unsafe extern "C" fn(*const TlvDescriptor) -> *mut u8
-        as usize as u64;
+    let thunk = tlv_thunk_addr();
 
     for vs in var_sections {
         let count = vs.size / std::mem::size_of::<TlvDescriptor>() as u64;
