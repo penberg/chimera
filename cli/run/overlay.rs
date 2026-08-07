@@ -128,7 +128,8 @@ pub fn run(mut cmd: RunCmd) -> ExitCode {
     };
     // Held for the whole run: dropping the prompt removes the rc file.
     let _prompt = if implicit_shell && !cmd.no_prompt {
-        match prompt::Prompt::new(fsys.as_ref()) {
+        let badge = fsys.as_ref().map(prompt::filesystem_badge);
+        match prompt::Prompt::new(&prompt::Shell::Bash, badge.as_deref()) {
             Ok(prompt) => {
                 cmd.argv.push("--rcfile".into());
                 cmd.argv

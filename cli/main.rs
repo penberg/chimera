@@ -1,8 +1,5 @@
 mod fs;
 mod opts;
-// The prompt badges a filesystem-backed session's shell; only the overlay
-// `run` path has a filesystem to name.
-#[cfg(target_os = "linux")]
 mod prompt;
 mod run;
 

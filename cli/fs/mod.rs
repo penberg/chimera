@@ -48,7 +48,6 @@ fn filesystems_dir() -> PathBuf {
 }
 
 /// 8 hex characters of kernel randomness.
-#[cfg(target_os = "linux")]
 pub fn fresh_id() -> io::Result<String> {
     use std::{fmt::Write as _, io::Read};
 
