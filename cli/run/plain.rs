@@ -16,11 +16,15 @@ use crate::opts::RunCmd;
 
 use super::read_shebang;
 
-pub fn run(cmd: RunCmd) -> ExitCode {
-    let Some((program, args)) = cmd.argv.split_first() else {
-        eprintln!("chimera: no program to run");
-        return ExitCode::FAILURE;
-    };
+pub fn run(mut cmd: RunCmd) -> ExitCode {
+    // An empty command line starts the user's shell, the way the overlay
+    // path starts bash: `$SHELL` when the environment names one, the
+    // platform's default shell otherwise.
+    if cmd.argv.is_empty() {
+        cmd.argv
+            .push(env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into()));
+    }
+    let (program, args) = cmd.argv.split_first().expect("argv names a program");
     // Same contradiction the overlay path rejects, reported the same way.
     if cmd.unsafe_ && (cmd.from.is_some() || cmd.in_.is_some() || cmd.rm) {
         eprintln!("chimera: --unsafe runs without a filesystem");
