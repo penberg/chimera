@@ -2,12 +2,12 @@
 //
 // A guest child's exit must not end the session's filesystem. Guest fork is a
 // host fork, so a child's host process carries a copy of the CLI and returns
-// through it when the child exits; the end-of-session disposition (the
-// empty-delta removal, the kept notice, --rm) belongs to the session root
-// alone. The regression this pins: an interactive bash forks short-lived rc
-// children before anything writes, the first child's exit garbage-collected
-// the still-empty filesystem, and every later write in the session failed
-// with ENOENT while reads kept working.
+// through it when the child exits; the end-of-session disposition (the kept
+// notice, --rm) belongs to the session root alone. The regression this pins:
+// an interactive bash forks short-lived rc children before anything writes,
+// the first child's exit garbage-collected the still-empty filesystem, and
+// every later write in the session failed with ENOENT while reads kept
+// working.
 
 #include <fcntl.h>
 #include <stdio.h>
