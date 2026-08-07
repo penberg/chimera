@@ -74,6 +74,121 @@ fn filesystems_dir() -> PathBuf {
     state.join("chimera/fs")
 }
 
+/// Where a pull assembles an image tree before it becomes a filesystem: a
+/// sibling of the filesystems directory, so the final move is a rename on
+/// one mount and a crashed pull never leaves a half-image where `list` or a
+/// run could find it.
+pub fn staging_dir() -> PathBuf {
+    filesystems_dir().with_file_name("pull")
+}
+
+/// Keep a staged image tree (`stage` holds its `data/`) as an image
+/// filesystem under a fresh id. An image filesystem is a complete base tree
+/// with no parent: `image` and `digest` become its provenance, and its
+/// immutability — resume is refused, a branch stacks on it by reference —
+/// is what lets that provenance stay true.
+pub fn adopt_image_root(
+    stage: &Path,
+    locator: &str,
+    canonical: &str,
+    digest: &str,
+) -> io::Result<String> {
+    use std::io::Write as _;
+
+    let base = filesystems_dir();
+    fs::create_dir_all(&base)?;
+    loop {
+        let id = fresh_id()?;
+        let root = base.join(&id);
+        match fs::rename(stage, &root) {
+            Ok(()) => {
+                write_meta(&root, &id, locator)?;
+                let mut meta = fs::OpenOptions::new()
+                    .append(true)
+                    .open(root.join("meta"))?;
+                writeln!(meta, "image = {canonical}\ndigest = {digest}")?;
+                return Ok(id);
+            }
+            // The fresh id lost a birth race; try another.
+            Err(e) if root.exists() && e.kind() != io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The kept image filesystem matching a normalized reference — by digest when
+/// the locator pinned one, by reference otherwise — newest first when a
+/// re-pulled tag left several roots behind.
+pub fn find_image_root(canonical: &str, digest: Option<&str>) -> Option<String> {
+    let entries = fs::read_dir(filesystems_dir()).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().join("data").is_dir())
+        .filter(|e| {
+            let root = e.path();
+            match digest {
+                Some(digest) => meta_field(&root, "digest").as_deref() == Some(digest),
+                None => meta_field(&root, "image").as_deref() == Some(canonical),
+            }
+        })
+        .max_by_key(|e| created(&e.path()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+}
+
+/// One field of a filesystem's provenance record.
+fn meta_field(root: &Path, name: &str) -> Option<String> {
+    let meta = fs::read_to_string(root.join("meta")).ok()?;
+    let value = meta
+        .lines()
+        .find_map(|l| l.strip_prefix(name)?.trim_start().strip_prefix('='))?
+        .trim()
+        .to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// The normalized image reference of an image filesystem, `None` for an
+/// ordinary change-set.
+pub fn image_of(root: &Path) -> Option<String> {
+    meta_field(root, "image")
+}
+
+/// The image filesystem a branch's change-set is relative to: the content of
+/// its `base` file. Absent for a filesystem whose lower is the live host.
+/// Unlike the informational `meta`, this record is load-bearing — it is how
+/// a run finds the tree to mount under the delta.
+pub fn base_of(root: &Path) -> Option<String> {
+    let base = fs::read_to_string(root.join("base")).ok()?;
+    let base = base.trim().to_string();
+    (!base.is_empty()).then_some(base)
+}
+
+fn record_base(root: &Path, base: &str) -> io::Result<()> {
+    fs::write(root.join("base"), format!("{base}\n"))
+}
+
+/// An image-rooted session's handle on its base: the tree to serve as the
+/// overlay's lower, plus this session's share of the base's hold so removal
+/// waits for the run.
+pub struct Base {
+    pub data: PathBuf,
+    _hold: OwnedFd,
+}
+
+/// Open the base an image-rooted filesystem stacks on. The named image
+/// filesystem must still exist: a branch references its base rather than
+/// copying it, which `fs rm`'s dependent check preserves.
+pub fn open_base(selector: &str) -> io::Result<Base> {
+    let root = resolve(selector)
+        .map_err(|e| io::Error::new(e.kind(), format!("base image filesystem {selector}: {e}")))?;
+    let hold = hold(&root)?;
+    Ok(Base {
+        data: root.join("data"),
+        _hold: hold,
+    })
+}
+
 /// A fresh filesystem with a collision-free generated id.
 pub fn create(command: &str) -> io::Result<Filesystem> {
     let base = filesystems_dir();
@@ -108,6 +223,7 @@ pub fn create(command: &str) -> io::Result<Filesystem> {
 pub fn attach(selector: &OsStr) -> io::Result<Filesystem> {
     let root = PathBuf::from(selector);
     fs::create_dir_all(&root)?;
+    refuse_image_root(&root)?;
     let hold = hold(&root)?;
     Ok(Filesystem {
         id: selector.to_string_lossy().into_owned(),
@@ -119,10 +235,24 @@ pub fn attach(selector: &OsStr) -> io::Result<Filesystem> {
     })
 }
 
+/// Refuse to open an image filesystem for writing. Its provenance promises
+/// the tree is exactly the pulled image, and every branch stacked on it
+/// reads it live — one resumed session would falsify both.
+fn refuse_image_root(root: &std::path::Path) -> io::Result<()> {
+    match image_of(root) {
+        Some(image) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{image} is an image and immutable; branch it with --from"),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Resume a kept filesystem by id: the change-set itself becomes the run's
 /// working state, so unlike a branch point it must already exist.
 pub fn resume(id: &str) -> io::Result<Filesystem> {
     let root = resolve(id)?;
+    refuse_image_root(&root)?;
     let hold = hold(&root)?;
     Ok(Filesystem {
         id: id.to_string(),
@@ -164,8 +294,25 @@ pub fn branch(selector: &str, command: &str) -> io::Result<Filesystem> {
     let src = resolve(selector)?;
     let _share = hold(&src)?;
     let fsys = create(command)?;
-    let seed = copy_entry(&src.join("data"), &fsys.root.join("data"))
-        .and_then(|()| record_parent(&fsys.root, selector));
+    let seed = if image_of(&src).is_some() {
+        // An image is a complete base tree, not a change-set: the branch
+        // starts with an empty delta — created here, since `data/` existing
+        // is what makes the result a filesystem — and records the image as
+        // the lower its changes are relative to. The reference (rather than
+        // a copy) is safe because the image is immutable, and `rm` refuses
+        // an image that filesystems still stack on.
+        fs::create_dir(fsys.root.join("data")).and_then(|()| record_base(&fsys.root, selector))
+    } else {
+        copy_entry(&src.join("data"), &fsys.root.join("data")).and_then(|()| {
+            // A branch of an image-rooted filesystem is relative to the
+            // same image; the base travels with the delta it interprets.
+            match base_of(&src) {
+                Some(base) => record_base(&fsys.root, &base),
+                None => Ok(()),
+            }
+        })
+    }
+    .and_then(|()| record_parent(&fsys.root, selector));
     if let Err(e) = seed {
         let _ = fs::remove_dir_all(&fsys.root);
         return Err(io::Error::new(
@@ -346,7 +493,7 @@ use chimera::delta::{
     Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin,
 };
 
-use crate::opts::{FsAction, FsApplyCmd, FsBranchCmd, FsDiffCmd, FsPruneCmd, FsRmCmd};
+use crate::opts::{FsAction, FsApplyCmd, FsBranchCmd, FsDiffCmd, FsPruneCmd, FsPullCmd, FsRmCmd};
 
 /// Entry point for `chimera fs <action>`.
 pub fn command(action: FsAction) -> std::process::ExitCode {
@@ -355,6 +502,7 @@ pub fn command(action: FsAction) -> std::process::ExitCode {
         FsAction::Diff(FsDiffCmd { filesystem }) => diff(&filesystem),
         FsAction::Apply(FsApplyCmd { filesystem }) => apply(&filesystem),
         FsAction::Branch(FsBranchCmd { filesystem }) => branch_cmd(&filesystem),
+        FsAction::Pull(FsPullCmd { image }) => pull_cmd(&image),
         FsAction::Rm(FsRmCmd { filesystems }) => rm(&filesystems),
         FsAction::Prune(FsPruneCmd { force }) => prune(force),
     };
@@ -445,9 +593,16 @@ fn row(id: &str, root: &Path) -> String {
         .parse::<u64>()
         .map(|created| human_age(now_secs().saturating_sub(created)))
         .unwrap_or_default();
-    let parent = match field("parent =") {
-        p if p.is_empty() => "host".to_string(),
-        p => p,
+    // An image filesystem is a root: it descends from nothing, and `-` is
+    // that fact in the FROM column. An ordinary filesystem with no recorded
+    // parent branched the live host, which the absence of the record encodes.
+    let parent = if !field("image =").is_empty() {
+        "-".to_string()
+    } else {
+        match field("parent =") {
+            p if p.is_empty() => "host".to_string(),
+            p => p,
+        }
     };
     format!(
         "{id:<10} {parent:<10} {age:>5} {:>8}  {}",
@@ -519,14 +674,14 @@ impl Kind {
 /// children. Directories themselves are listed only when opaque (they
 /// replace the lower directory wholesale); an ordinary upper directory is
 /// just the scaffolding under its children.
-fn changes(root: &Path) -> io::Result<Vec<Change>> {
+fn changes(root: &Path, lower: &Path) -> io::Result<Vec<Change>> {
     let data = root.join("data");
     let mut out = Vec::new();
-    walk(&data, Path::new("/"), &mut out)?;
+    walk(&data, Path::new("/"), lower, &mut out)?;
     Ok(out)
 }
 
-fn walk(upper_dir: &Path, guest_dir: &Path, out: &mut Vec<Change>) -> io::Result<()> {
+fn walk(upper_dir: &Path, guest_dir: &Path, lower: &Path, out: &mut Vec<Change>) -> io::Result<()> {
     let mut entries: Vec<_> = fs::read_dir(upper_dir)?.filter_map(Result::ok).collect();
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
@@ -544,16 +699,16 @@ fn walk(upper_dir: &Path, guest_dir: &Path, out: &mut Vec<Change>) -> io::Result
         if md.is_dir() {
             if is_opaque(&upper).map_err(errno_to_io)? {
                 out.push(Change {
-                    kind: kind_against_host(&guest),
+                    kind: kind_against_lower(lower, &guest),
                     path: guest.clone(),
                     upper: upper.clone(),
                 });
             }
-            walk(&upper, &guest, out)?;
+            walk(&upper, &guest, lower, out)?;
             continue;
         }
         out.push(Change {
-            kind: kind_against_host(&guest),
+            kind: kind_against_lower(lower, &guest),
             path: guest,
             upper,
         });
@@ -561,12 +716,26 @@ fn walk(upper_dir: &Path, guest_dir: &Path, out: &mut Vec<Change>) -> io::Result
     Ok(())
 }
 
-/// Added or Modified, judged against the live host.
-fn kind_against_host(guest: &Path) -> Kind {
-    if fs::symlink_metadata(guest).is_ok() {
+/// Added or Modified, judged against the tree the change-set is relative to:
+/// the live host (`lower` is `/`, and the guest path is the host path), or an
+/// image filesystem's tree.
+fn kind_against_lower(lower: &Path, guest: &Path) -> Kind {
+    let target = lower.join(guest.strip_prefix("/").unwrap_or(guest));
+    if fs::symlink_metadata(target).is_ok() {
         Kind::Modified
     } else {
         Kind::Added
+    }
+}
+
+/// The tree `root`'s change-set is relative to: `/` for the live host, an
+/// image filesystem's `data/` when a `base` record names one.
+fn lower_of(root: &Path) -> io::Result<PathBuf> {
+    match base_of(root) {
+        Some(base) => Ok(resolve(&base)
+            .map_err(|e| io::Error::new(e.kind(), format!("base image filesystem {base}: {e}")))?
+            .join("data")),
+        None => Ok(PathBuf::from("/")),
     }
 }
 
@@ -576,9 +745,24 @@ fn errno_to_io(e: chimera::Errno) -> io::Error {
 
 fn diff(selector: &str) -> io::Result<()> {
     let root = resolve(selector)?;
-    for change in changes(&root)? {
+    if let Some(image) = image_of(&root) {
+        return Err(io::Error::other(format!(
+            "{image} is an image — a base tree, not a change-set"
+        )));
+    }
+    let lower = lower_of(&root)?;
+    for change in changes(&root, &lower)? {
         println!("{} {}", change.kind.letter(), change.path.display());
     }
+    Ok(())
+}
+
+/// `chimera fs pull`: the id on stdout is the whole interface, mirroring
+/// `fs branch` — `chimera run --from $(chimera fs pull docker:debian:13-slim)`
+/// is pinned to the digest that pull resolved.
+fn pull_cmd(image: &str) -> io::Result<()> {
+    let id = crate::docker::pull(image)?;
+    println!("{id}");
     Ok(())
 }
 
@@ -611,17 +795,44 @@ fn disposal_guard(root: &Path) -> io::Result<Option<OwnedFd>> {
 }
 
 fn rm(selectors: &[String]) -> io::Result<()> {
-    for selector in selectors {
-        let root = resolve(selector)?;
-        let _guard = disposal_guard(&root).map_err(|_| {
+    let victims: Vec<PathBuf> = selectors
+        .iter()
+        .map(|s| resolve(s))
+        .collect::<io::Result<_>>()?;
+    for (selector, root) in selectors.iter().zip(&victims) {
+        // A branch references its base image rather than copying it, so an
+        // image with surviving dependents must stay. A dependent going in
+        // the same command is not a survivor.
+        if image_of(root).is_some()
+            && let Some(dependent) = dependent_of(selector, root, &victims)
+        {
+            return Err(io::Error::other(format!(
+                "filesystem {dependent} branches image {selector}; remove it first"
+            )));
+        }
+        let _guard = disposal_guard(root).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!("filesystem {selector} is in use"),
             )
         })?;
-        fs::remove_dir_all(&root)?;
+        fs::remove_dir_all(root)?;
     }
     Ok(())
+}
+
+/// A kept filesystem whose `base` names this image, excluding those going in
+/// the same removal. The base record holds whatever selector the branch was
+/// created from, so both the image's id and the spelled selector count.
+fn dependent_of(selector: &str, root: &Path, victims: &[PathBuf]) -> Option<String> {
+    let id = root.file_name()?.to_string_lossy().into_owned();
+    let entries = fs::read_dir(filesystems_dir()).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| !victims.contains(&e.path()))
+        .filter(|e| matches!(base_of(&e.path()), Some(base) if base == id || base == selector))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .next()
 }
 
 /// Remove every filesystem under the state directory that no live session
@@ -684,8 +895,21 @@ fn prune(force: bool) -> io::Result<()> {
 /// command report failure.
 fn apply(selector: &str) -> io::Result<()> {
     let root = resolve(selector)?;
+    // Apply's one meaning is copying changes onto the live host. An image is
+    // not a change-set at all, and an image-rooted change-set is relative to
+    // the image's tree — pasting either onto the host would be nonsense.
+    if let Some(image) = image_of(&root) {
+        return Err(io::Error::other(format!(
+            "{image} is an image — a base tree, not changes to apply"
+        )));
+    }
+    if let Some(base) = base_of(&root) {
+        return Err(io::Error::other(format!(
+            "filesystem {selector} branches image {base}; its changes are relative to the image, not the host"
+        )));
+    }
     let mut conflicts = 0u32;
-    for change in changes(&root)? {
+    for change in changes(&root, Path::new("/"))? {
         match apply_change(&change) {
             Ok(()) => println!("{} {}", change.kind.letter(), change.path.display()),
             Err(ApplyError::Conflict) => {

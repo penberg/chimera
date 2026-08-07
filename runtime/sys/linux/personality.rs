@@ -97,6 +97,13 @@ impl Personality {
         }
     }
 
+    /// Set the guest's initial working directory, overriding the inherited
+    /// one — the embedder's choice when the host's cwd names nothing in the
+    /// guest's namespace, as under an image-rooted filesystem.
+    pub fn set_cwd(&self, path: impl Into<PathBuf>) {
+        *self.cwd.lock().unwrap() = normalize(&path.into());
+    }
+
     /// Record the guest image the sandbox launches, for `/proc/self/exe`.
     /// Canonicalized so the guest sees the absolute path the kernel would
     /// store.

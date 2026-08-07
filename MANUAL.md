@@ -180,29 +180,57 @@ not even a change-set that ended up empty, because you may well have branched
 precisely in order to have somewhere to stand. `--rm` is the one and only
 thing that discards, and you have to ask for it.
 
+### Image filesystems
+
+A container image can serve where the live host does: as the tree a sandbox
+reads through. `chimera fs pull docker:debian:13-slim` fetches the image from
+its registry, flattens its layers into one complete tree, and keeps the
+result as an *image filesystem* — a filesystem like any other, with an id in
+`fs list`, except that it descends from nothing (`-` in the FROM column) and
+is immutable. `--from docker:debian:13-slim` does the same resolution — the
+pull happens on first use, later runs reuse the kept image — and branches
+the result, so the guest sees the image's Debian tree at `/` while its writes
+land in the run's change-set, exactly as a host-rooted run's land over the
+live host.
+
+Because the image is immutable, a branch references it rather than copying
+it: branches are cheap regardless of image size, and `fs rm` refuses to
+remove an image that kept filesystems still stack on. Everything relative is
+reinterpreted against the image: `fs diff` of an image-rooted filesystem
+compares with the image's tree, and `fs apply` is refused — the changes are
+relative to the image, and pasting them onto the host would be nonsense.
+`/proc`, `/sys`, and `/dev` come from the running host, since they are
+interfaces to the kernel rather than content an image could carry; everything
+else the guest sees is the image's. A session starts at `/`, the image's
+root, and the guest keeps your environment variables.
+
+Only public images pull today (the anonymous token flow — Docker Hub, GHCR,
+and any distribution-spec registry), the transport borrows `curl(1)`, and a
+moved tag is refreshed by removing the old image filesystem and pulling
+again.
+
 ### Naming filesystems
 
 How a filesystem is named is independent of what you do with it. A *locator*
 names one; the verb — `--from` or `--in` — decides whether it is branched or
-resumed. Three forms exist today:
+resumed. Four forms exist today:
 
 | Locator | Names | Notes |
 | --- | --- | --- |
 | `host` | The live host tree | Only ever a branch point: `--from host` is the default spelled out, `--in host` is refused — that operation is `--unsafe`. |
 | An id | A kept filesystem | 8 hex characters — what `fs list` prints and what the kept notice hands you. The normal currency. |
 | A path | A change-set directory, directly | Anything containing `/`. `--in` creates it on first use. Raw state, yours to manage — see [Pin a filesystem in scripts](#pin-a-filesystem-in-scripts). |
+| `docker:<image>` | A container image | Docker reference rules: `docker:debian:13-slim`, `docker:ghcr.io/acme/tool:v2`, `@sha256:...` to pin. Resolves to the kept image filesystem, pulling on first use. Branch-only, like `host`. |
 
-`--from` accepts all three, and every `fs` subcommand accepts an id or a
+`--from` accepts all four, and every `fs` subcommand accepts an id or a
 path. `--in` accepts only what can be written to: an id or a path, never
-`host`.
+`host` and never an image.
 
-Locators of the form `<word>:...` are reserved for filesystems that do not
-live on this machine — a container image, a remote change-set. A leading
-scheme is recognized before anything else, so adding them later cannot change
-how a path or an id is read. Such a source may well be immutable, as a
-container image is: it can be branched with `--from` and never resumed with
-`--in`. A path whose first component contains a colon needs a leading `./` to
-be read as a path.
+Locator schemes other than `docker:` — the rest of the `<word>:...` space —
+remain reserved for filesystems that do not live on this machine. A leading
+scheme is recognized before anything else, so adding one cannot change how a
+path or an id is read; a path whose first component contains a colon needs a
+leading `./` to be read as a path.
 
 ## How to
 
@@ -252,7 +280,8 @@ Naming no program starts `/bin/bash`. Chimera hands the shell an rc file that
 sources your own `~/.bashrc` and then badges the prompt with the filesystem
 the session writes into — `unsafe`, on a red field, under `--unsafe` — so the
 badge survives a `PS1` set in your dotfiles. Pass `--no-prompt` to leave the
-prompt alone.
+prompt alone. An image-rooted session runs the image's own `/bin/bash` with
+no badge yet: the rc file lives on the host, outside the guest's tree.
 
 ### Resume a session
 
@@ -273,6 +302,42 @@ modifies, a run that takes one from the environment announces it:
 $ export CHIMERA_FS=51fad6cd
 $ chimera run make install
 chimera: --in 51fad6cd (CHIMERA_FS)
+```
+
+### Base a sandbox on a container image
+
+Name an image as the branch point and the guest runs against that image's
+tree instead of the live host — same CoW model, different base:
+
+```console
+$ chimera run --from docker:debian:13-slim
+chimera: pulling docker:docker.io/library/debian:13-slim
+chimera:   layer 1/1 (28M)
+chimera: pulled docker:docker.io/library/debian:13-slim as 56ffafdf
+bash-5.2$ cat /etc/os-release | head -1
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+```
+
+The pull happens once; the image is now filesystem `56ffafdf`, and every
+later `--from docker:debian:13-slim` — or `--from 56ffafdf`, the same thing —
+branches it without touching the network.
+
+This composes with branch-and-resume into image baking without an image
+build system: run the setup commands once, keep the result, and fan out.
+
+```console
+$ chimera run --from docker:debian:13-slim apt-get install -y build-essential
+chimera: filesystem kept; continue with:
+  chimera run --in 51fad6cd
+$ chimera run --rm --from 51fad6cd make test    # each agent branches the baked base
+```
+
+To pin the exact image in a script regardless of where the tag moves later,
+capture the id `fs pull` prints:
+
+```console
+$ base=$(chimera fs pull docker:debian:13-slim)
+$ chimera run --from "$base" ...
 ```
 
 ### Experiment without risk
@@ -390,8 +455,8 @@ Options are spelled `--name value`, not `--name=value`.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--from`, `-f` `<filesystem>` | `host` | Branch point: `host`, a kept filesystem's id, or a path to a change-set directory. The named filesystem is left exactly as it was. |
-| `--in <filesystem>` | | Resume an existing filesystem: an id or a path, never `host`. Changes accumulate into it rather than into a new one. Defaults from `CHIMERA_FS`. |
+| `--from`, `-f` `<filesystem>` | `host` | Branch point: `host`, a kept filesystem's id, a path to a change-set directory, or a `docker:` image (pulled on first use). The named filesystem is left exactly as it was. |
+| `--in <filesystem>` | | Resume an existing filesystem: an id or a path, never `host` and never an image. Changes accumulate into it rather than into a new one. Defaults from `CHIMERA_FS`. |
 | `--rm` | | Discard the new filesystem when the run exits. Only meaningful when branching; refused with `--in`, where it would destroy a filesystem you had deliberately kept. |
 | `--unsafe` | | No filesystem at all; the guest mutates the live host. Contradicts `--from`, `--in`, and `--rm`. |
 | `--no-prompt` | | Leave the started shell's prompt alone instead of badging it. |
@@ -445,9 +510,19 @@ because it is a copy rather than a reference, later resuming the source with
 `--in` cannot disturb anything already branched from it. Branch from a
 quiesced source: a live session still writing into it can tear the snapshot.
 
+#### `chimera fs pull <image>`
+
+Fetch a container image (`docker:` locators only) and keep it as an image
+filesystem; prints the id on stdout, so `chimera run --from $(chimera fs
+pull docker:debian:13-slim)` scripts cleanly and stays pinned to the digest
+the pull resolved. An image already kept — matched by digest when the
+locator pins one, by normalized reference otherwise — prints its existing id
+without touching the network. Needs `curl(1)` and `sha256sum(1)` on `PATH`.
+
 #### `chimera fs rm <filesystem>...`
 
-Remove filesystems. Refused while any live session holds one.
+Remove filesystems. Refused while any live session holds one, and for an
+image filesystem that kept filesystems still branch from.
 
 #### `chimera fs prune`
 
@@ -479,9 +554,10 @@ Kept filesystems live under `$XDG_STATE_HOME/chimera/fs` (defaulting to
 
 | Entry | Contents |
 | --- | --- |
-| `data/` | The change-set itself, in the format the runtime owns. |
+| `data/` | The change-set itself, in the format the runtime owns. For an image filesystem, the image's complete flattened tree. |
 | `tmp/` | Staging space. |
-| `meta` | Human-readable provenance — informational only, including the `parent` line a branch records. |
+| `meta` | Human-readable provenance — informational only, including the `parent` line a branch records and the `image`/`digest` lines a pull records. |
+| `base` | For a filesystem that branched an image: the image filesystem its change-set is relative to. Load-bearing, unlike `meta`. |
 | `lock` | Coordinates live sessions and removal. |
 
 The change-set encodes deletions and metadata in user extended attributes, so
