@@ -479,6 +479,7 @@ impl Signals {
                     state.regs[30],
                     Self::name_of(state.regs[30]),
                 );
+                crate::sys::darwin::entitlements_hint();
                 eprintln!(
                     "  x0={:#x} x1={:#x} x2={:#x} x3={:#x} x8={:#x} sp={:#x}",
                     state.regs[0],
