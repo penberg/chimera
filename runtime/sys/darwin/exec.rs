@@ -75,6 +75,13 @@ pub fn execv(
         Some(over) => over.iter().map(|(k, v)| env_pair(k, v)).collect(),
         None => std::env::vars_os().map(|(k, v)| env_pair(&k, &v)).collect(),
     };
+    // The guest's getenv reads the shared libSystem's `environ`, not the
+    // frame envp `main` receives, so an embedder's explicit environment must
+    // be published there too — the same sync an execve installs for the next
+    // image.
+    if envs.is_some() {
+        sync_host_environ(&envp);
+    }
 
     let image = load_macho(program)?;
     warn_unhonoured_entitlements(program, &image);
