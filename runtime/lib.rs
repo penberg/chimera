@@ -11,11 +11,14 @@ mod arch;
 mod process;
 mod sys;
 mod syscall;
+#[cfg(target_os = "macos")]
+mod trace;
 
 pub use syscall::{ForkHold, Passthrough, SyscallResult, SystemCall, SystemCalls};
 
-pub use sys::linux::syscall::host_syscall;
+pub use sys::host_syscall;
 
+#[cfg(target_os = "linux")]
 pub use sys::linux::{
     DirEntry, Errno, File, FileType, HostFs, Mode, MountFlags, Namespace, OpenFlags, OverlayFs,
     Personality, RenameFlags, Stat, StatFs, Timespec, Vfs, WriteResult,
@@ -27,6 +30,7 @@ pub use sys::linux::{
 /// `fs apply` advances after each successful host operation. The format
 /// itself is owned by this crate; the CLI's `chimera fs` subcommands
 /// consume these rather than reimplementing the on-disk knowledge.
+#[cfg(target_os = "linux")]
 pub mod delta {
     pub use crate::sys::linux::{
         Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin,
@@ -50,7 +54,14 @@ pub const MAX_CODE_CACHE_SIZE: usize = i32::MAX as usize;
 /// Whether the host supports memory protection keys for the translated-code
 /// cache.
 pub fn mpk_enabled() -> bool {
-    arch::mpk_enabled()
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch::mpk_enabled()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 /// A sandboxed guest program, configured but not yet running.

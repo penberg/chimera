@@ -103,11 +103,11 @@ pub struct RunCmd {
     #[argh(switch, long = "unsafe")]
     pub unsafe_: bool,
 
-    /// leave the default Bash prompt unchanged
+    /// leave the shell's default prompt unchanged
     #[argh(switch)]
     pub no_prompt: bool,
 
-    /// the program and its arguments (default: /bin/bash). Greedy: option
+    /// the program and its arguments (default: a shell). Greedy: option
     /// parsing stops at the program token, so the guest's own flags need no `--`
     /// separator.
     #[argh(positional, greedy)]

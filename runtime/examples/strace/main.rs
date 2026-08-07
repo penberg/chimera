@@ -22,8 +22,19 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+#[cfg(target_os = "linux")]
 use linux::main;
 
+#[cfg(target_os = "macos")]
+use darwin::main;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn main() -> std::process::ExitCode {
+    eprintln!("strace example supports Linux and macOS hosts only");
+    std::process::ExitCode::from(2)
+}
+
+#[cfg(target_os = "linux")]
 mod linux {
 
     use std::{env, fmt::Write, process::ExitCode, ptr};
@@ -739,3 +750,116 @@ mod linux {
         }
     }
 } // mod linux
+
+#[cfg(target_os = "macos")]
+mod darwin {
+
+    use std::{env, fmt::Write, process::ExitCode};
+
+    use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls};
+
+    pub fn main() -> ExitCode {
+        let mut argv = env::args_os().skip(1);
+        let program = match argv.next() {
+            Some(p) => p,
+            None => {
+                eprintln!("usage: strace <program> [args...]");
+                return ExitCode::from(2);
+            }
+        };
+        let prog_args: Vec<_> = argv.collect();
+
+        let mut sandbox = match Sandbox::new(&program) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("strace: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        sandbox.args(prog_args).system_calls(Strace);
+
+        match sandbox.run() {
+            Ok(status) => ExitCode::from(status.code() as u8),
+            Err(e) => {
+                eprintln!("strace: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+
+    struct Strace;
+
+    // The Darwin path prints the syscall name and its first three argument
+    // registers in hex — enough to scan a trace by eye without re-implementing
+    // every BSD/Mach struct decoder. The Linux path keeps the rich decoders.
+    impl SystemCalls for Strace {
+        fn post_syscall(&self, call: &SystemCall) {
+            let a = &call.args;
+            let mut line = String::with_capacity(48);
+            let _ = write!(
+                line,
+                "{}({:#x}, {:#x}, {:#x})",
+                syscall_name(call.number),
+                a[0],
+                a[1],
+                a[2],
+            );
+            match call.result() {
+                Some(SyscallResult::Ok(v)) => eprintln!("{line:<48} = {v:#x}"),
+                Some(SyscallResult::Error(e)) => eprintln!("{line:<48} = -{e}"),
+                None => eprintln!("{line:<48} = ?"),
+            }
+        }
+    }
+
+    /// Darwin/arm64 syscall names. Positive numbers are BSD syscalls; values
+    /// with bit 31 set are Mach traps (the kernel reads x16 as a signed 32-bit
+    /// value, so they appear here as `0xFFFF_FFFF_FFFF_FFxx`). A common subset;
+    /// anything unrecognized prints as `syscall`.
+    fn syscall_name(n: u64) -> &'static str {
+        match n {
+            1 => "exit",
+            2 => "fork",
+            3 => "read",
+            4 => "write",
+            5 => "open",
+            6 => "close",
+            7 => "wait4",
+            20 => "getpid",
+            24 => "getuid",
+            33 => "access",
+            37 => "kill",
+            38 => "readlink",
+            39 => "getppid",
+            42 => "pipe",
+            46 => "sigaction",
+            48 => "sigprocmask",
+            53 => "sigaltstack",
+            54 => "ioctl",
+            73 => "munmap",
+            74 => "mprotect",
+            75 => "madvise",
+            92 => "fcntl",
+            170 => "csops",
+            197 => "mmap",
+            202 => "sysctl",
+            220 => "mlock",
+            336 => "proc_info",
+            339 => "fstat64",
+            483 => "bsdthread_register",
+            500 => "thread_selfid",
+            521 => "abort_with_payload",
+            0x8000_0000 => "thread_set_tsd_base",
+            0xFFFF_FFFF_FFFF_FFE4 => "task_self_trap",
+            0xFFFF_FFFF_FFFF_FFE3 => "host_self_trap",
+            0xFFFF_FFFF_FFFF_FFE6 => "mach_reply_port",
+            0xFFFF_FFFF_FFFF_FFE1 => "mach_msg_trap",
+            0xFFFF_FFFF_FFFF_FFF1 => "_kernelrpc_mach_vm_protect_trap",
+            0xFFFF_FFFF_FFFF_FFF2 => "_kernelrpc_mach_vm_deallocate_trap",
+            0xFFFF_FFFF_FFFF_FFF4 => "_kernelrpc_mach_vm_allocate_trap",
+            0xFFFF_FFFF_FFFF_FFF6 => "_kernelrpc_mach_vm_map_trap",
+            0xFFFF_FFFF_FFFF_FFED => "_kernelrpc_mach_port_deallocate_trap",
+            _ => "syscall",
+        }
+    }
+}
