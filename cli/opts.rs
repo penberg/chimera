@@ -33,6 +33,7 @@ pub enum FsAction {
     List(FsListCmd),
     Diff(FsDiffCmd),
     Apply(FsApplyCmd),
+    Branch(FsBranchCmd),
     Rm(FsRmCmd),
     Prune(FsPruneCmd),
 }
@@ -63,6 +64,16 @@ pub struct FsApplyCmd {
     pub filesystem: String,
 }
 
+/// Fork a filesystem: a new filesystem seeded with a copy of the source's
+/// changes, leaving the source untouched. Prints the new filesystem's id.
+#[derive(FromArgs)]
+#[argh(subcommand, name = "branch")]
+pub struct FsBranchCmd {
+    /// source filesystem id or path
+    #[argh(positional)]
+    pub filesystem: String,
+}
+
 /// Remove filesystems.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "rm")]
@@ -89,17 +100,22 @@ pub struct RunCmd {
     #[argh(option)]
     pub code_cache_size: Option<usize>,
 
-    /// attach to an existing filesystem: an id from a kept run, or a path to
-    /// a filesystem directory (env: CHIMERA_FS)
+    /// the branch point: `host` for the live host (the default), a kept
+    /// filesystem's id, or a path to a change-set directory — the run stacks
+    /// a fresh change-set on it and the source stays untouched
     #[argh(option, short = 'f')]
-    pub fs: Option<String>,
+    pub from: Option<String>,
 
-    /// discard the filesystem on exit instead of keeping it
+    /// resume an existing filesystem — an id or a path, never `host` — so
+    /// the run's changes accumulate into it (env: CHIMERA_FS)
+    #[argh(option, long = "in")]
+    pub in_: Option<String>,
+
+    /// discard the branch on exit instead of keeping it; refused with --in
     #[argh(switch)]
     pub rm: bool,
 
-    /// bypass the copy-on-write filesystem: the guest mutates the host
-    /// directly
+    /// run without a branch: the guest mutates the live host directly
     #[argh(switch, long = "unsafe")]
     pub unsafe_: bool,
 

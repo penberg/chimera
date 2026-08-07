@@ -6,6 +6,7 @@ use std::{
     env,
     ffi::OsString,
     io,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -53,29 +54,73 @@ fn run(mut cmd: RunCmd) -> ExitCode {
         cmd.argv.push("/bin/bash".into());
     }
     // Route the guest's filesystem syscalls through a userspace VFS mounted
-    // at `/`. Copy-on-write is the default: every run mounts an overlay
-    // whose upper layer is a filesystem's delta, so the guest works against
-    // what looks like the live host while every mutation lands in the
-    // filesystem. Only `--unsafe` touches the host directly. The host root
-    // must exist, so its construction cannot fail.
+    // at `/`. Every run works in a filesystem: by default it branches one —
+    // the live host — so the guest sees what looks like the real tree while
+    // every mutation lands in the branch's change-set; `--in` resumes an
+    // existing filesystem instead, and `--unsafe` is the refusal to have one
+    // at all. The host changes only through `fs apply`. The host root must
+    // exist, so its construction cannot fail.
     let host = Arc::new(HostFs::new("/").expect("host root / is a directory"));
-    let selector = cmd
-        .fs
-        .clone()
-        .map(OsString::from)
-        .or_else(|| env::var_os("CHIMERA_FS"));
     let (root, fsys): (Arc<dyn Vfs>, Option<fs::Filesystem>) = if cmd.unsafe_ {
         // The explicit flags contradict --unsafe; the ambient environment
         // variable is merely inert, like any other env a script exports.
-        if cmd.fs.is_some() || cmd.rm {
+        if cmd.from.is_some() || cmd.in_.is_some() || cmd.rm {
             eprintln!("chimera: --unsafe runs without a filesystem");
             return ExitCode::FAILURE;
         }
         (host, None)
     } else {
-        let fsys = match &selector {
-            Some(sel) => fs::attach(sel),
-            None => fs::create(&describe(&cmd)),
+        if cmd.from.is_some() && cmd.in_.is_some() {
+            eprintln!("chimera: a run either branches with --from or resumes with --in, not both");
+            return ExitCode::FAILURE;
+        }
+        // The environment supplies a default for --in only; an explicit
+        // verb always wins over an inherited one.
+        let env_in = (cmd.from.is_none() && cmd.in_.is_none())
+            .then(|| env::var_os("CHIMERA_FS"))
+            .flatten();
+        let from_env = env_in.is_some();
+        let resume = cmd.in_.clone().map(OsString::from).or(env_in);
+        if cmd.rm && resume.is_some() {
+            eprintln!(
+                "chimera: --rm discards a fresh branch, not a filesystem resumed with --in{}",
+                if from_env { " (CHIMERA_FS)" } else { "" },
+            );
+            return ExitCode::FAILURE;
+        }
+        let selector = resume
+            .clone()
+            .or_else(|| cmd.from.clone().map(OsString::from));
+        if let Some(sel) = &selector
+            && let Some(scheme) = fs::scheme(sel)
+        {
+            eprintln!(
+                "chimera: unknown filesystem scheme \"{scheme}:\" (a path whose first component contains a colon needs a leading ./)",
+            );
+            return ExitCode::FAILURE;
+        }
+        // A locator names a filesystem; the verb decides what happens to
+        // it: `--from` branches, leaving the source exactly as it was, and
+        // `--in` resumes, accumulating changes into the named filesystem.
+        // An id names a kept change-set under the state directory, a path
+        // names a change-set directory in place, and `host` is the default
+        // branch point spelled out, so what `fs list` prints in its FROM
+        // column can be typed straight back; a generated id is 8 hex
+        // characters and can never collide with the word.
+        let fsys = match &resume {
+            Some(sel) if sel.as_bytes() == b"host" => {
+                eprintln!(
+                    "chimera: --in host mutates the live host; that operation is spelled --unsafe"
+                );
+                return ExitCode::FAILURE;
+            }
+            Some(sel) if sel.as_bytes().contains(&b'/') => fs::attach(sel),
+            Some(sel) => fs::resume(&sel.to_string_lossy()),
+            None => match &cmd.from {
+                Some(sel) if sel == "host" => fs::create(&describe(&cmd)),
+                Some(sel) => fs::branch(sel, &describe(&cmd)),
+                None => fs::create(&describe(&cmd)),
+            },
         };
         let fsys = match fsys {
             Ok(fsys) => fsys,
@@ -84,14 +129,12 @@ fn run(mut cmd: RunCmd) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        // An attach the user typed is self-evident; one inherited from the
-        // environment is not, and a stale exported CHIMERA_FS would
-        // otherwise resurrect old deletions with no visible cause.
-        if cmd.fs.is_none() && selector.is_some() {
-            eprintln!(
-                "chimera: attached to filesystem {} (CHIMERA_FS)",
-                fsys.root.display(),
-            );
+        // A filesystem the user named is self-evident; one inherited from
+        // the environment is not, and a stale exported CHIMERA_FS would
+        // otherwise change both what the guest sees and what it mutates
+        // with no visible cause.
+        if from_env && let Some(sel) = &resume {
+            eprintln!("chimera: --in {} (CHIMERA_FS)", Path::new(sel).display());
         }
         match OverlayFs::new(host, &fsys.root) {
             Ok(overlay) => (Arc::new(overlay), Some(fsys)),
@@ -130,9 +173,10 @@ fn run(mut cmd: RunCmd) -> ExitCode {
     let (program, args) = cmd.argv.split_first().expect("argv names a program");
     let program = Path::new(program);
     // Resolve the initial executable through the same merged view the
-    // guest's own syscalls will see: an attached filesystem may have replaced
-    // or deleted the program, its script, or its interpreter, and the session
-    // must load the bytes the guest observes, not the lower host's.
+    // guest's own syscalls will see: an inherited change-set may have
+    // replaced or deleted the program, its script, or its interpreter, and
+    // the session must load the bytes the guest observes, not the lower
+    // host's.
     let program = match resolve_program(root.as_ref(), program, args) {
         Ok(program) => program,
         Err(err) => {

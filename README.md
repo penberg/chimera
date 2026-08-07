@@ -47,14 +47,20 @@ Then wrap any command:
 chimera run /bin/echo hello
 ```
 
+The wrapped process sees the host filesystem exactly as it is, but every write,
+rename, and delete it makes lands in a private change-set rather than on the
+host. Every run keeps its change-set under a short id: inspect it with
+`chimera fs diff`, resume it with `chimera run --in <id>`, branch it with
+`--from <id>`, or adopt it onto the host with `chimera fs apply`. `--rm`
+discards it on exit, and `--unsafe` runs without one, the process mutating the
+host directly.
+
 With no command, `chimera run` starts `/bin/bash` with a compact prompt naming
 its filesystem id. `--unsafe` replaces the id with `unsafe`; pass
 `--no-prompt` to leave the normal Bash prompt unchanged.
 
-By default Chimera forwards every system call to the host kernel, so the
-wrapped process behaves like a native one.
-
-From a checkout, install with `cargo install --path cli` instead.
+From a checkout, install with `cargo install --path cli` instead. The
+[manual](MANUAL.md) covers the `chimera` command in full.
 
 ## Library
 

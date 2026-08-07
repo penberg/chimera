@@ -1,19 +1,19 @@
-// RUN: %cc %s -o %t && rm -rf %t.probeA %t.probeB %t.childA %t.childB %t.ws2
+// RUN: %cc %s -o %t && rm -rf %t.probeA %t.probeB %t.childA %t.childB
 // RUN: %runner %t scenario %t.probeA > %t.childA
 // RUN: %t await %t.childA
 // RUN: %t verify-kept "$XDG_STATE_HOME/chimera/fs" %t.probeA
-// RUN: case "%runner" in *--unsafe*) : ;; *chimera*) CHIMERA_FS=%t.ws2 %runner --rm %t scenario %t.probeB > %t.childB && %t await %t.childB && %t verify-rm %t.ws2 %t.probeB ;; *) : ;; esac
+// RUN: case "%runner" in *--unsafe*) : ;; *chimera*) %runner --rm %t scenario %t.probeB > %t.childB && %t await %t.childB && %t verify-rm "$XDG_STATE_HOME/chimera/fs" %t.probeB ;; *) : ;; esac
 //
 // The session lifetime is the guest process tree, not the root command: a
 // forked guest that outlives the session root must keep a usable filesystem.
 // The scenario forks a child that waits (by pipe EOF) until its parent — the
 // session root — has fully exited, then creates and reads back an upper
 // file, reporting through the inherited host stdout. Disposal decisions are
-// deferred to the last process out: the fresh-and-still-empty filesystem of
-// the first run must not be garbage-collected at root exit (the child's
-// write lands in it and keeps it), and the --rm of the second run must not
-// remove the filesystem before the child is done — but must remove it after.
-// Natively the child simply writes to disk after its parent exits.
+// deferred to the last process out: the first run's filesystem must still
+// accept the child's write after the root exits, and the --rm of the second
+// run must not remove the branch before the child is done — but must remove
+// it after, leaving no kept filesystem holding the probe and the host path
+// absent. Natively the child simply writes to disk after its parent exits.
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -90,11 +90,26 @@ static int verify_kept(const char *statedir, const char *probe) {
     return stat(probe, &st) == 0 ? 0 : 52;
 }
 
-static int verify_rm(const char *ws, const char *probe) {
+// After the --rm run's tree has fully exited, the branch is gone: no kept
+// filesystem holds the probe, and the host path never appeared.
+static int verify_rm(const char *statedir, const char *probe) {
+    char path[4096];
     struct stat st;
-    if (stat(ws, &st) == 0) return 61;
-    if (stat(probe, &st) == 0) return 62;
-    return 0;
+    DIR *dir = opendir(statedir);
+    if (dir) {
+        struct dirent *e;
+        while ((e = readdir(dir))) {
+            if (e->d_name[0] == '.') continue;
+            snprintf(path, sizeof(path), "%s/%s/data%s", statedir, e->d_name,
+                     probe);
+            if (stat(path, &st) == 0) {
+                closedir(dir);
+                return 61;
+            }
+        }
+        closedir(dir);
+    }
+    return stat(probe, &st) == 0 ? 62 : 0;
 }
 
 int main(int argc, char **argv) {
