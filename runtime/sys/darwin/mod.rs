@@ -168,6 +168,50 @@ pub fn clear_guest_zones() {
     *GUEST_ZONES.lock().unwrap() = None;
 }
 
+/// The current guest image's path and the entitlements the kernel will not
+/// grant it, kept for a failure-time hint rather than announced at load:
+/// nearly every Apple system binary carries some entitlement, so a load-time
+/// warning fires once per spawned child of an interactive guest and buries
+/// its output. The hardened-runtime relaxations (`com.apple.security.cs.*`)
+/// are dropped at recording — they permit what a non-hardened Chimera
+/// process may do anyway, so a guest loses nothing by running without them
+/// and listing them would misattribute the failure. Replaced by each exec'd
+/// image.
+static UNHONOURED_ENTITLEMENTS: Mutex<Option<(String, Vec<String>)>> = Mutex::new(None);
+
+pub fn set_unhonoured_entitlements(path: &Path, entitlements: &[String]) {
+    let kept: Vec<String> = entitlements
+        .iter()
+        .filter(|e| !e.starts_with("com.apple.security.cs."))
+        .cloned()
+        .collect();
+    *UNHONOURED_ENTITLEMENTS.lock().unwrap() = if kept.is_empty() {
+        None
+    } else {
+        Some((path.display().to_string(), kept))
+    };
+}
+
+/// Say once, after a run that failed, that the image ran stripped of its
+/// entitlements — the moment the fact explains something. Only the process
+/// the user started speaks: a forked child's failure surfaces through its
+/// parent, and a hint from every child of an interactive guest is the spam
+/// the load-time warning used to be.
+pub fn entitlements_hint() {
+    use std::sync::atomic::AtomicBool;
+    static PRINTED: AtomicBool = AtomicBool::new(false);
+    if callback::is_fork_child() || PRINTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if let Some((path, entitlements)) = &*UNHONOURED_ENTITLEMENTS.lock().unwrap() {
+        eprintln!(
+            "chimera: note: {path} is signed with entitlements the kernel will not grant \
+             under Chimera ({}); a permission error above may stem from that",
+            entitlements.join(", "),
+        );
+    }
+}
+
 /// Guest-registered `pthread_atfork` handlers, kept off libpthread's global
 /// list. Registered there, they would be *guest* function pointers on a list
 /// the host's own `fork(3)` wrapper walks natively: the runtime's posix_spawn

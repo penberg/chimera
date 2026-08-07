@@ -84,7 +84,7 @@ pub fn execv(
     }
 
     let image = load_macho(program)?;
-    warn_unhonoured_entitlements(program, &image);
+    super::set_unhonoured_entitlements(program, &image.entitlements);
     // A dynamic image carries imports and rebases that must be applied before
     // it runs; Chimera links it in-process rather than handing control to
     // Apple's dyld (see dyld.rs). A static image is dispatched as mapped.
@@ -128,7 +128,12 @@ pub fn execv(
 pub fn drive(thread: &mut Thread, mut reason: ExitReason) -> Result<i32, Error> {
     loop {
         match reason {
-            ExitReason::Exited(code) => return Ok(code),
+            ExitReason::Exited(code) => {
+                if code != 0 {
+                    super::entitlements_hint();
+                }
+                return Ok(code);
+            }
             ExitReason::Execve => {
                 // A committed execve: the calling thread — main or a sibling —
                 // already validated, parsed, and mapped the image and
@@ -413,26 +418,13 @@ pub fn prepare_exec(args: &[u64; 8]) -> Result<PreparedExec, Error> {
     let argv = read_guest_ptr_array(args[1], MAX_ARG_COUNT, MAX_ARG_STRLEN)?;
     let envp = read_guest_ptr_array(args[2], MAX_ARG_COUNT, MAX_ARG_STRLEN)?;
     let image = load_macho(&path)?;
-    warn_unhonoured_entitlements(&path, &image);
+    super::set_unhonoured_entitlements(&path, &image.entitlements);
     Ok(PreparedExec {
         path,
         argv,
         envp,
         image,
     })
-}
-
-/// See [`LoadedMachO::entitlements`] for why these can never be honoured.
-fn warn_unhonoured_entitlements(path: &Path, image: &LoadedMachO) {
-    if image.entitlements.is_empty() {
-        return;
-    }
-    eprintln!(
-        "chimera: warning: {} is signed with entitlements the kernel will not grant \
-         under Chimera ({}); syscalls gated on them will fail as permission errors",
-        path.display(),
-        image.entitlements.join(", "),
-    );
 }
 
 /// The errno a failed [`prepare_exec`] reports to the guest. `None` for
