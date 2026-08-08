@@ -4,16 +4,22 @@
 userspace VFS costs over native. `run.sh` builds it and runs each operation
 four ways against the same file — native, under `chimera run`, and native
 through two `chimera mount` FUSE views of an empty change-set over the live
-host, one uncached (the default) and one with `--cache 60` — printing ns/op
-and each route's ratio over native. The Chimera routes serve the same merged
-view; they differ in how the operations reach the VFS (DBT syscall
-interception in-process, or the kernel's FUSE protocol) and in what the
-kernel may cache.
+host, one uncached (the default) and one with `--cache 60`. The Chimera
+routes serve the same merged view; they differ in how the operations reach
+the VFS (DBT syscall interception in-process, or the kernel's FUSE protocol)
+and in what the kernel may cache.
 
 ```
 ./run.sh
-CHIMERA=../../target/release/chimera ./run.sh [iters] [path]
+CHIMERA=../../target/release/chimera ./run.sh [iters-per-round] [path] [rounds]
 ```
+
+Each cell is measured over `rounds` (default 10) self-timed rounds of
+`iters-per-round` operations within one process — one warm-up, many
+independent samples — and reported as mean±sd ns/op with ratios of means
+over native. The raw per-round samples land in `build/samples.csv` as
+`route,op,round,ns_per_op`, which is what a plot with error bars should
+consume; the table is only the summary.
 
 Use a release build; a debug build inflates the overhead.
 
