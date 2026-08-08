@@ -683,6 +683,11 @@ impl Vfs for OverlayFs {
     }
 
     fn resolve_fast(&self, path: &Path) -> Option<Stat> {
+        // A clean delta serves everything from the lower, so the upper walk
+        // has nothing to say and the lower's own proof suffices.
+        if self.inner.delta.is_clean() {
+            return self.inner.lower.resolve_fast(path);
+        }
         // Only a pure-lower path can skip the merge. The upper walk stops at
         // the first missing component — one lstat on the common no-shadow
         // prefix — and the lower then proves no symlink participates, which
@@ -691,6 +696,18 @@ impl Vfs for OverlayFs {
             Ok(Visibility::Lower) => self.inner.lower.resolve_fast(path),
             _ => None,
         }
+    }
+
+    fn stat_fast(&self, path: &Path, follow: bool) -> Option<Result<Stat, Errno>> {
+        // While the delta is clean the merged view is the lower verbatim —
+        // whatever path a symlink expansion takes, there is no upper entry
+        // for it to land on — so the question passes wholesale to the lower.
+        // The lower must answer for itself: this delta's cleanliness says
+        // nothing about, say, a nested overlay's own upper.
+        if !self.inner.delta.is_clean() {
+            return None;
+        }
+        self.inner.lower.stat_fast(path, follow)
     }
 
     fn host_path(&self, path: &Path) -> Option<PathBuf> {
@@ -1612,6 +1629,172 @@ mod tests {
         let direct = ns.stat_path(Path::new("/real/g"), true).unwrap();
         assert_eq!(via_link.ino, direct.ino);
         assert_eq!(via_link.size, 7); // "upper-g", not "lower-g"'s identity
+    }
+
+    /// While the delta is clean, `stat_fast` answers everything the lower
+    /// answers — symlink chains and misses included, which `resolve_fast`
+    /// must decline — and the first upper mutation silences it for good.
+    #[test]
+    fn stat_fast_serves_only_clean_deltas() {
+        let scratch = Scratch::new();
+        let Some((fs, _delta)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::create_dir_all(scratch.join("lower/d")).unwrap();
+        std::fs::write(scratch.join("lower/d/f"), b"x").unwrap();
+        std::os::unix::fs::symlink("d", scratch.join("lower/link")).unwrap();
+
+        let st = fs.stat_fast(Path::new("/d/f"), true).unwrap().unwrap();
+        assert_eq!(st.file_type, FileType::Regular);
+        let via_link = fs.stat_fast(Path::new("/link/f"), true).unwrap().unwrap();
+        assert_eq!(via_link.ino, st.ino);
+        let l = fs.stat_fast(Path::new("/link"), false).unwrap().unwrap();
+        assert_eq!(l.file_type, FileType::Symlink);
+        assert_eq!(
+            fs.stat_fast(Path::new("/absent"), true)
+                .unwrap()
+                .unwrap_err(),
+            Errno::ENOENT
+        );
+
+        fs.chmod(Path::new("/d/f"), true, Mode(0o600)).unwrap();
+        assert!(fs.stat_fast(Path::new("/d/f"), true).is_none());
+        assert!(fs.stat_fast(Path::new("/link/f"), true).is_none());
+    }
+
+    /// A mutation aimed at the root leaves no child entry in the upper —
+    /// its whole record is the claim on `data/` itself — and must silence
+    /// the fast path like any other write.
+    #[test]
+    fn root_mutation_taints() {
+        let scratch = Scratch::new();
+        let Some((fs, _delta)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::write(scratch.join("lower/f"), b"x").unwrap();
+        assert!(fs.stat_fast(Path::new("/f"), true).is_some());
+
+        fs.chmod(Path::new("/"), true, Mode(0o711)).unwrap();
+        assert!(fs.stat_fast(Path::new("/f"), true).is_none());
+        assert!(fs.stat_fast(Path::new("/"), true).is_none());
+    }
+
+    /// The taint is a property of the delta on disk, not of one `Delta`
+    /// instance: a mutation through any handle — another host process of the
+    /// guest tree, a concurrent session — is seen by every other, and a
+    /// reattach of a non-empty delta starts tainted.
+    #[test]
+    fn taint_is_shared_across_delta_handles() {
+        let scratch = Scratch::new();
+        let Some((fs, delta)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::write(scratch.join("lower/f"), b"x").unwrap();
+        assert!(fs.stat_fast(Path::new("/f"), true).is_some());
+
+        // The sibling handle mutates; this overlay must stop answering
+        // before the whiteout could bleed a stale lower hit.
+        delta.whiteout(Path::new("/f")).unwrap();
+        assert!(fs.stat_fast(Path::new("/f"), true).is_none());
+
+        let reattached = Delta::open(scratch.join("delta")).unwrap();
+        assert!(!reattached.is_clean());
+    }
+
+    /// `..` after a symlink acts on the expanded target, which no lexical
+    /// fast path can know: with `/link -> dir/sub`, `/link/../file` names
+    /// `/dir/file`, never `/file`. The whole-path stat must see the raw
+    /// path so the kernel applies that order, and the walked path must
+    /// agree — clean and tainted alike.
+    #[test]
+    fn stat_path_orders_dotdot_after_symlinks() {
+        use super::super::namespace::{MountFlags, Namespace};
+
+        let scratch = Scratch::new();
+        let Some((fs, _delta)) = overlay(&scratch) else {
+            return;
+        };
+        std::fs::create_dir_all(scratch.join("lower/dir/sub")).unwrap();
+        std::fs::write(scratch.join("lower/dir/file"), b"in-dir").unwrap();
+        std::fs::write(scratch.join("lower/file"), b"at-root").unwrap();
+        std::os::unix::fs::symlink("dir/sub", scratch.join("lower/link")).unwrap();
+
+        let ns = Namespace::with_root(
+            Arc::new(OverlayFs {
+                inner: Arc::clone(&fs.inner),
+            }),
+            MountFlags::NONE,
+        );
+        let direct = ns.stat_path(Path::new("/dir/file"), true).unwrap();
+        let clean = ns.stat_path(Path::new("/link/../file"), true).unwrap();
+        assert_eq!(clean.ino, direct.ino);
+        let dir = ns.stat_path(Path::new("/dir"), true).unwrap();
+        let popped = ns.stat_path(Path::new("/dir/sub/.."), true).unwrap();
+        assert_eq!(popped.ino, dir.ino);
+
+        ns.stat_path(Path::new("/absent"), true).unwrap_err();
+        // Tainting sends the path to the walk, which must agree; the chmod
+        // copied the file up, so compare against the merged view it serves
+        // now, not the lower inode it left behind.
+        fs.chmod(Path::new("/dir/file"), true, Mode(0o600)).unwrap();
+        let walked = ns.stat_path(Path::new("/link/../file"), true).unwrap();
+        let merged = ns.stat_path(Path::new("/dir/file"), true).unwrap();
+        assert_eq!(walked.ino, merged.ino);
+        assert_eq!(walked.mode.0 & 0o7777, 0o600);
+
+        // A trailing `..` names the parent, never the child the walk just
+        // popped — through a symlink expansion too.
+        let popped = ns.stat_path(Path::new("/dir/sub/.."), true).unwrap();
+        assert_eq!(popped.ino, dir.ino);
+        let via_link = ns.stat_path(Path::new("/link/.."), true).unwrap();
+        assert_eq!(via_link.ino, dir.ino);
+    }
+
+    /// A clean delta only proves its own layer transparent; the lower must
+    /// answer for itself. A nested overlay whose delta shadows the target of
+    /// a lower symlink declines the whole-path stat, and the walk finds the
+    /// inner upper entry.
+    #[test]
+    fn stat_fast_defers_to_a_layered_lower() {
+        use super::super::namespace::{MountFlags, Namespace};
+
+        let scratch = Scratch::new();
+        std::fs::create_dir_all(scratch.join("lower/real")).unwrap();
+        std::fs::write(scratch.join("lower/real/g"), b"lower-g").unwrap();
+        std::os::unix::fs::symlink("real", scratch.join("lower/link")).unwrap();
+        let host = Arc::new(HostFs::new(scratch.join("lower")).unwrap());
+        let inner = match OverlayFs::new(host, scratch.join("delta-inner")) {
+            Ok(fs) => Arc::new(fs),
+            Err(Errno(libc::ENOTSUP)) => return,
+            Err(e) => panic!("inner overlay: {e:?}"),
+        };
+        let outer = OverlayFs::new(
+            Arc::clone(&inner) as Arc<dyn Vfs>,
+            scratch.join("delta-outer"),
+        )
+        .unwrap();
+
+        // Clean all the way down: the chain answers wholesale.
+        let st = outer
+            .stat_fast(Path::new("/link/g"), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(st.size, 7);
+
+        // The inner overlay shadows the symlink's target; the outer delta is
+        // still clean, but the answer is no longer the host's.
+        inner
+            .chmod(Path::new("/real/g"), true, Mode(0o600))
+            .unwrap();
+        assert!(outer.stat_fast(Path::new("/link/g"), true).is_none());
+        let ns = Namespace::with_root(
+            Arc::new(OverlayFs {
+                inner: Arc::clone(&outer.inner),
+            }),
+            MountFlags::NONE,
+        );
+        let walked = ns.stat_path(Path::new("/link/g"), true).unwrap();
+        assert_eq!(walked.mode.0 & 0o7777, 0o600);
     }
 
     #[test]

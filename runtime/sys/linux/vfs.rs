@@ -124,6 +124,21 @@ pub trait Vfs: Send + Sync {
         None
     }
 
+    /// Answer `stat`/`lstat` for a raw absolute path wholesale, with kernel
+    /// resolution semantics — symlinks followed and `..` applied to the
+    /// expanded chain, the final symlink per `follow` — when the filesystem
+    /// can prove that resolution is its whole answer. `Some` is
+    /// authoritative, errors included; `None` sends the caller to the walk.
+    /// Unlike [`Vfs::resolve_fast`] this makes no claim that the path
+    /// lexically names the object, so it serves only stat lookups, never a
+    /// resolution whose path a later operation acts on. A confining
+    /// filesystem resolves whole paths itself by definition; a layered one
+    /// must prove its own layer transparent *and* delegate below, since its
+    /// composed view is only as resolvable as its parts.
+    fn stat_fast(&self, path: &Path, follow: bool) -> Option<Result<Stat, Errno>> {
+        self.confines().then(|| self.stat(path, follow))
+    }
+
     /// The host path backing a mount-relative path, if this filesystem is host
     /// passthrough. The runtime uses it to load an `execve` target through its
     /// ELF loader without reaching back through this trait byte by byte; a
