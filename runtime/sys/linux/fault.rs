@@ -28,11 +28,21 @@
 //!
 //! The handler is async-signal-safe: it touches only atomics, a `Mutex` and
 //! `HashMap` whose operations never allocate, and `mprotect`. It must not call
-//! the allocator, use TLS, or panic — it runs on whatever context the store
-//! interrupted, with the guest's `FS` base still loaded.
+//! the allocator or panic — it runs on whatever context the store interrupted.
+//! A fault taken in translated code can arrive with the *guest's* FS base
+//! installed (a block prologue's lazy `wrfsbase`), and the handler's Rust can
+//! reach libc code that stores through FS-relative TLS — a contended `Mutex`
+//! falls back to a `futex` system call whose libc wrapper writes `errno` on
+//! `EAGAIN`. With the guest base installed that store lands inside the guest's
+//! TLS block (for node it hit a thread-local hash table's bucket pointer), so
+//! before running any Rust beyond the pure rip-fixup early-outs the handler
+//! swaps Chimera's own FS base back in ([`install_chimera_fs`]) and restores
+//! the interrupted base on every path back to guest code.
 
 use std::{
-    mem, ptr,
+    mem,
+    mem::offset_of,
+    ptr,
     sync::{
         Once,
         atomic::{AtomicPtr, Ordering},
@@ -41,6 +51,7 @@ use std::{
 
 use crate::{
     arch::x86::{
+        dispatch::ThreadState,
         trampoline::{fetch_copy_span, guarded_copy_fixup, in_guarded_copy},
         translate::code_cache_contains,
     },
@@ -122,15 +133,25 @@ extern "C" fn chimera_fault(
         return;
     }
 
+    // Beyond this point the handler runs Rust that can reach libc's
+    // FS-relative TLS (`errno`), so a fault taken in translated code must run
+    // it under Chimera's FS base, not the guest's (see the module comment).
+    // GS holds a `ThreadState` whenever a fault is taken in the cache, so only
+    // then can the flag and bases be consulted; a fault anywhere else already
+    // runs on Chimera's base (the exit trampolines restore it before any Rust).
+    let in_cache = code_cache_contains(rip);
+    let saved_fs = if in_cache { install_chimera_fs() } else { None };
+
     // Only a fault taken while executing translated guest code can be an SMC
     // write, and only then is the address-space lock guaranteed free on this
     // thread — it is never held across dispatch — so the handler can take it
     // without deadlocking against itself.
-    if code_cache_contains(rip) {
+    if in_cache {
         let process = PROCESS.load(Ordering::Acquire);
         if !process.is_null() {
             let process = unsafe { &*process };
             if process.addr_space.lock().unwrap().on_smc_write(fault_addr) {
+                restore_interrupted_fs(saved_fs);
                 return; // write permission restored; re-execute the store
             }
         }
@@ -147,6 +168,57 @@ extern "C" fn chimera_fault(
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = 0;
         libc::sigaction(signo, &sa, ptr::null_mut());
+    }
+    // The faulting guest instruction re-executes to terminate; hand it back
+    // the FS base it was interrupted with so the final state is faithful.
+    restore_interrupted_fs(saved_fs);
+}
+
+/// If the interrupted translated code was running with the guest's FS base
+/// installed (`ThreadState::fs_is_guest`), install Chimera's base for the
+/// handler's own Rust and return the interrupted base to restore on the way
+/// out. The interrupted base is read from the FS MSR rather than
+/// `guest_fs_base` because a guest `wrfsbase` executes natively and can leave
+/// the MSR ahead of the recorded value. Caller must ensure GS holds a
+/// `ThreadState` (true whenever a fault is taken in the code cache).
+fn install_chimera_fs() -> Option<u64> {
+    let fs_is_guest: u64;
+    unsafe {
+        std::arch::asm!(
+            "mov {x}, gs:[{off}]",
+            x = out(reg) fs_is_guest,
+            off = const offset_of!(ThreadState, fs_is_guest),
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    if fs_is_guest == 0 {
+        return None;
+    }
+    let interrupted: u64;
+    unsafe {
+        std::arch::asm!(
+            "rdfsbase {int}",
+            "mov {chi}, gs:[{off}]",
+            "wrfsbase {chi}",
+            int = out(reg) interrupted,
+            chi = out(reg) _,
+            off = const offset_of!(ThreadState, chimera_fs_base),
+            options(nostack, preserves_flags),
+        );
+    }
+    Some(interrupted)
+}
+
+/// Undo [`install_chimera_fs`] before resuming (or re-executing) guest code.
+fn restore_interrupted_fs(saved: Option<u64>) {
+    if let Some(base) = saved {
+        unsafe {
+            std::arch::asm!(
+                "wrfsbase {x}",
+                x = in(reg) base,
+                options(nostack, preserves_flags),
+            );
+        }
     }
 }
 
