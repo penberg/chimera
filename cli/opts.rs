@@ -30,6 +30,13 @@ pub struct MountCmd {
     #[argh(switch)]
     pub read_only: bool,
 
+    /// let the kernel cache entries and attributes for this many seconds.
+    /// The default 0 revalidates every operation against the live host;
+    /// a nonzero value trades bounded staleness (changes made outside the
+    /// mount may lag by up to this long) for far fewer FUSE round trips
+    #[argh(option, default = "0")]
+    pub cache: u64,
+
     /// filesystem id or path
     #[argh(positional)]
     pub filesystem: String,

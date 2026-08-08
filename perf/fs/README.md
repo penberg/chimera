@@ -2,12 +2,13 @@
 
 `fs_bench.c` measures what running a filesystem-heavy workload under Chimera's
 userspace VFS costs over native. `run.sh` builds it and runs each operation
-three ways against the same file — native, under `chimera run`, and native
-through a `chimera mount` FUSE view of an empty change-set over the live
-host — printing ns/op and each route's ratio over native. The two Chimera
-routes serve the same merged view; they differ only in how the operations
-reach the VFS: DBT syscall interception in-process, or the kernel's FUSE
-protocol round trip.
+four ways against the same file — native, under `chimera run`, and native
+through two `chimera mount` FUSE views of an empty change-set over the live
+host, one uncached (the default) and one with `--cache 60` — printing ns/op
+and each route's ratio over native. The Chimera routes serve the same merged
+view; they differ in how the operations reach the VFS (DBT syscall
+interception in-process, or the kernel's FUSE protocol) and in what the
+kernel may cache.
 
 ```
 ./run.sh
@@ -30,10 +31,13 @@ Use a release build; a debug build inflates the overhead.
 resolver cost. Pass a deeper or shallower `path` to see the resolver scale with
 depth.
 
-Read the FUSE column knowing the mount advertises zero-TTL entries and
-attributes — correctness over the live host, bought with round trips. Every
-`stat`/`open` re-looks-up (and permission-checks) each in-mount path
+Read the `fuse` column knowing the default mount advertises zero-TTL entries
+and attributes — coherence with the live host, bought with round trips.
+Every `stat`/`open` re-looks-up (and permission-checks) each in-mount path
 component, so those figures are several protocol round trips each and scale
-with depth. `read` serves its data from the kernel page cache, but the
-zero attribute TTL still forces a GETATTR revalidation per call, so its
-figure is one round trip, not a pure cache hit.
+with depth. `read` serves its data from the kernel page cache, but the zero
+attribute TTL still forces a GETATTR revalidation per call, so its figure is
+one round trip, not a pure cache hit. The `fuse-c60` column is the other end
+of the trade: with `--cache 60` the kernel answers repeated resolutions from
+its own caches, so what remains is dentry/page-cache machinery, at the price
+of staleness (bounded by the TTL) against changes made outside the mount.

@@ -12,12 +12,13 @@
 //! seen. The kernel resolves symlinks and `..` itself and looks up one
 //! component at a time, so every path handed to the [`Vfs`] is normalized
 //! and symlink-free — the same contract the namespace walker gives it.
-//! Entries and attributes are advertised with a zero TTL: the lower layer
-//! is the live host, which can change under the mount at any moment, so the
-//! kernel is never allowed to cache a resolution. One consequence of path
-//! identity: two hard links to one file report two inode numbers (their
-//! `nlink` still counts links); programs that deduplicate by inode see them
-//! as distinct files.
+//! Entries and attributes are advertised with a zero TTL by default: the
+//! lower layer is the live host, which can change under the mount at any
+//! moment, so the kernel is never allowed to cache a resolution. `--cache`
+//! raises the TTL for workloads that prefer fewer round trips over
+//! host-coherence. One consequence of path identity: two hard links to one
+//! file report two inode numbers (their `nlink` still counts links);
+//! programs that deduplicate by inode see them as distinct files.
 
 use std::{
     collections::HashMap,
@@ -111,7 +112,8 @@ fn mount(cmd: &MountCmd) -> io::Result<()> {
     if cmd.read_only {
         options.push(MountOption::RO);
     }
-    let mut session = fuser::Session::new(Bridge::new(root), &mountpoint, &options)?;
+    let bridge = Bridge::new(root, Duration::from_secs(cmd.cache));
+    let mut session = fuser::Session::new(bridge, &mountpoint, &options)?;
 
     // Unmount on SIGINT/SIGTERM. A signal handler cannot unmount (the
     // unmounter takes locks), so the signals are blocked process-wide and a
@@ -153,11 +155,6 @@ fn block_signals() -> io::Result<libc::sigset_t> {
     }
 }
 
-/// Never let the kernel cache an entry or attribute: the lower layer is the
-/// live host, and a cached resolution could outlive the host state it
-/// described.
-const TTL: Duration = Duration::ZERO;
-
 /// The reserved xattr namespace of the delta format. Bookkeeping is delta
 /// state, never part of the merged view: reads answer as if the names did
 /// not exist and writes are refused, the same rules the Personality gives a
@@ -174,6 +171,14 @@ enum Handle {
 
 struct Bridge {
     root: Arc<dyn Vfs>,
+    /// How long the kernel may cache an entry or attribute (`--cache`).
+    /// Zero, the default, forbids caching outright: the lower layer is the
+    /// live host, and a cached resolution could outlive the host state it
+    /// described. A nonzero value accepts staleness bounded by the TTL in
+    /// exchange for skipped round trips; changes made through the mount
+    /// itself stay coherent either way, since the kernel tracks its own
+    /// writes.
+    ttl: Duration,
     /// The ino⇄path table. Entries live for the session: the kernel may
     /// hold an inode number as long as the mount exists, and the table is
     /// the only thing that can turn it back into a path.
@@ -185,13 +190,14 @@ struct Bridge {
 }
 
 impl Bridge {
-    fn new(root: Arc<dyn Vfs>) -> Self {
+    fn new(root: Arc<dyn Vfs>, ttl: Duration) -> Self {
         let mut paths = HashMap::new();
         let mut inos = HashMap::new();
         paths.insert(fuser::FUSE_ROOT_ID, PathBuf::from("/"));
         inos.insert(PathBuf::from("/"), fuser::FUSE_ROOT_ID);
         Bridge {
             root,
+            ttl,
             paths,
             inos,
             next_ino: fuser::FUSE_ROOT_ID + 1,
@@ -369,7 +375,7 @@ impl fuser::Filesystem for Bridge {
             Err(e) => return reply.error(e),
         };
         match self.entry(&path) {
-            Ok((_, attr)) => reply.entry(&TTL, &attr, 0),
+            Ok((_, attr)) => reply.entry(&self.ttl, &attr, 0),
             Err(e) => reply.error(e),
         }
     }
@@ -381,7 +387,7 @@ impl fuser::Filesystem for Bridge {
             && let Ok(file) = self.file(fh)
         {
             return match file.fstat() {
-                Ok(stat) => reply.attr(&TTL, &attr(&stat, ino)),
+                Ok(stat) => reply.attr(&self.ttl, &attr(&stat, ino)),
                 Err(e) => reply.error(e.raw()),
             };
         }
@@ -390,7 +396,7 @@ impl fuser::Filesystem for Bridge {
             Err(e) => return reply.error(e),
         };
         match self.root.stat(&path, false) {
-            Ok(stat) => reply.attr(&TTL, &attr(&stat, ino)),
+            Ok(stat) => reply.attr(&self.ttl, &attr(&stat, ino)),
             Err(e) => reply.error(e.raw()),
         }
     }
@@ -454,7 +460,7 @@ impl fuser::Filesystem for Bridge {
             return reply.error(e.raw());
         }
         match self.root.stat(&path, false) {
-            Ok(stat) => reply.attr(&TTL, &attr(&stat, ino)),
+            Ok(stat) => reply.attr(&self.ttl, &attr(&stat, ino)),
             Err(e) => reply.error(e.raw()),
         }
     }
@@ -488,7 +494,7 @@ impl fuser::Filesystem for Bridge {
             return reply.error(e.raw());
         }
         match self.entry(&path) {
-            Ok((_, attr)) => reply.entry(&TTL, &attr, 0),
+            Ok((_, attr)) => reply.entry(&self.ttl, &attr, 0),
             Err(e) => reply.error(e),
         }
     }
@@ -510,7 +516,7 @@ impl fuser::Filesystem for Bridge {
             return reply.error(e.raw());
         }
         match self.entry(&path) {
-            Ok((_, attr)) => reply.entry(&TTL, &attr, 0),
+            Ok((_, attr)) => reply.entry(&self.ttl, &attr, 0),
             Err(e) => reply.error(e),
         }
     }
@@ -559,7 +565,7 @@ impl fuser::Filesystem for Bridge {
             return reply.error(e.raw());
         }
         match self.entry(&path) {
-            Ok((_, attr)) => reply.entry(&TTL, &attr, 0),
+            Ok((_, attr)) => reply.entry(&self.ttl, &attr, 0),
             Err(e) => reply.error(e),
         }
     }
@@ -613,7 +619,7 @@ impl fuser::Filesystem for Bridge {
             return reply.error(e.raw());
         }
         match self.entry(&new) {
-            Ok((_, attr)) => reply.entry(&TTL, &attr, 0),
+            Ok((_, attr)) => reply.entry(&self.ttl, &attr, 0),
             Err(e) => reply.error(e),
         }
     }
@@ -991,7 +997,7 @@ impl fuser::Filesystem for Bridge {
                 };
                 let _ = ino;
                 let fh = self.insert_handle(Handle::File(file));
-                reply.created(&TTL, &attr, 0, fh, 0);
+                reply.created(&self.ttl, &attr, 0, fh, 0);
             }
             Err(e) => reply.error(e.raw()),
         }

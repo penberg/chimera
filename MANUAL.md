@@ -480,7 +480,7 @@ candidates and confirming. `-f` skips the prompt.
 Mount a filesystem's merged view at a directory, through FUSE.
 
 ```
-chimera mount [--read-only] <filesystem> <mountpoint>
+chimera mount [--read-only] [--cache <seconds>] <filesystem> <mountpoint>
 ```
 
 The view is what a run resuming the filesystem would see: the live host
@@ -493,9 +493,21 @@ existing directory.
 
 The command runs in the foreground until the filesystem is unmounted, by
 `fusermount -u`, `umount`, or Ctrl-C. While mounted it counts as a live
-session, so `fs rm` and `fs prune` refuse to remove the filesystem. Nothing
-is cached: the kernel revalidates every entry and attribute against the
-merged view, so changes on the live host appear in the mount as they happen.
+session, so `fs rm` and `fs prune` refuse to remove the filesystem.
+
+By default nothing is cached: the kernel revalidates every entry and
+attribute against the merged view, so changes on the live host appear in
+the mount as they happen — at the cost of protocol round trips on every
+operation. `--cache <seconds>` lets the kernel trust entries and attributes
+for that long, which makes repeated resolutions near-native but means
+changes made *outside* the mount — on the live host, or by a session
+sharing the filesystem — may lag by up to the TTL; within the window a
+host-deleted file can still stat, a host-modified file can serve stale
+content, and an append through the mount can race an outside writer to the
+same file. Changes made through the mount itself stay immediately visible.
+Caching pairs naturally with `--read-only`, where the trade is pure
+staleness.
+
 One caveat of the path-keyed view: two hard links to one file report two
 inode numbers (their link counts still agree), so tools that deduplicate by
 inode see them as distinct files.
