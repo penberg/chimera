@@ -20,9 +20,9 @@ use mimalloc::MiMalloc;
 use opts::{Command, Opts, RunCmd};
 
 /// Route every Chimera-side allocation through mimalloc, whose segments are
-/// `mmap`-backed and never touch `brk`. This keeps Chimera's heap clear of the
-/// guest libc's `brk`-managed `main_arena`, which shares the one process-wide
-/// program break.
+/// `mmap`-backed and never touch `brk`, keeping Chimera's heap traffic out of
+/// the process's `brk` segment. The guest's own `brk` is virtualized by the
+/// runtime, so the real break belongs to the host libc alone.
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 

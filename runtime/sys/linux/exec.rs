@@ -91,7 +91,7 @@ pub fn execv(
         interp.as_ref(),
         stack_start,
         stack_len,
-    );
+    )?;
 
     let reason = thread.run()?;
     drive(&mut thread, reason)
@@ -162,7 +162,7 @@ pub fn drive(thread: &mut dispatch::Thread, mut reason: ExitReason) -> Result<i3
                     interp.as_ref(),
                     stack_start,
                     stack_len,
-                );
+                )?;
                 thread.enter(rip, rsp);
                 // POSIX `execve` resets caught signals to their default
                 // disposition (ignored stay ignored) and drops the alt stack.
@@ -374,8 +374,8 @@ fn record_regions(
     interp: Option<&LoadedElf>,
     stack_start: usize,
     stack_len: usize,
-) {
-    addr_space.set_program_break(current_program_break());
+) -> Result<(), Error> {
+    addr_space.init_program_break()?;
     for &(start, len) in &main.regions {
         addr_space.add_region(start as usize, len as usize);
     }
@@ -385,13 +385,7 @@ fn record_regions(
         }
     }
     addr_space.add_region(stack_start, stack_len);
-}
-
-fn current_program_break() -> usize {
-    // Guest `brk` is forwarded to the host kernel, so guest-region bookkeeping
-    // has to start from the process's live break rather than the ELF image's
-    // nominal end-of-data address.
-    unsafe { libc::syscall(libc::SYS_brk, 0) as usize }
+    Ok(())
 }
 
 /// A decoded `execve`/`execveat` request, copied out of guest memory. `raw`

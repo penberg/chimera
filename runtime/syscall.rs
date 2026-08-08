@@ -76,8 +76,8 @@ impl SystemCall {
 /// syscalls are handed to [`SystemCalls::do_syscall`], while
 /// [`SystemCalls::pre_syscall`] and [`SystemCalls::post_syscall`] can observe
 /// every guest syscall, including the few Chimera intercepts for its own
-/// correctness (`exit`, `execve`, `arch_prctl`, `mmap`, `munmap`, `mremap`,
-/// `mprotect`, `pkey_mprotect`).
+/// correctness (`exit`, `execve`, `arch_prctl`, `brk`, `mmap`, `munmap`,
+/// `mremap`, `mprotect`, `pkey_mprotect`).
 ///
 /// Chimera also rewrites the `prot` argument of `mmap`, `mprotect`, and
 /// `pkey_mprotect` before servicing them, clearing `PROT_EXEC` (see
@@ -241,10 +241,12 @@ mod host {
     /// through to the embedder.
     ///
     /// `mmap`/`munmap`/`mremap` are runtime-owned so Chimera's guest-mapping
-    /// bookkeeping stays authoritative. Successful `brk` calls still run
-    /// through the embedder, but their returned break updates that same
-    /// bookkeeping so heap pages grown through `brk` remain part of the
-    /// tracked guest address space. `mprotect`/`pkey_mprotect` are
+    /// bookkeeping stays authoritative. `brk` is runtime-owned too, and
+    /// virtualized: the guest's break lives in a private arena of Chimera's,
+    /// never the process's real program break, which stays the host libc
+    /// allocator's alone (see `AddressSpace::init_program_break`). Heap pages
+    /// grown through `brk` remain part of the tracked guest address space.
+    /// `mprotect`/`pkey_mprotect` are
     /// runtime-owned only when the entire range lies inside that tracked guest
     /// address space; otherwise they fall through to the embedder so it can
     /// enforce host-process policy. Embedders can still observe all of these in
@@ -426,10 +428,8 @@ mod host {
                 call.set_result(result);
             }
             libc::SYS_brk => {
-                handler.do_syscall(call);
-                if let Some(SyscallResult::Ok(brk)) = call.result() {
-                    thread.addr_space().update_program_break(brk as usize);
-                }
+                let brk = thread.addr_space().handle_brk(call.args[0] as usize);
+                call.set_return(brk as i64);
             }
             libc::SYS_exit => {
                 // Thread-local: end only this thread. The run loop stops on its
