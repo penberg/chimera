@@ -404,6 +404,14 @@ fn rename_exchange(a: &Path, b: &Path) -> Result<(), Errno> {
     })
 }
 
+/// Whether an entry with this metadata could be a whiteout at all: a
+/// whiteout is always an *empty* regular file — built by
+/// [`Delta::stage_whiteout`] and never written — so a file with bytes in it,
+/// and every other type, provably carries no marker and needs no xattr read.
+pub fn may_be_whiteout(md: &std::fs::Metadata) -> bool {
+    md.is_file() && md.len() == 0
+}
+
 /// `true` when the upper entry at `path` is a whiteout. A missing entry is
 /// not one, and a filesystem answer of "no such attribute" (or no xattrs at
 /// all) is an ordinary upper file.
