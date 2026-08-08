@@ -78,9 +78,8 @@ pub struct Personality {
     /// The guest's executed image — what `/proc/self/exe` names. Chimera
     /// emulates `execve` in place, so the kernel's own link points at the
     /// runtime binary; leaking that gives a self-respawning guest (Bun's
-    /// `execPath`) the runtime to exec instead of itself. Seeded by the
-    /// embedder ([`Personality::set_exe`]), updated on every committed exec
-    /// ([`SystemCalls::on_execve`]).
+    /// `execPath`) the runtime to exec instead of itself. Recorded at every
+    /// image install ([`SystemCalls::on_execve`]), the initial one included.
     exe: Mutex<Option<PathBuf>>,
 }
 
@@ -95,15 +94,6 @@ impl Personality {
             cwd: Mutex::new(normalize(&cwd)),
             exe: Mutex::new(None),
         }
-    }
-
-    /// Record the guest image the sandbox launches, for `/proc/self/exe`.
-    /// Canonicalized so the guest sees the absolute path the kernel would
-    /// store.
-    pub fn set_exe(&self, path: impl Into<PathBuf>) {
-        let path = path.into();
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
-        *self.exe.lock().unwrap() = Some(path);
     }
 }
 
@@ -493,8 +483,11 @@ impl SystemCalls for Personality {
     }
 
     fn on_execve(&self, path: &Path) {
-        // The link target of /proc/self/exe follows the exec.
-        *self.exe.lock().unwrap() = Some(path.to_path_buf());
+        // The link target of /proc/self/exe follows the exec. Canonicalized
+        // so the guest sees the absolute, symlink-resolved path the kernel
+        // would store.
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        *self.exe.lock().unwrap() = Some(path);
         // POSIX exec semantics for the table: close-on-exec entries go, the
         // rest survive into the new image with their numbers intact. Closing
         // through `FdTable::close` releases each reserved kernel number, so
