@@ -697,12 +697,15 @@ impl Personality {
     fn open(&self, dirfd: i32, pathptr: u64, flags: i32, mode: u32) -> Result<i64, Errno> {
         // open(2) ignores `mode` unless the call creates a file (O_CREAT or
         // O_TMPFILE) — the third argument is variadic and callers routinely
-        // pass a stale value on plain reads. openat2, which HostFs resolves
-        // through, instead rejects a nonzero mode on a non-creating open
-        // with EINVAL, so apply the kernel's open(2) rule before any
-        // filesystem sees it.
+        // pass a stale value on plain reads — and even on a creating open it
+        // masks everything outside the permission bits, so the common idiom
+        // open(dst, O_CREAT, src_stat.st_mode) works with S_IFREG included
+        // (libuv's uv_fs_copyfile does exactly that). openat2, which HostFs
+        // resolves through, instead rejects a nonzero mode on a non-creating
+        // open and unknown mode bits with EINVAL, so apply the kernel's
+        // open(2) rule before any filesystem sees it.
         let mode = if flags & libc::O_CREAT != 0 || flags & libc::O_TMPFILE == libc::O_TMPFILE {
-            mode
+            mode & 0o7777
         } else {
             0
         };
