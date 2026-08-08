@@ -56,6 +56,7 @@ pub fn mpk_enabled() -> bool {
 /// A sandboxed guest program, configured but not yet running.
 pub struct Sandbox {
     program: PathBuf,
+    arg0: Option<OsString>,
     args: Vec<OsString>,
     envs: Option<Vec<(OsString, OsString)>>,
     handler: Box<dyn SystemCalls>,
@@ -69,11 +70,21 @@ impl Sandbox {
         sys::mmap::init()?;
         Ok(Self {
             program: program.as_ref().to_path_buf(),
+            arg0: None,
             args: Vec::new(),
             envs: None,
             handler: Box::new(Passthrough),
             code_cache_size: DEFAULT_CODE_CACHE_SIZE,
         })
+    }
+
+    /// Set the guest's `argv[0]`, when the name the guest should see differs
+    /// from the file the loader reads — an embedder whose namespace serves
+    /// the program from a backing file elsewhere passes the guest-visible
+    /// path here. Defaults to the program path.
+    pub fn arg0(&mut self, arg0: impl AsRef<OsStr>) -> &mut Self {
+        self.arg0 = Some(arg0.as_ref().to_os_string());
+        self
     }
 
     /// Append a single argument to the guest's argv.
@@ -138,6 +149,7 @@ impl Sandbox {
         let handler = std::mem::replace(&mut self.handler, Box::new(Passthrough));
         let code = sys::exec::execv(
             &self.program,
+            self.arg0.as_deref(),
             &self.args,
             self.envs.as_deref(),
             handler,

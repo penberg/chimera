@@ -34,6 +34,7 @@ pub enum FsAction {
     Diff(FsDiffCmd),
     Apply(FsApplyCmd),
     Branch(FsBranchCmd),
+    Pull(FsPullCmd),
     Rm(FsRmCmd),
     Prune(FsPruneCmd),
 }
@@ -74,6 +75,18 @@ pub struct FsBranchCmd {
     pub filesystem: String,
 }
 
+/// Fetch a container image and keep it as an image filesystem: a complete
+/// base tree with no parent, immutable, made to be branched with --from.
+/// Prints the filesystem's id; an image already kept prints its existing id
+/// without touching the network.
+#[derive(FromArgs)]
+#[argh(subcommand, name = "pull")]
+pub struct FsPullCmd {
+    /// image locator, e.g. docker:debian:13-slim
+    #[argh(positional)]
+    pub image: String,
+}
+
 /// Remove filesystems.
 #[derive(FromArgs)]
 #[argh(subcommand, name = "rm")]
@@ -101,8 +114,9 @@ pub struct RunCmd {
     pub code_cache_size: Option<usize>,
 
     /// the branch point: `host` for the live host (the default), a kept
-    /// filesystem's id, or a path to a change-set directory — the run stacks
-    /// a fresh change-set on it and the source stays untouched
+    /// filesystem's id, a path to a change-set directory, or a container
+    /// image like `docker:debian:13-slim` — the run stacks a fresh
+    /// change-set on it and the source stays untouched
     #[argh(option, short = 'f')]
     pub from: Option<String>,
 

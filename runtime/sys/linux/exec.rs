@@ -33,16 +33,18 @@ const AT_EMPTY_PATH: i32 = 0x1000;
 
 pub fn execv(
     program: &Path,
+    arg0: Option<&OsStr>,
     args: &[OsString],
     envs: Option<&[(OsString, OsString)]>,
     handler: Box<dyn SystemCalls>,
     code_cache_size: usize,
 ) -> Result<i32, Error> {
     // The first image's argv and envp come from the embedder: argv[0] is the
-    // program path, then the supplied args; the environment is the explicit set
-    // if one was given, otherwise the host's.
+    // guest-visible program name (the program path unless overridden), then
+    // the supplied args; the environment is the explicit set if one was
+    // given, otherwise the host's.
     let mut argv: Vec<Vec<u8>> = Vec::with_capacity(args.len() + 1);
-    argv.push(program.as_os_str().as_bytes().to_vec());
+    argv.push(arg0.unwrap_or(program.as_os_str()).as_bytes().to_vec());
     for a in args {
         argv.push(a.as_bytes().to_vec());
     }
@@ -54,15 +56,17 @@ pub fn execv(
     let main = load_elf(program)?;
     let (rip, interp_base, interp) = match &main.interp {
         Some(interp_path) => {
-            let interp = load_elf(interp_path)?;
+            let interp = load_elf(&resolve_image_path(interp_path, handler.as_ref())?)?;
             (interp.entry, interp.base, Some(interp))
         }
         None => (main.entry, 0, None),
     };
+    // `AT_EXECFN` is guest-visible the same way argv[0] is; both carry the
+    // name the guest knows itself by, not the backing file the loader read.
     let (rsp, stack_start, stack_len) = build_stack(
         &argv,
         &envp,
-        program.as_os_str().as_bytes(),
+        arg0.unwrap_or(program.as_os_str()).as_bytes(),
         &main,
         interp_base,
     )?;
@@ -220,7 +224,7 @@ pub fn prepare_exec(
     let req = read_request(number, args, handler)?;
     let parsed = parse_elf(&req.path)?;
     let parsed_interp = match &parsed.interp {
-        Some(interp_path) => Some(parse_elf(interp_path)?),
+        Some(interp_path) => Some(parse_elf(&resolve_image_path(interp_path, handler)?)?),
         None => None,
     };
     Ok(PreparedExec {
@@ -228,6 +232,23 @@ pub fn prepare_exec(
         parsed,
         parsed_interp,
     })
+}
+
+/// The host file backing a guest-visible image path. `PT_INTERP` names the
+/// dynamic interpreter by its guest path, and only the handler's namespace
+/// can say which host file serves it — under an image-rooted filesystem the
+/// guest's `/lib64/ld-linux-x86-64.so.2` is the image's, not the host's, and
+/// loading the host's mixes two libcs into one process. A handler with no
+/// resolver ([`Passthrough`]) reads the path as-is.
+fn resolve_image_path(path: &Path, handler: &dyn SystemCalls) -> Result<PathBuf, Error> {
+    match handler.resolve_exec(AT_FDCWD, path.as_os_str().as_bytes(), 0) {
+        Some(Ok(host)) => Ok(host),
+        Some(Err(errno)) => Err(Error::io(
+            format!("interpreter {}", path.display()),
+            std::io::Error::from_raw_os_error(errno),
+        )),
+        None => Ok(path.to_path_buf()),
+    }
 }
 
 /// The errno a failed [`prepare_exec`] reports to the guest. `None` for

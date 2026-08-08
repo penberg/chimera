@@ -1,10 +1,11 @@
+mod docker;
 mod fs;
 mod opts;
 mod prompt;
 
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -46,6 +47,11 @@ fn version() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// What a run assembles before the sandbox starts: the merged root the guest
+/// sees, the filesystem receiving its changes (`None` under `--unsafe`), and
+/// the held base image tree when that filesystem branched an image.
+type Session = (Arc<dyn Vfs>, Option<fs::Filesystem>, Option<fs::Base>);
+
 fn run(mut cmd: RunCmd) -> ExitCode {
     // Only a shell Chimera starts on its own gets a badged prompt; a program
     // the user named runs exactly as typed.
@@ -61,14 +67,14 @@ fn run(mut cmd: RunCmd) -> ExitCode {
     // at all. The host changes only through `fs apply`. The host root must
     // exist, so its construction cannot fail.
     let host = Arc::new(HostFs::new("/").expect("host root / is a directory"));
-    let (root, fsys): (Arc<dyn Vfs>, Option<fs::Filesystem>) = if cmd.unsafe_ {
+    let (root, fsys, base): Session = if cmd.unsafe_ {
         // The explicit flags contradict --unsafe; the ambient environment
         // variable is merely inert, like any other env a script exports.
         if cmd.from.is_some() || cmd.in_.is_some() || cmd.rm {
             eprintln!("chimera: --unsafe runs without a filesystem");
             return ExitCode::FAILURE;
         }
-        (host, None)
+        (host, None, None)
     } else {
         if cmd.from.is_some() && cmd.in_.is_some() {
             eprintln!("chimera: a run either branches with --from or resumes with --in, not both");
@@ -94,10 +100,22 @@ fn run(mut cmd: RunCmd) -> ExitCode {
         if let Some(sel) = &selector
             && let Some(scheme) = fs::scheme(sel)
         {
-            eprintln!(
-                "chimera: unknown filesystem scheme \"{scheme}:\" (a path whose first component contains a colon needs a leading ./)",
-            );
-            return ExitCode::FAILURE;
+            if scheme != "docker" {
+                eprintln!(
+                    "chimera: unknown filesystem scheme \"{scheme}:\" (a path whose first component contains a colon needs a leading ./)",
+                );
+                return ExitCode::FAILURE;
+            }
+            // An image can only ever be a branch point: resuming one would
+            // falsify the provenance every branch of it depends on.
+            if resume.is_some() {
+                eprintln!(
+                    "chimera: {} is an image and immutable; branch it with --from{}",
+                    Path::new(sel).display(),
+                    if from_env { " (CHIMERA_FS)" } else { "" },
+                );
+                return ExitCode::FAILURE;
+            }
         }
         // A locator names a filesystem; the verb decides what happens to
         // it: `--from` branches, leaving the source exactly as it was, and
@@ -118,6 +136,18 @@ fn run(mut cmd: RunCmd) -> ExitCode {
             Some(sel) => fs::resume(&sel.to_string_lossy()),
             None => match &cmd.from {
                 Some(sel) if sel == "host" => fs::create(&describe(&cmd)),
+                // A docker: image resolves to a kept image filesystem —
+                // pulled now if this is its first use — and the run branches
+                // that, exactly as if its id had been named.
+                Some(sel) if fs::scheme(OsStr::new(sel)).as_deref() == Some("docker") => {
+                    match docker::pull(sel) {
+                        Ok(id) => fs::branch(&id, &describe(&cmd)),
+                        Err(err) => {
+                            eprintln!("chimera: cannot pull {sel}: {err}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
                 Some(sel) => fs::branch(sel, &describe(&cmd)),
                 None => fs::create(&describe(&cmd)),
             },
@@ -136,8 +166,33 @@ fn run(mut cmd: RunCmd) -> ExitCode {
         if from_env && let Some(sel) = &resume {
             eprintln!("chimera: --in {} (CHIMERA_FS)", Path::new(sel).display());
         }
-        match OverlayFs::new(host, &fsys.root) {
-            Ok(overlay) => (Arc::new(overlay), Some(fsys)),
+        // The change-set's lower layer: the live host, or — for a filesystem
+        // that branched an image — the image's complete tree, held for the
+        // session so removal waits for the run.
+        let base = match fs::base_of(&fsys.root).map(|sel| fs::open_base(&sel)) {
+            None => None,
+            Some(Ok(base)) => Some(base),
+            Some(Err(err)) => {
+                eprintln!("chimera: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let lower: Arc<dyn Vfs> = match &base {
+            None => host,
+            Some(b) => match HostFs::new(&b.data) {
+                Ok(image) => Arc::new(image),
+                Err(err) => {
+                    eprintln!(
+                        "chimera: cannot open image tree {}: {}",
+                        b.data.display(),
+                        io::Error::from_raw_os_error(err.raw()),
+                    );
+                    return ExitCode::FAILURE;
+                }
+            },
+        };
+        match OverlayFs::new(lower, &fsys.root) {
+            Ok(overlay) => (Arc::new(overlay), Some(fsys), base),
             Err(err) => {
                 let err = io::Error::from_raw_os_error(err.raw());
                 let hint = if err.kind() == io::ErrorKind::Unsupported {
@@ -153,8 +208,11 @@ fn run(mut cmd: RunCmd) -> ExitCode {
             }
         }
     };
-    // Held for the whole run: dropping the prompt removes the rc file.
-    let _prompt = if implicit_shell && !cmd.no_prompt {
+    // Held for the whole run: dropping the prompt removes the rc file. An
+    // image-rooted session gets no badge yet: the rc file lives on the host,
+    // and the guest's namespace bottoms out in the image tree, where the
+    // file does not exist.
+    let _prompt = if implicit_shell && !cmd.no_prompt && base.is_none() {
         match prompt::Prompt::new(fsys.as_ref()) {
             Ok(prompt) => {
                 cmd.argv.push("--rcfile".into());
@@ -170,6 +228,13 @@ fn run(mut cmd: RunCmd) -> ExitCode {
     } else {
         None
     };
+    // Under an image root the host's cwd names nothing in the guest's tree;
+    // the session starts at the image's root instead.
+    let guest_cwd = if base.is_some() {
+        PathBuf::from("/")
+    } else {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+    };
     let (program, args) = cmd.argv.split_first().expect("argv names a program");
     let program = Path::new(program);
     // Resolve the initial executable through the same merged view the
@@ -177,7 +242,7 @@ fn run(mut cmd: RunCmd) -> ExitCode {
     // replaced or deleted the program, its script, or its interpreter, and
     // the session must load the bytes the guest observes, not the lower
     // host's.
-    let program = match resolve_program(root.as_ref(), program, args) {
+    let program = match resolve_program(root.as_ref(), &guest_cwd, program, args) {
         Ok(program) => program,
         Err(err) => {
             eprintln!("chimera: {err}");
@@ -197,11 +262,27 @@ fn run(mut cmd: RunCmd) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The guest knows the program by its merged-view path; the host_exec
+    // backing file is the loader's business, not argv[0]'s.
+    sandbox.arg0(&program.exec);
     if let Some(mib) = cmd.code_cache_size {
         sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
     }
 
-    let personality = Personality::new(Namespace::with_root(root, MountFlags::NONE));
+    let mut ns = Namespace::with_root(root, MountFlags::NONE);
+    if base.is_some() {
+        // The kernel's virtual trees and the device nodes are interfaces to
+        // the running host, not content an image tarball could carry; the
+        // host serves them over the image tree. A host without one of them
+        // has nothing to mount, which is also what the guest should see.
+        for point in ["/proc", "/sys", "/dev"] {
+            if let Ok(host_tree) = HostFs::new(point) {
+                ns.mount(point, Arc::new(host_tree), MountFlags::NONE);
+            }
+        }
+    }
+    let personality = Personality::new(ns);
+    personality.set_cwd(&guest_cwd);
     personality.set_exe(&program.exec);
     sandbox.system_calls(personality);
 
@@ -232,8 +313,13 @@ struct Program {
     args: Vec<OsString>,
 }
 
-fn resolve_program(root: &dyn Vfs, program: &Path, args: &[String]) -> Result<Program, io::Error> {
-    let (exec, host_exec) = resolve_path(root, program)?;
+fn resolve_program(
+    root: &dyn Vfs,
+    cwd: &Path,
+    program: &Path,
+    args: &[String],
+) -> Result<Program, io::Error> {
+    let (exec, host_exec) = resolve_path(root, cwd, program)?;
     if let Some((interpreter, interpreter_args)) = read_shebang(&host_exec)? {
         let mut exec_args = interpreter_args;
         // Run shebang scripts through their interpreter so the runtime still
@@ -241,7 +327,7 @@ fn resolve_program(root: &dyn Vfs, program: &Path, args: &[String]) -> Result<Pr
         // script by its guest-visible name.
         exec_args.push(exec.into_os_string());
         exec_args.extend(args.iter().map(OsString::from));
-        let (exec, host_exec) = resolve_path(root, &interpreter)?;
+        let (exec, host_exec) = resolve_path(root, cwd, &interpreter)?;
         return Ok(Program {
             exec,
             host_exec,
@@ -260,9 +346,13 @@ fn resolve_program(root: &dyn Vfs, program: &Path, args: &[String]) -> Result<Pr
 /// serving it. A bare name walks `PATH` with each candidate's existence
 /// judged in the merged view, so a filesystem whiteout hides a candidate
 /// instead of letting the lower host file shadow through.
-fn resolve_path(root: &dyn Vfs, program: &Path) -> Result<(PathBuf, PathBuf), io::Error> {
+fn resolve_path(
+    root: &dyn Vfs,
+    cwd: &Path,
+    program: &Path,
+) -> Result<(PathBuf, PathBuf), io::Error> {
     if program.is_absolute() || program.components().count() > 1 {
-        let exec = absolutize(program)?;
+        let exec = absolutize(cwd, program);
         let host = root.host_path(&exec).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -274,7 +364,7 @@ fn resolve_path(root: &dyn Vfs, program: &Path) -> Result<(PathBuf, PathBuf), io
 
     let path = env::var_os("PATH").unwrap_or_default();
     for dir in env::split_paths(&path) {
-        let candidate = absolutize(&dir.join(program))?;
+        let candidate = absolutize(cwd, &dir.join(program));
         if let Some(host) = root.host_path(&candidate)
             && host.is_file()
         {
@@ -288,12 +378,12 @@ fn resolve_path(root: &dyn Vfs, program: &Path) -> Result<(PathBuf, PathBuf), io
     ))
 }
 
-/// The lexically absolute form of `path`, anchored at the current directory:
-/// the merged view is indexed by absolute guest paths.
-fn absolutize(path: &Path) -> Result<PathBuf, io::Error> {
+/// The lexically absolute form of `path`, anchored at the guest's initial
+/// working directory: the merged view is indexed by absolute guest paths.
+fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
     use std::path::Component;
 
-    let mut out = env::current_dir()?;
+    let mut out = cwd.to_path_buf();
     for c in path.components() {
         match c {
             Component::RootDir => out = PathBuf::from("/"),
@@ -304,7 +394,7 @@ fn absolutize(path: &Path) -> Result<PathBuf, io::Error> {
             Component::Normal(n) => out.push(n),
         }
     }
-    Ok(out)
+    out
 }
 
 fn read_shebang(path: &Path) -> Result<Option<(PathBuf, Vec<OsString>)>, io::Error> {
