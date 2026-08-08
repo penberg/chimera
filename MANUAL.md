@@ -327,6 +327,27 @@ Resolve on the host and re-run. A re-run recognizes its own earlier work and
 never applies a change twice, so `apply` is safe to repeat until it exits
 zero.
 
+### Browse a filesystem as a mount
+
+`chimera mount` serves a filesystem's merged view — the live host with the
+filesystem's changes applied — at a directory, through FUSE, so ordinary
+host tools can browse it without a guest running:
+
+```console
+$ mkdir /tmp/view
+$ chimera mount 51fad6cd /tmp/view
+chimera: mounted 51fad6cd at /tmp/view; unmount with `fusermount -u /tmp/view` or Ctrl-C
+```
+
+From another terminal, `/tmp/view/etc/ssh/sshd_config` is the modified copy,
+deleted files are absent, and everything the filesystem never touched shines
+through from the live host. Writes through the mount land in the change-set,
+exactly as a run resuming the filesystem would leave them — the host stays
+untouched until `fs apply` — so an editor pointed at the mount edits the
+sandbox's state in place. Pass `--read-only` to make the view immutable
+instead. The mount counts as a live session: `fs rm` and `fs prune` leave
+the filesystem alone until it is unmounted.
+
 ### Pin a filesystem in scripts
 
 A path locator names a change-set directory directly, outside the state
@@ -453,6 +474,31 @@ Remove filesystems. Refused while any live session holds one.
 
 Remove every filesystem no live session is using, after listing the
 candidates and confirming. `-f` skips the prompt.
+
+### `chimera mount`
+
+Mount a filesystem's merged view at a directory, through FUSE.
+
+```
+chimera mount [--read-only] <filesystem> <mountpoint>
+```
+
+The view is what a run resuming the filesystem would see: the live host
+below, the change-set above. Writes through the mount land in the
+change-set, so `fs diff` reports them and `fs apply` adopts them like any
+other change; `--read-only` refuses writes at the mount. The filesystem is
+named as `--in` names one — an id names a kept filesystem, a path names a
+change-set directory, created on first use — and the mountpoint must be an
+existing directory.
+
+The command runs in the foreground until the filesystem is unmounted, by
+`fusermount -u`, `umount`, or Ctrl-C. While mounted it counts as a live
+session, so `fs rm` and `fs prune` refuse to remove the filesystem. Nothing
+is cached: the kernel revalidates every entry and attribute against the
+merged view, so changes on the live host appear in the mount as they happen.
+One caveat of the path-keyed view: two hard links to one file report two
+inode numbers (their link counts still agree), so tools that deduplicate by
+inode see them as distinct files.
 
 ### `chimera version`
 

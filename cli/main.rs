@@ -1,4 +1,6 @@
 mod fs;
+mod fuser;
+mod mount;
 mod opts;
 mod prompt;
 
@@ -28,6 +30,7 @@ fn main() -> ExitCode {
     let opts: Opts = argh::from_env();
     match opts.command {
         Command::Run(cmd) => run(cmd),
+        Command::Mount(cmd) => mount::command(cmd),
         Command::Version(_) => version(),
         Command::Fs(cmd) => fs::command(cmd.action),
     }

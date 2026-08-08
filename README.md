@@ -51,7 +51,8 @@ The wrapped process sees the host filesystem exactly as it is, but every write,
 rename, and delete it makes lands in a private change-set rather than on the
 host. Every run keeps its change-set under a short id: inspect it with
 `chimera fs diff`, resume it with `chimera run --in <id>`, branch it with
-`--from <id>`, or adopt it onto the host with `chimera fs apply`. `--rm`
+`--from <id>`, browse it as a FUSE mount with `chimera mount <id> <dir>`, or
+adopt it onto the host with `chimera fs apply`. `--rm`
 discards it on exit, and `--unsafe` runs without one, the process mutating the
 host directly.
 
