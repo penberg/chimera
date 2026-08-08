@@ -175,12 +175,11 @@ fn run(mut cmd: RunCmd) -> ExitCode {
     };
     let (program, args) = cmd.argv.split_first().expect("argv names a program");
     let program = Path::new(program);
-    // Resolve the initial executable through the same merged view the
-    // guest's own syscalls will see: an inherited change-set may have
-    // replaced or deleted the program, its script, or its interpreter, and
-    // the session must load the bytes the guest observes, not the lower
-    // host's.
-    let program = match resolve_program(root.as_ref(), program, args) {
+    // Resolve a bare name through `PATH` with existence judged in the same
+    // merged view the guest's own syscalls will see, and report a missing
+    // program here, before a session starts. The runtime re-resolves the
+    // guest path — shebang splice included — when it installs the image.
+    let program = match resolve_program(root.as_ref(), program) {
         Ok(program) => program,
         Err(err) => {
             eprintln!("chimera: {err}");
@@ -190,7 +189,7 @@ fn run(mut cmd: RunCmd) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut sandbox = match Sandbox::new(&program.host_exec) {
+    let mut sandbox = match Sandbox::new(&program) {
         Ok(sandbox) => sandbox,
         Err(err) => {
             eprintln!("chimera: {err}");
@@ -205,10 +204,9 @@ fn run(mut cmd: RunCmd) -> ExitCode {
     }
 
     let personality = Personality::new(Namespace::with_root(root, MountFlags::NONE));
-    personality.set_exe(&program.exec);
     sandbox.system_calls(personality);
 
-    let result = sandbox.args(&program.args).run();
+    let result = sandbox.args(args).run();
     if let Some(fsys) = fsys {
         fsys.finish(cmd.rm);
     }
@@ -226,53 +224,20 @@ fn describe(cmd: &RunCmd) -> String {
     cmd.argv.join(" ")
 }
 
-struct Program {
-    /// The guest-visible executable path — what `/proc/self/exe` reports.
-    exec: PathBuf,
-    /// The host file serving `exec` through the merged view; where the ELF
-    /// loader actually reads.
-    host_exec: PathBuf,
-    args: Vec<OsString>,
-}
-
-fn resolve_program(root: &dyn Vfs, program: &Path, args: &[String]) -> Result<Program, io::Error> {
-    let (exec, host_exec) = resolve_path(root, program)?;
-    if let Some((interpreter, interpreter_args)) = read_shebang(&host_exec)? {
-        let mut exec_args = interpreter_args;
-        // Run shebang scripts through their interpreter so the runtime still
-        // only has to execute ELF binaries. The interpreter re-opens the
-        // script by its guest-visible name.
-        exec_args.push(exec.into_os_string());
-        exec_args.extend(args.iter().map(OsString::from));
-        let (exec, host_exec) = resolve_path(root, &interpreter)?;
-        return Ok(Program {
-            exec,
-            host_exec,
-            args: exec_args,
-        });
-    }
-
-    Ok(Program {
-        exec,
-        host_exec,
-        args: args.iter().map(OsString::from).collect(),
-    })
-}
-
-/// Resolve `program` to its guest-visible absolute path and the host file
-/// serving it. A bare name walks `PATH` with each candidate's existence
-/// judged in the merged view, so a filesystem whiteout hides a candidate
-/// instead of letting the lower host file shadow through.
-fn resolve_path(root: &dyn Vfs, program: &Path) -> Result<(PathBuf, PathBuf), io::Error> {
+/// Resolve `program` to its guest-visible absolute path. A bare name walks
+/// `PATH` with each candidate's existence judged in the merged view, so a
+/// filesystem whiteout hides a candidate instead of letting the lower host
+/// file shadow through.
+fn resolve_program(root: &dyn Vfs, program: &Path) -> Result<PathBuf, io::Error> {
     if program.is_absolute() || program.components().count() > 1 {
         let exec = absolutize(program)?;
-        let host = root.host_path(&exec).ok_or_else(|| {
+        root.host_path(&exec).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("program {:?}: no such file or directory", exec.display()),
             )
         })?;
-        return Ok((exec, host));
+        return Ok(exec);
     }
 
     let path = env::var_os("PATH").unwrap_or_default();
@@ -281,7 +246,7 @@ fn resolve_path(root: &dyn Vfs, program: &Path) -> Result<(PathBuf, PathBuf), io
         if let Some(host) = root.host_path(&candidate)
             && host.is_file()
         {
-            return Ok((candidate, host));
+            return Ok(candidate);
         }
     }
 
@@ -308,37 +273,4 @@ fn absolutize(path: &Path) -> Result<PathBuf, io::Error> {
         }
     }
     Ok(out)
-}
-
-fn read_shebang(path: &Path) -> Result<Option<(PathBuf, Vec<OsString>)>, io::Error> {
-    let bytes = std::fs::read(path)?;
-    if !bytes.starts_with(b"#!") {
-        return Ok(None);
-    }
-
-    let line_end = bytes
-        .iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or(bytes.len());
-    let line = bytes[2..line_end]
-        .strip_suffix(b"\r")
-        .unwrap_or(&bytes[2..line_end]);
-    let line = String::from_utf8_lossy(line);
-    let words = shlex::split(&line).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid shebang in {}", path.display()),
-        )
-    })?;
-    let Some((interpreter, args)) = words.split_first() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("empty shebang in {}", path.display()),
-        ));
-    };
-
-    Ok(Some((
-        PathBuf::from(interpreter),
-        args.iter().map(OsString::from).collect(),
-    )))
 }

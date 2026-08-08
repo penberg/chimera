@@ -135,9 +135,12 @@ pub trait SystemCalls: Send + Sync {
         None
     }
 
-    /// The guest committed an `execve`: drop whatever close-on-exec state the
-    /// handler virtualizes, before the runtime's own sweep applies host-side
-    /// `FD_CLOEXEC` (see `close_cloexec_fds` in `crate::sys::linux::exec`). A
+    /// An image install committed — a guest `execve`, or the initial program
+    /// a [`Sandbox`](crate::Sandbox) run loads: drop whatever close-on-exec
+    /// state the handler virtualizes, before the runtime's own sweep applies
+    /// host-side `FD_CLOEXEC` (see `close_cloexec_fds` in
+    /// `crate::sys::linux::exec`; the initial install has no sweep, since the
+    /// runtime's own inherited descriptors are not the guest's to lose). A
     /// handler that owns a descriptor table closes its close-on-exec entries
     /// here — their close-on-exec flag lives in the table, not on a host fd,
     /// so the runtime's sweep cannot see it. The default does nothing, since

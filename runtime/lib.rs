@@ -63,7 +63,11 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
-    /// Create a new sandbox for the given program.
+    /// Create a new sandbox for the given program. The path is the
+    /// guest-visible name: [`Sandbox::run`] resolves and installs it exactly
+    /// like a guest `execve` target — through the handler's namespace, `#!`
+    /// scripts spliced onto their interpreter — so the initial program comes
+    /// from the same view the guest's own execs use.
     pub fn new(program: impl AsRef<Path>) -> Result<Self, Error> {
         arch::init()?;
         sys::mmap::init()?;

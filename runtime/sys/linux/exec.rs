@@ -40,7 +40,10 @@ pub fn execv(
 ) -> Result<i32, Error> {
     // The first image's argv and envp come from the embedder: argv[0] is the
     // program path, then the supplied args; the environment is the explicit set
-    // if one was given, otherwise the host's.
+    // if one was given, otherwise the host's. The program path is the
+    // guest-visible name, resolved and installed exactly like a guest `execve`
+    // target — handler namespace, shebang splice, and `on_execve` report — so
+    // the initial image comes from the same view the guest's own execs use.
     let mut argv: Vec<Vec<u8>> = Vec::with_capacity(args.len() + 1);
     argv.push(program.as_os_str().as_bytes().to_vec());
     for a in args {
@@ -50,8 +53,17 @@ pub fn execv(
         Some(over) => over.iter().map(|(k, v)| env_pair(k, v)).collect(),
         None => std::env::vars_os().map(|(k, v)| env_pair(&k, &v)).collect(),
     };
+    let raw = program.as_os_str().as_bytes().to_vec();
+    let path = resolve_exec_path(AT_FDCWD, &raw, 0, &*handler)?;
+    let mut req = ExecRequest {
+        path,
+        raw,
+        argv,
+        envp,
+    };
+    splice_shebang(&mut req, &*handler)?;
 
-    let main = load_elf(program)?;
+    let main = load_elf(&req.path)?;
     let (rip, interp_base, interp) = match &main.interp {
         Some(interp_path) => {
             let interp = load_elf(interp_path)?;
@@ -59,13 +71,9 @@ pub fn execv(
         }
         None => (main.entry, 0, None),
     };
-    let (rsp, stack_start, stack_len) = build_stack(
-        &argv,
-        &envp,
-        program.as_os_str().as_bytes(),
-        &main,
-        interp_base,
-    )?;
+    handler.on_execve(&req.path);
+    let (rsp, stack_start, stack_len) =
+        build_stack(&req.argv, &req.envp, &req.raw, &main, interp_base)?;
 
     // The process's shared state: the address space, code cache, and the
     // embedder's syscall handler. The first thread is created against it; future
@@ -218,41 +226,7 @@ pub fn prepare_exec(
     handler: &dyn SystemCalls,
 ) -> Result<PreparedExec, Error> {
     let mut req = read_request(number, args, handler)?;
-    // A `#!` script executes through its interpreter line, spliced the way
-    // the kernel's script loader does it: argv becomes the interpreter, its
-    // optional argument, the script's pathname as the caller wrote it, then
-    // the caller's argv past argv[0]. The interpreter may itself be a
-    // script, to the kernel's nesting depth; one level deeper falls through
-    // to `parse_elf`, whose failure reports `ENOEXEC`.
-    let mut script = if req.raw.is_empty() {
-        req.path.as_os_str().as_bytes().to_vec()
-    } else {
-        req.raw.clone()
-    };
-    for _ in 0..4 {
-        let Some((interp, optarg)) = shebang_line(&req.path)? else {
-            break;
-        };
-        let mut argv: Vec<Vec<u8>> = Vec::with_capacity(req.argv.len() + 2);
-        argv.push(interp.clone());
-        if let Some(arg) = optarg {
-            argv.push(arg);
-        }
-        argv.push(script);
-        argv.extend(req.argv.iter().skip(1).cloned());
-        req.argv = argv;
-        req.path = match handler.resolve_exec(AT_FDCWD, &interp, 0) {
-            Some(Ok(path)) => path,
-            Some(Err(errno)) => {
-                return Err(Error::io(
-                    "execve",
-                    std::io::Error::from_raw_os_error(errno),
-                ));
-            }
-            None => resolve_at(AT_FDCWD, &interp, 0, handler),
-        };
-        script = interp;
-    }
+    splice_shebang(&mut req, handler)?;
     let parsed = parse_elf(&req.path)?;
     let parsed_interp = match &parsed.interp {
         Some(interp_path) => Some(parse_elf(interp_path)?),
@@ -273,6 +247,57 @@ pub fn exec_errno(err: &Error) -> Option<i32> {
         Error::BadBinary(_) | Error::Link(_) | Error::Unsupported(_) => Some(libc::ENOEXEC),
         Error::BadAccess(_) => Some(libc::EFAULT),
         Error::CodeCacheExhausted | Error::Translate(_) => None,
+    }
+}
+
+/// Execute a `#!` script through its interpreter line, spliced the way the
+/// kernel's script loader does it: argv becomes the interpreter, its
+/// optional argument, the script's pathname as the caller wrote it, then
+/// the caller's argv past argv[0], and the request's path becomes the
+/// interpreter's, resolved through the handler's namespace. The interpreter
+/// may itself be a script, to the kernel's nesting depth; one level deeper
+/// falls through to `parse_elf`, whose failure reports `ENOEXEC`. A request
+/// naming a plain ELF passes through untouched.
+fn splice_shebang(req: &mut ExecRequest, handler: &dyn SystemCalls) -> Result<(), Error> {
+    let mut script = if req.raw.is_empty() {
+        req.path.as_os_str().as_bytes().to_vec()
+    } else {
+        req.raw.clone()
+    };
+    for _ in 0..4 {
+        let Some((interp, optarg)) = shebang_line(&req.path)? else {
+            break;
+        };
+        let mut argv: Vec<Vec<u8>> = Vec::with_capacity(req.argv.len() + 2);
+        argv.push(interp.clone());
+        if let Some(arg) = optarg {
+            argv.push(arg);
+        }
+        argv.push(script);
+        argv.extend(req.argv.iter().skip(1).cloned());
+        req.argv = argv;
+        req.path = resolve_exec_path(AT_FDCWD, &interp, 0, handler)?;
+        script = interp;
+    }
+    Ok(())
+}
+
+/// Resolve an exec target to the host path the ELF loader reads: the
+/// handler's namespace when it claims the resolution, the runtime's default
+/// rules (see [`resolve_at`]) when it defers.
+fn resolve_exec_path(
+    dirfd: i32,
+    raw: &[u8],
+    flags: i32,
+    handler: &dyn SystemCalls,
+) -> Result<PathBuf, Error> {
+    match handler.resolve_exec(dirfd, raw, flags) {
+        Some(Ok(path)) => Ok(path),
+        Some(Err(errno)) => Err(Error::io(
+            "execve",
+            std::io::Error::from_raw_os_error(errno),
+        )),
+        None => Ok(resolve_at(dirfd, raw, flags, handler)),
     }
 }
 
@@ -400,16 +425,7 @@ fn read_request(
         (AT_FDCWD, args[0], 0, args[1], args[2])
     };
     let raw = read_guest_cstr(rawptr, libc::PATH_MAX as usize, libc::ENAMETOOLONG)?;
-    let path = match handler.resolve_exec(dirfd, &raw, flags) {
-        Some(Ok(path)) => path,
-        Some(Err(errno)) => {
-            return Err(Error::io(
-                "execve",
-                std::io::Error::from_raw_os_error(errno),
-            ));
-        }
-        None => resolve_at(dirfd, &raw, flags, handler),
-    };
+    let path = resolve_exec_path(dirfd, &raw, flags, handler)?;
     Ok(ExecRequest {
         path,
         raw,

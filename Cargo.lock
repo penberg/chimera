@@ -61,7 +61,6 @@ dependencies = [
  "libc",
  "log",
  "mimalloc",
- "shlex",
  "smallvec",
  "zerocopy",
 ]
