@@ -14,8 +14,36 @@ pub struct Opts {
 #[argh(subcommand)]
 pub enum Command {
     Run(RunCmd),
+    Mount(MountCmd),
     Version(VersionCmd),
     Fs(FsCmd),
+}
+
+/// Mount a filesystem's merged view — the live host with the filesystem's
+/// changes applied — at a directory, through FUSE. Writes land in the
+/// filesystem's change-set, exactly as a run resuming it would leave them.
+/// Runs until unmounted (`fusermount -u`, `umount`, or Ctrl-C).
+#[derive(FromArgs)]
+#[argh(subcommand, name = "mount")]
+pub struct MountCmd {
+    /// mount read-only: the merged view is browsable but immutable
+    #[argh(switch)]
+    pub read_only: bool,
+
+    /// let the kernel cache entries and attributes for this many seconds.
+    /// The default 0 revalidates every operation against the live host;
+    /// a nonzero value trades bounded staleness (changes made outside the
+    /// mount may lag by up to this long) for far fewer FUSE round trips
+    #[argh(option, default = "0")]
+    pub cache: u64,
+
+    /// filesystem id or path
+    #[argh(positional)]
+    pub filesystem: String,
+
+    /// directory to mount at
+    #[argh(positional)]
+    pub mountpoint: String,
 }
 
 /// Manage filesystems: the change-sets kept runs leave behind.
