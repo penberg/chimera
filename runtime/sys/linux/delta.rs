@@ -17,6 +17,10 @@
 //! `user.chimera.origin`. The delta must therefore sit on a filesystem with
 //! user xattrs (ext4, XFS, btrfs, tmpfs); [`Delta::open`] probes for them and
 //! refuses at startup rather than failing at the first unlink.
+//!
+//! `<delta>/taint` is one byte that says whether `data/` has ever held an
+//! entry, mapped `MAP_SHARED` by every process over the delta so cleanliness
+//! is a memory load, not a probe. See [`Delta::is_clean`].
 
 use std::{
     ffi::{CStr, CString},
@@ -25,7 +29,7 @@ use std::{
         unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU8, AtomicU64, Ordering},
 };
 
 use super::vfs::Errno;
@@ -49,6 +53,81 @@ pub struct Delta {
     /// Distinguishes concurrent stagings within one process; the pid in the
     /// staging name keeps forked processes apart.
     staging_seq: AtomicU64,
+    taint: TaintFlag,
+}
+
+/// One shared byte that says whether the upper tree has ever held an entry:
+/// a `MAP_SHARED` mapping of the `<delta>/taint` file, so every process over
+/// the delta — forked guest processes and concurrent sessions alike — reads
+/// the same page-cache byte with a plain load, no syscall. Monotonic: set
+/// before a first mutation publishes, never cleared.
+struct TaintFlag {
+    byte: std::ptr::NonNull<AtomicU8>,
+}
+
+// The mapping is plain shared memory accessed through an atomic.
+unsafe impl Send for TaintFlag {}
+unsafe impl Sync for TaintFlag {}
+
+impl TaintFlag {
+    /// Failure refuses the delta: a session without the mapping could write
+    /// upper entries with `taint` a no-op, while sessions that did map the
+    /// byte keep trusting a cleanliness the writes have falsified.
+    fn open(path: &Path) -> Result<TaintFlag, Errno> {
+        let cpath = cpath(path)?;
+        // O_NOFOLLOW, and the inode is validated before the ftruncate below:
+        // in a crafted delta the name could be a symlink to (or a hard link
+        // of) any writable file, and truncating through it would corrupt the
+        // target. Only what this format creates — a private one-byte regular
+        // file — is accepted.
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o644,
+            )
+        };
+        if fd < 0 {
+            return Err(last_errno());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+            return Err(last_errno());
+        }
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG || st.st_nlink != 1 || st.st_size > 1 {
+            return Err(Errno::EINVAL);
+        }
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), 1) } < 0 {
+            return Err(last_errno());
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                1,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(last_errno());
+        }
+        Ok(TaintFlag {
+            byte: std::ptr::NonNull::new(ptr as *mut AtomicU8).ok_or(Errno::EINVAL)?,
+        })
+    }
+
+    fn get(&self) -> &AtomicU8 {
+        unsafe { self.byte.as_ref() }
+    }
+}
+
+impl Drop for TaintFlag {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.byte.as_ptr() as *mut libc::c_void, 1) };
+    }
 }
 
 impl Delta {
@@ -59,15 +138,46 @@ impl Delta {
     /// xattrs.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, Errno> {
         let root = root.into();
+        let data = root.join("data");
+        let tmp = root.join("tmp");
+        std::fs::create_dir_all(&data).map_err(|e| Errno::from_io(&e))?;
+        std::fs::create_dir_all(&tmp).map_err(|e| Errno::from_io(&e))?;
         let delta = Self {
-            data: root.join("data"),
-            tmp: root.join("tmp"),
+            data,
+            tmp,
             staging_seq: AtomicU64::new(0),
+            taint: TaintFlag::open(&root.join("taint"))?,
         };
-        std::fs::create_dir_all(&delta.data).map_err(|e| Errno::from_io(&e))?;
-        std::fs::create_dir_all(&delta.tmp).map_err(|e| Errno::from_io(&e))?;
         delta.probe_xattrs()?;
+        // A reattach may find upper state the flag file predates (a delta
+        // from before the flag existed, or a branch copy that carried only
+        // `data/`): entries in the tree, or a mutation to the root itself,
+        // whose claimed identity (origin) or opacity is bookkeeping on
+        // `data/` with no child entry to betray it. Taint by inspection so
+        // cleanliness always implies an untouched upper; inspection errors
+        // read as tainted.
+        let root_claimed = origin(&delta.data).map_or(true, |o| o.is_some())
+            || is_opaque(&delta.data).unwrap_or(true);
+        match std::fs::read_dir(&delta.data).map(|mut entries| entries.next()) {
+            Ok(None) if !root_claimed => {}
+            _ => delta.taint(),
+        }
         Ok(delta)
+    }
+
+    /// Whether the upper tree has never held an entry. While clean, the
+    /// merged view is the lower verbatim — no shadow, no whiteout, no opaque
+    /// marker can exist, whatever path a symlink expansion takes — which is
+    /// what licenses the overlay's one-syscall stat. The mutators taint
+    /// before their first write publishes; the taint byte's store retires
+    /// before the publishing syscall enters the kernel, so a reader that
+    /// still observes a clean flag also observes the upper without the entry.
+    pub fn is_clean(&self) -> bool {
+        self.taint.get().load(Ordering::Acquire) == 0
+    }
+
+    fn taint(&self) {
+        self.taint.get().store(1, Ordering::Release);
     }
 
     /// The upper file backing a mount-relative guest path.
@@ -118,6 +228,11 @@ impl Delta {
     /// Parents materialize lazily — only when something lands beneath them —
     /// so an untouched subtree leaves no trace in the delta.
     pub fn materialize_parents(&self, rel: &Path) -> Result<(), Errno> {
+        // Every first entry a clean delta gains — a create's parents, a
+        // whiteout, a copy-up — passes through here (or through `scaffold`/
+        // `copy_up_dir`) before it publishes; the remaining mutators only
+        // ever touch upper state that already exists.
+        self.taint();
         if let Some(parent) = self.data_path(rel).parent() {
             std::fs::create_dir_all(parent).map_err(|e| Errno::from_io(&e))?;
         }
@@ -129,6 +244,7 @@ impl Delta {
     /// identity. A scaffold carries no origin, which is what keeps stat
     /// serving the lower directory it merges with.
     pub fn scaffold(&self, rel: &Path) -> Result<(), Errno> {
+        self.taint();
         std::fs::create_dir_all(self.data_path(rel)).map_err(|e| Errno::from_io(&e))
     }
 
@@ -138,6 +254,7 @@ impl Delta {
     /// lands last, so an interruption leaves ordinary scaffolding — which
     /// keeps serving the lower — never a half-claimed directory.
     pub fn copy_up_dir(&self, src: &Path, rel: &Path) -> Result<(), Errno> {
+        self.taint();
         let csrc = cpath(src)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         check(unsafe { libc::stat(csrc.as_ptr(), &mut st) })?;
@@ -777,6 +894,61 @@ mod tests {
         assert!(scratch.join("delta/tmp").is_dir());
         // Reopening an existing delta is how attach and fork see it.
         assert!(Delta::open(scratch.join("delta")).is_ok());
+    }
+
+    /// A mutation aimed at the root itself leaves `data/` without a single
+    /// child entry — its whole record is bookkeeping on the directory. A
+    /// branch copy carries `data/` but not the taint file, so the attach
+    /// inspection must read the root's claim, not just its entries.
+    #[test]
+    fn reattach_reads_a_claimed_root_as_tainted() {
+        let scratch = Scratch::new();
+        let Some(d) = delta(&scratch) else { return };
+        assert!(d.is_clean());
+
+        let data = scratch.join("delta/data");
+        let cdata = cpath(&data).unwrap();
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::stat(cdata.as_ptr(), &mut st) }, 0);
+        record_origin(&data, &Origin::of(&st)).unwrap();
+        drop(d);
+        std::fs::remove_file(scratch.join("delta/taint")).unwrap();
+
+        let reattached = Delta::open(scratch.join("delta")).unwrap();
+        assert!(!reattached.is_clean());
+    }
+
+    /// Without the shared byte a session's `taint` would be a no-op while
+    /// other sessions keep trusting the zero they mapped; such a delta is
+    /// refused, like one whose filesystem cannot carry the xattrs.
+    #[test]
+    fn open_refuses_an_unmappable_taint_flag() {
+        let scratch = Scratch::new();
+        let Some(_) = delta(&scratch) else { return };
+        std::fs::remove_file(scratch.join("delta/taint")).unwrap();
+        std::fs::create_dir(scratch.join("delta/taint")).unwrap();
+        assert!(Delta::open(scratch.join("delta")).is_err());
+    }
+
+    /// In a crafted delta the taint name may lead elsewhere — a symlink to,
+    /// or a hard link of, a writable file. Opening must not follow it, and
+    /// the truncate-to-one-byte must never reach the foreign inode.
+    #[test]
+    fn open_refuses_a_planted_taint_flag() {
+        let scratch = Scratch::new();
+        let Some(_) = delta(&scratch) else { return };
+        let victim = scratch.join("victim");
+        std::fs::write(&victim, b"do not truncate").unwrap();
+
+        std::fs::remove_file(scratch.join("delta/taint")).unwrap();
+        std::os::unix::fs::symlink(&victim, scratch.join("delta/taint")).unwrap();
+        assert!(Delta::open(scratch.join("delta")).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not truncate");
+
+        std::fs::remove_file(scratch.join("delta/taint")).unwrap();
+        std::fs::hard_link(&victim, scratch.join("delta/taint")).unwrap();
+        assert!(Delta::open(scratch.join("delta")).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not truncate");
     }
 
     #[test]

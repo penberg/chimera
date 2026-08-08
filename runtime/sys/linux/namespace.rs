@@ -112,15 +112,17 @@ impl Namespace {
             // walk, the normalized path is the canonical one. Anything the
             // proof cannot cover — a symlink, a missing component, a
             // shadowed prefix — walks below.
-            let norm = normalize(path);
-            if let Some(st) = m.fs.resolve_fast(&norm) {
-                return Ok(Resolved {
-                    fs: Arc::clone(&m.fs),
-                    rel: norm.clone(),
-                    writable: !m.flags.rdonly,
-                    abs: norm,
-                    stat: Some(st),
-                });
+            if normalizes_exactly(path) {
+                let norm = normalize(path);
+                if let Some(st) = m.fs.resolve_fast(&norm) {
+                    return Ok(Resolved {
+                        fs: Arc::clone(&m.fs),
+                        rel: norm.clone(),
+                        writable: !m.flags.rdonly,
+                        abs: norm,
+                        stat: Some(st),
+                    });
+                }
             }
         }
 
@@ -134,6 +136,7 @@ impl Namespace {
                 Part::Dot => continue,
                 Part::DotDot => {
                     acc.pop(); // popping at `/` stays at `/` — confined
+                    last = None; // the remembered stat named the popped child
                     continue;
                 }
                 Part::Name(name) => name,
@@ -189,9 +192,17 @@ impl Namespace {
             if m.fs.confines() {
                 return m.fs.stat(path, follow);
             }
+            // The raw path, not the normalized one: the whole-path fast path
+            // resolves with kernel semantics, where `..` acts on the
+            // symlink-expanded chain, which lexical normalization cannot know.
+            if let Some(r) = m.fs.stat_fast(path, follow) {
+                return r;
+            }
             // The follow flag is moot on the fast path: it proved no symlink
             // participates, final component included.
-            if let Some(st) = m.fs.resolve_fast(&normalize(path)) {
+            if normalizes_exactly(path)
+                && let Some(st) = m.fs.resolve_fast(&normalize(path))
+            {
                 return Ok(st);
             }
         }
@@ -256,6 +267,15 @@ pub fn normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Whether [`normalize`] preserves the path's meaning. Removing `..`
+/// lexically assumes the component before it is a real directory, but a
+/// symlink there makes `..` act on the expanded target — and which
+/// components are symlinks is exactly what the lexical fast paths do not
+/// know, so a `..` anywhere sends the path to the walk.
+fn normalizes_exactly(path: &Path) -> bool {
+    !path.components().any(|c| matches!(c, Component::ParentDir))
 }
 
 #[cfg(test)]
