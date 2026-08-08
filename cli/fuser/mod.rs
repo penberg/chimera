@@ -6,7 +6,8 @@
 //!
 //! Vendored from AgentFS (<https://github.com/tursodatabase/agentfs>), itself
 //! a vendored fork of the `fuser` crate, with the `nix`, `page_size`, and
-//! `memchr` dependencies replaced by `libc` and `std` equivalents.
+//! `memchr` dependencies replaced by `libc` and `std` equivalents. `fuser`
+//! is MIT-licensed; the license rides along as `licenses/LICENSE-fuser.md`.
 
 #![allow(
     missing_docs,
