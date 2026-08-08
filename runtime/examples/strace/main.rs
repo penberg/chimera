@@ -17,8 +17,9 @@
 use mimalloc::MiMalloc;
 
 /// Route this embedder's allocations through mimalloc's `mmap`-backed
-/// segments, keeping Chimera's heap off the guest libc's shared `brk`.
-/// A `#[global_allocator]` is per-binary, so every embedder needs its own.
+/// segments, keeping the embedder's heap traffic out of the process's `brk`
+/// segment. A `#[global_allocator]` is per-binary, so every embedder needs
+/// its own.
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 

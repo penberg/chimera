@@ -21,7 +21,7 @@ A workable starter policy for a dynamically linked binary looks
 something like:
 
     cargo run --example sandbox -- \
-        --allow '^(read|write|close|fstat|lseek|brk|set_tid_address|set_robust_list|rseq|prlimit64|getrandom|openat|newfstatat|pread64)$' \
+        --allow '^(read|write|close|fstat|lseek|set_tid_address|set_robust_list|rseq|prlimit64|getrandom|openat|newfstatat|pread64)$' \
         /bin/echo hi
 
 Less is more revealing — start with `--allow '^write$'` and let the

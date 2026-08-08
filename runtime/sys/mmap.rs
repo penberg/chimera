@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashSet,
-    io,
+    io, ptr,
     sync::{
         OnceLock,
         atomic::{AtomicI32, Ordering},
@@ -17,6 +17,13 @@ use crate::{
 
 /// Guest page size (x86-64); SMC arming and invalidation work per page.
 const PAGE: usize = 4096;
+
+/// Size of the guest's break arena. `PROT_NONE` + `MAP_NORESERVE`, so the
+/// reservation costs address space only until the guest grows into it. A guest
+/// whose `brk` outgrows the arena sees the call fail with the break unchanged —
+/// the same face the kernel shows when `RLIMIT_DATA` is exhausted — and every
+/// mainstream allocator falls back to `mmap`.
+const BREAK_ARENA_LEN: usize = 1 << 30;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Region {
@@ -45,6 +52,9 @@ pub struct AddressSpace {
     /// does not allocate in the common case.
     granted: HashSet<usize>,
     program_break: Option<usize>,
+    /// The reservation the guest's virtualized `brk` lives in; see
+    /// [`AddressSpace::init_program_break`].
+    break_arena: Option<Region>,
 }
 
 impl AddressSpace {
@@ -57,6 +67,7 @@ impl AddressSpace {
             armed: HashSet::new(),
             granted,
             program_break: None,
+            break_arena: None,
         })
     }
 
@@ -254,21 +265,92 @@ impl AddressSpace {
         self.granted.clear();
     }
 
-    pub fn set_program_break(&mut self, brk: usize) {
-        self.program_break = Some(brk);
+    /// Reserve the guest's break arena and place the initial program break at
+    /// its base.
+    ///
+    /// The guest's `brk` is virtualized over this private reservation, never
+    /// the process's real program break. Chimera and the guest share one
+    /// address space, and the host libc's `malloc` keeps a `brk`-backed
+    /// `main_arena` that a Rust `#[global_allocator]` cannot shield — glibc's
+    /// internal callers (`opendir`, `getaddrinfo`, …) reach `__libc_malloc`
+    /// directly. A guest moving the shared kernel break would interleave two
+    /// allocators on one segment, and unmapping guest-grown break pages at
+    /// teardown would punch a hole below the break that the host allocator
+    /// later grows across. Keeping the guest break in a runtime-owned arena
+    /// leaves the real break with a single owner for the process's lifetime.
+    pub fn init_program_break(&mut self) -> Result<(), Error> {
+        let addr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                BREAK_ARENA_LEN,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            return Err(Error::io("break arena", io::Error::last_os_error()));
+        }
+        let start = addr as usize;
+        self.break_arena = Some(Region {
+            start,
+            len: BREAK_ARENA_LEN,
+        });
+        self.program_break = Some(start);
+        Ok(())
     }
 
-    pub fn update_program_break(&mut self, brk: usize) {
-        if let Some(old_brk) = self.program_break {
-            let old_end = round_mapping_len(old_brk);
-            let new_end = round_mapping_len(brk);
-            if new_end > old_end {
-                self.add_region(old_end, new_end - old_end);
-            } else if new_end < old_end {
-                self.remove_region(new_end, old_end - new_end);
-            }
+    /// Service a guest `brk` against the break arena, with the kernel's
+    /// contract: success returns the requested break, and a request the arena
+    /// cannot satisfy leaves the break unchanged and returns the current one
+    /// (which is also how `brk(0)` reads it back). Grown pages join the guest
+    /// regions; a shrink discards its pages, so regrowth reads zeroes just as
+    /// it does from the kernel.
+    pub fn handle_brk(&mut self, requested: usize) -> usize {
+        let (Some(current), Some(arena)) = (self.program_break, self.break_arena.clone()) else {
+            return 0;
+        };
+        if requested < arena.start || requested > arena.start + arena.len {
+            return current;
         }
-        self.program_break = Some(brk);
+        let old_end = round_mapping_len(current);
+        let new_end = round_mapping_len(requested);
+        if new_end > old_end {
+            let ret = unsafe {
+                libc::mprotect(
+                    old_end as *mut libc::c_void,
+                    new_end - old_end,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+            if ret != 0 {
+                return current;
+            }
+            self.add_region(old_end, new_end - old_end);
+            self.note_map(old_end, new_end - old_end);
+        } else if new_end < old_end {
+            // Map fresh `PROT_NONE` pages over the vacated range rather than
+            // unmapping it, so the arena's reservation stays in place and no
+            // unrelated mapping can land inside it.
+            let ret = unsafe {
+                libc::mmap(
+                    new_end as *mut libc::c_void,
+                    old_end - new_end,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            if ret == libc::MAP_FAILED {
+                return current;
+            }
+            self.remove_region(new_end, old_end - new_end);
+            self.note_unmap(new_end, old_end - new_end);
+        }
+        self.program_break = Some(requested);
+        requested
     }
 
     fn clear_regions(&mut self) {
@@ -276,6 +358,10 @@ impl AddressSpace {
         for region in self.regions.drain(..) {
             let ret = unsafe { libc::munmap(region.start as *mut libc::c_void, region.len) };
             debug_assert_eq!(ret, 0, "guest region munmap failed");
+        }
+        if let Some(arena) = self.break_arena.take() {
+            let ret = unsafe { libc::munmap(arena.start as *mut libc::c_void, arena.len) };
+            debug_assert_eq!(ret, 0, "break arena munmap failed");
         }
     }
 

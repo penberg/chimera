@@ -10,7 +10,7 @@
 //! incrementally — repeated denials of the same call are silent.
 //!
 //! Example:
-//!   cargo run --example sandbox -- --allow '^(read|write|brk)$' /bin/echo hi
+//!   cargo run --example sandbox -- --allow '^(read|write)$' /bin/echo hi
 //!
 //! This is the smallest non-trivial use of Chimera's `SystemCalls`
 //! trait: classify by name and either forward or refuse. The `strace`
@@ -26,8 +26,9 @@ use regex::Regex;
 use chimera::{Sandbox, SyscallResult, SystemCall, SystemCalls, host_syscall};
 
 /// Route this embedder's allocations through mimalloc's `mmap`-backed
-/// segments, keeping Chimera's heap off the guest libc's shared `brk`.
-/// A `#[global_allocator]` is per-binary, so every embedder needs its own.
+/// segments, keeping the embedder's heap traffic out of the process's `brk`
+/// segment. A `#[global_allocator]` is per-binary, so every embedder needs
+/// its own.
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
