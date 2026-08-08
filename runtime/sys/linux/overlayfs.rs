@@ -26,7 +26,7 @@ use std::{
 };
 
 use super::{
-    delta::{Delta, is_opaque, is_whiteout, is_whiteout_fd, mark_opaque, origin},
+    delta::{Delta, is_opaque, is_whiteout, is_whiteout_fd, mark_opaque, may_be_whiteout, origin},
     hostfs::HostFs,
     vfs::{
         DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec, Vfs,
@@ -114,7 +114,7 @@ impl OverlayInner {
                 }
                 Err(e) => return Err(Errno::from_io(&e)),
             };
-            if is_whiteout(&cur)? {
+            if may_be_whiteout(&md) && is_whiteout(&cur)? {
                 // The name is deleted; nothing below it survives either.
                 return Ok(if is_final {
                     Visibility::Whiteout
@@ -569,7 +569,11 @@ impl Vfs for OverlayFs {
         let to_upper = inner.delta.data_path(to);
         let mut removed_marker = false;
         match std::fs::symlink_metadata(&to_upper) {
-            Ok(_) if is_whiteout(&to_upper)? && (src_dir || flags.noreplace()) => {
+            Ok(md)
+                if may_be_whiteout(&md)
+                    && is_whiteout(&to_upper)?
+                    && (src_dir || flags.noreplace()) =>
+            {
                 inner.remove_marker(to)?;
                 removed_marker = true;
             }
@@ -894,7 +898,8 @@ impl File for OverlayDir {
         // appears.
         let mut shadowed: HashSet<OsString> = HashSet::new();
         for e in self.upper.getdents()? {
-            let whiteout = is_whiteout(&self.upper_host.join(&e.name))?;
+            let whiteout =
+                e.file_type == FileType::Regular && is_whiteout(&self.upper_host.join(&e.name))?;
             shadowed.insert(e.name.clone());
             if !whiteout {
                 out.push(e);
