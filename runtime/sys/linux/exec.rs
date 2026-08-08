@@ -217,7 +217,42 @@ pub fn prepare_exec(
     args: &[u64; 6],
     handler: &dyn SystemCalls,
 ) -> Result<PreparedExec, Error> {
-    let req = read_request(number, args, handler)?;
+    let mut req = read_request(number, args, handler)?;
+    // A `#!` script executes through its interpreter line, spliced the way
+    // the kernel's script loader does it: argv becomes the interpreter, its
+    // optional argument, the script's pathname as the caller wrote it, then
+    // the caller's argv past argv[0]. The interpreter may itself be a
+    // script, to the kernel's nesting depth; one level deeper falls through
+    // to `parse_elf`, whose failure reports `ENOEXEC`.
+    let mut script = if req.raw.is_empty() {
+        req.path.as_os_str().as_bytes().to_vec()
+    } else {
+        req.raw.clone()
+    };
+    for _ in 0..4 {
+        let Some((interp, optarg)) = shebang_line(&req.path)? else {
+            break;
+        };
+        let mut argv: Vec<Vec<u8>> = Vec::with_capacity(req.argv.len() + 2);
+        argv.push(interp.clone());
+        if let Some(arg) = optarg {
+            argv.push(arg);
+        }
+        argv.push(script);
+        argv.extend(req.argv.iter().skip(1).cloned());
+        req.argv = argv;
+        req.path = match handler.resolve_exec(AT_FDCWD, &interp, 0) {
+            Some(Ok(path)) => path,
+            Some(Err(errno)) => {
+                return Err(Error::io(
+                    "execve",
+                    std::io::Error::from_raw_os_error(errno),
+                ));
+            }
+            None => resolve_at(AT_FDCWD, &interp, 0, handler),
+        };
+        script = interp;
+    }
     let parsed = parse_elf(&req.path)?;
     let parsed_interp = match &parsed.interp {
         Some(interp_path) => Some(parse_elf(interp_path)?),
@@ -239,6 +274,62 @@ pub fn exec_errno(err: &Error) -> Option<i32> {
         Error::BadAccess(_) => Some(libc::EFAULT),
         Error::CodeCacheExhausted | Error::Translate(_) => None,
     }
+}
+
+/// The kernel inspects this many leading bytes of an image to choose its
+/// loader (`BINPRM_BUF_SIZE`); a shebang line must fit inside them.
+const SHEBANG_BUF: usize = 256;
+
+/// A parsed shebang line: the interpreter path and its optional argument.
+type ShebangLine = (Vec<u8>, Option<Vec<u8>>);
+
+/// Parse `path`'s shebang line: `Ok(None)` when the image is not a `#!`
+/// script, otherwise the interpreter path and its optional argument. Kernel
+/// semantics throughout: the line ends at the first newline and must fit
+/// the probe buffer, trailing blanks are trimmed, the interpreter ends at
+/// the first blank, and everything after it — embedded blanks included — is
+/// a single argument. A shebang that names no interpreter is a malformed
+/// image, reported as `ENOEXEC`.
+fn shebang_line(path: &Path) -> Result<Option<ShebangLine>, Error> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).map_err(|e| Error::io("execve", e))?;
+    let mut buf = [0u8; SHEBANG_BUF];
+    let mut len = 0;
+    while len < buf.len() {
+        match file
+            .read(&mut buf[len..])
+            .map_err(|e| Error::io("execve", e))?
+        {
+            0 => break,
+            n => len += n,
+        }
+    }
+    let buf = &buf[..len];
+    if len < 2 || &buf[..2] != b"#!" {
+        return Ok(None);
+    }
+    let line = match buf.iter().position(|&b| b == b'\n') {
+        Some(nl) => &buf[2..nl],
+        None if len < SHEBANG_BUF => &buf[2..],
+        None => {
+            return Err(Error::BadBinary(
+                "shebang line does not fit the interpreter probe buffer".into(),
+            ));
+        }
+    };
+    let blank = |b: u8| b == b' ' || b == b'\t';
+    let line = &line[..line.len() - line.iter().rev().take_while(|&&b| blank(b)).count()];
+    let rest = &line[line.iter().take_while(|&&b| blank(b)).count()..];
+    if rest.is_empty() {
+        return Err(Error::BadBinary("shebang names no interpreter".into()));
+    }
+    let end = rest.iter().position(|&b| blank(b)).unwrap_or(rest.len());
+    let interp = rest[..end].to_vec();
+    let after = &rest[end..];
+    let arg = &after[after.iter().take_while(|&&b| blank(b)).count()..];
+    let optarg = (!arg.is_empty()).then(|| arg.to_vec());
+    Ok(Some((interp, optarg)))
 }
 
 /// Format a `KEY=VALUE` environment entry (no trailing NUL; `build_stack` adds
@@ -278,9 +369,13 @@ fn current_program_break() -> usize {
     unsafe { libc::syscall(libc::SYS_brk, 0) as usize }
 }
 
-/// A decoded `execve`/`execveat` request, copied out of guest memory.
+/// A decoded `execve`/`execveat` request, copied out of guest memory. `raw`
+/// is the pathname as the guest passed it, before namespace resolution: a
+/// shebang splice hands it to the interpreter, which re-resolves it under
+/// the same guest semantics.
 struct ExecRequest {
     path: PathBuf,
+    raw: Vec<u8>,
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
 }
@@ -317,6 +412,7 @@ fn read_request(
     };
     Ok(ExecRequest {
         path,
+        raw,
         argv: read_guest_ptr_array(argv_ptr)?,
         envp: read_guest_ptr_array(envp_ptr)?,
     })
