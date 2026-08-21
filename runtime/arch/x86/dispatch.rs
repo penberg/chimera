@@ -6,9 +6,10 @@
 //!
 //! [`Thread::run`] is the loop: deliver any pending guest signal, translate the
 //! next block if it isn't already cached, enter the cache through [`dispatch`],
-//! handle whatever caused the cache to exit (a block boundary or a syscall), and
-//! repeat until the guest issues `exit_group` or `exit`. The boundary-crossing
-//! assembly lives in [`super::trampoline`].
+//! handle whatever caused the cache to exit (a block boundary, a syscall, or a
+//! preemption — see [`super::preempt`]), and repeat until the guest issues
+//! `exit_group` or `exit`. The boundary-crossing assembly lives in
+//! [`super::trampoline`].
 
 use std::{
     arch::asm,
@@ -458,32 +459,16 @@ impl Thread {
         self.signals.restore(state);
     }
 
-    /// Deliver one pending, unblocked guest signal at a safe point (a block
-    /// boundary), building its frame and redirecting the guest to the handler.
-    /// Entry into the handler then happens through the normal `dispatch` path.
+    /// Deliver one pending, unblocked guest signal at the run-loop boundary,
+    /// building its frame and redirecting the guest to the handler. Entry into
+    /// the handler then happens through the normal `dispatch` path. The
+    /// boundary is precise: a thread preempted inside translated code arrives
+    /// here with the register file of the interrupted instruction.
     fn deliver_pending_signals(&mut self) {
         if let Some(signo) = self.signals.pending_take_one() {
             let restart = self.restart.take();
             let state = &mut *self.state;
             self.signals.deliver(state, signo, restart);
-        }
-    }
-
-    /// Recompute the safepoint exit flag the translated loop-closing polls read.
-    /// It is set exactly when a signal is pending and not blocked, so a fully
-    /// linked guest loop is forced back into this run loop within one iteration to
-    /// deliver it; once nothing is deliverable it clears, leaving warm loops
-    /// poll-free at runtime. Clear first, then re-arm only if deliverable — never
-    /// re-clearing — so a same-thread catcher that sets the flag from a signal
-    /// handler between the clear and the recheck is not lost. The `compiler_fence`
-    /// keeps the clear ordered before the recheck (signal delivery on this thread
-    /// is itself a serialization point, so no CPU fence is needed).
-    fn refresh_exit_requested(&mut self) {
-        self.state.exit_requested.store(0, Ordering::Relaxed);
-        core::sync::atomic::compiler_fence(Ordering::SeqCst);
-        let deliverable = self.signals.pending_snapshot() & !self.signals.blocked;
-        if deliverable != 0 {
-            self.state.exit_requested.store(1, Ordering::Relaxed);
         }
     }
 
@@ -508,10 +493,9 @@ impl Thread {
         self.running = true;
 
         // Join the thread list so a sibling's process-wide stop can reach
-        // this thread: the interrupt signal if it parks in a host syscall, the
-        // registered `exit_requested` safepoint slot if it is executing fully
-        // linked translated code. The guard removes it on every exit path
-        // (including the `execve` early return).
+        // this thread with the interrupt signal, which preempts it out of
+        // translated code or out of a blocking host syscall. The guard
+        // removes it on every exit path (including the `execve` early return).
         self.state.tid.store(
             unsafe { libc::syscall(libc::SYS_gettid) } as i32,
             Ordering::Release,
@@ -537,18 +521,21 @@ impl Thread {
             .ensure_ib_lookup(block_exit)?;
 
         while self.running {
+            // Disarm the entry abort before looking at anything a signal
+            // catcher may have armed it for. A catcher that runs on this thread
+            // while it is in Rust — anywhere from here to the cache entry — sets
+            // `exit_requested`, and `dispatch` then declines to enter the cache
+            // so the loop comes back around to the checks below. Clearing first
+            // keeps the order right: a signal recorded (or a sibling stop
+            // published) before the clear is seen by the checks that follow it;
+            // one that lands after the clear leaves the flag set, and the
+            // declined entry brings it back here. The `compiler_fence` keeps the
+            // clear ahead of the checks (a signal on this thread is itself a
+            // serialization point, so no CPU fence is needed).
+            self.state.exit_requested.store(0, Ordering::Relaxed);
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
             self.deliver_pending_signals();
-            self.refresh_exit_requested();
 
-            // Observe a sibling's process-wide stop only after
-            // `refresh_exit_requested`: the refresh clears this thread's
-            // safepoint slot, so checking first would open a window where a
-            // stop armed between the check and the clear is wiped — the flag
-            // already checked, the slot no longer set — and a fully linked
-            // loop runs on unwatched. Checked in this order, a stop armed
-            // before the refresh is caught by these flags, and one armed
-            // after it leaves the slot set for the in-cache polls.
-            //
             // Another thread may have issued `exit_group`, which ends the
             // whole thread group: stop with the process-wide code so the main
             // thread returns it from the run and the process exits.
@@ -805,19 +792,19 @@ pub struct ThreadState {
     pub ib_rcx: u64,
     pub ib_rdx: u64,
     pub ib_host: u64,
-    /// Asynchronous-exit flag polled by translated code at loop-closing edges.
-    /// The host signal catcher sets it; the run loop recomputes it each iteration
-    /// as "a deliverable signal is pending" so it self-clears. When set, a fully
-    /// linked, syscall-free guest loop is dragged back to the run loop within one
-    /// iteration, where a pending signal is delivered at a real block boundary.
-    /// Reached from translated code as `gs:[]`.
+    /// Entry-abort flag: set when a signal catcher found this thread in
+    /// Chimera's own code rather than in the cache, where it could preempt it
+    /// directly (see [`super::preempt`]), and by a sibling publishing a
+    /// process-wide stop. `dispatch` tests it as its first instruction and
+    /// returns without entering the cache while it is set; the run loop clears
+    /// it at the top of every iteration, before its own checks. Translated
+    /// code never reads it.
     ///
     /// `AtomicU32` because the signal catcher writes it asynchronously (from the
     /// handler, via `gs:[]`) while the run loop reads and writes it; plain accesses
-    /// would be a data race the compiler could miscompile (e.g. drop the clear in
-    /// [`Thread::refresh_exit_requested`] as a dead store). The in-memory layout is
-    /// an identical 32-bit word at the same offset, so the `gs:[]` poll is
-    /// unaffected.
+    /// would be a data race the compiler could miscompile (e.g. drop the clear as a
+    /// dead store). The in-memory layout is an identical 32-bit word at the same
+    /// offset, so the `gs:[]` test in `dispatch` is unaffected.
     pub exit_requested: AtomicU32,
     /// Whether the physical FP/SIMD registers currently hold this thread's
     /// guest state. `dispatch` clears it on every cache entry (the Rust code

@@ -5,13 +5,15 @@
 //! code (outside the sandbox, and a hard fault under W^X). Instead Chimera owns
 //! the guest's signal disposition. `rt_sigaction`/`rt_sigprocmask`/`sigaltstack`
 //! are intercepted into [`Signals`]; for any caught signal a single host-side
-//! catcher ([`chimera_sigcatch`]) is installed that does nothing but record the
-//! signal as pending. The dispatch loop drains the pending set at a safe point
-//! (a block boundary), builds a kernel-ABI `rt_sigframe` on the guest stack with
-//! [`Signals::deliver`], and re-enters the translator at the handler — so the
-//! handler runs translated, in-sandbox. The handler returns through its restorer
-//! (`sa_restorer`, or a built-in `rt_sigreturn` stub), whose `rt_sigreturn` is
-//! intercepted into [`Signals::restore`].
+//! catcher ([`chimera_sigcatch`]) is installed that records the signal as
+//! pending and preempts the interrupted thread out of translated code
+//! ([`crate::arch::preempt`]), so it reaches its run loop at once with the
+//! precise register state of the interrupted instruction. The run loop drains
+//! the pending set there, builds a kernel-ABI `rt_sigframe` on the guest stack
+//! with [`Signals::deliver`], and re-enters the translator at the handler — so
+//! the handler runs translated, in-sandbox. The handler returns through its
+//! restorer (`sa_restorer`, or a built-in `rt_sigreturn` stub), whose
+//! `rt_sigreturn` is intercepted into [`Signals::restore`].
 //!
 //! A blocking host syscall forwarded on the guest's behalf is interrupted
 //! (the catcher is installed without `SA_RESTART`), so the loop regains control
@@ -388,9 +390,9 @@ impl PendingSet {
 
 /// Host signal catcher. Runs asynchronously on whatever context the host thread
 /// happened to be in (translated guest code or Chimera Rust), so it must be
-/// async-signal-safe: [`PendingSet::record`] plus `gs`-relative accesses.
-/// Installed with `SA_SIGINFO`, so it captures the kernel's `siginfo_t` for the
-/// guest handler.
+/// async-signal-safe: [`PendingSet::record`], the preemption code, and
+/// `gs`-relative accesses. Installed with `SA_SIGINFO`, so it captures the
+/// kernel's `siginfo_t` for the guest handler.
 ///
 /// The signal is recorded on the *catching* thread's own [`PendingSet`],
 /// reached through the gs-addressed `ThreadState`. The kernel already routed
@@ -401,7 +403,7 @@ impl PendingSet {
 extern "C" fn chimera_sigcatch(
     signo: libc::c_int,
     info: *const libc::siginfo_t,
-    _uc: *mut libc::c_void,
+    uc: *mut libc::c_void,
 ) {
     if signo >= 1 && signo as usize <= NSIG {
         // Temporary diagnostic: raw, alloc-free trace of every SIGPWR catch
@@ -422,19 +424,23 @@ extern "C" fn chimera_sigcatch(
         // Drag the interrupted guest thread back to its run loop. Translated code
         // keeps the guest registers live across linked block chains and only
         // returns to the dispatcher at a block exit, so a tight syscall-free loop
-        // would never observe the bit set above. Set the per-context exit flag the
-        // loop-closing polls in translated code read, so the next such poll falls
-        // back to the dispatcher, where delivery happens at a real block boundary.
-        // GS is this thread's `ThreadState` throughout guest execution (bound once
-        // via `ARCH_SET_GS`, never changed — only FS is swapped), so a single
+        // would never observe the bit set above. Preempt it: the interrupted
+        // context is rewritten so the thread leaves the cache at this very
+        // instruction boundary. A thread caught in Chimera's own Rust instead
+        // has its next cache entry declined, so the run loop comes back to its
+        // delivery point before any translated code runs. GS is this thread's
+        // `ThreadState` throughout guest execution (bound once via
+        // `ARCH_SET_GS`, never changed — only FS is swapped), so a single
         // `gs:[]` store reaches the right context with no TLS, allocation, or
         // locking, keeping the catcher async-signal-safe.
-        unsafe {
-            core::arch::asm!(
-                "mov dword ptr gs:[{off}], 1",
-                off = const core::mem::offset_of!(ThreadState, exit_requested),
-                options(nostack, preserves_flags),
-            );
+        if !crate::arch::preempt(uc) {
+            unsafe {
+                core::arch::asm!(
+                    "mov dword ptr gs:[{off}], 1",
+                    off = const core::mem::offset_of!(ThreadState, exit_requested),
+                    options(nostack, preserves_flags),
+                );
+            }
         }
     }
 }
@@ -790,11 +796,6 @@ impl Signals {
     /// the thread that caught them.
     pub fn pending_set_ptr(&self) -> *const PendingSet {
         Arc::as_ptr(&self.pending)
-    }
-
-    /// Snapshot this thread's recorded-but-undelivered signals.
-    pub fn pending_snapshot(&self) -> u64 {
-        self.pending.snapshot()
     }
 
     /// Atomically remove and return the lowest-numbered deliverable (pending

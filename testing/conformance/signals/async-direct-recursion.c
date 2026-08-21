@@ -3,12 +3,13 @@
 // An asynchronous signal must reach the guest handler even when the guest is
 // looping purely through linked direct-call edges — direct recursion with no
 // back-branch and no `ret`. Such a cycle stays entirely in the code cache until
-// the stack overflows, so without a safepoint poll on the direct-call back-edge
-// the pending signal is never delivered. Each call does only straight-line work
-// (no loop, so no competing back-edge poll can deliver the signal instead),
-// which also slows the recursion enough that the signal lands long before the
-// stack overflows. A helper child raises the signal; if delivery regresses, the
-// child's watchdog kill bounds the failure instead of hanging the suite.
+// the stack overflows, so the pending signal is delivered only if the thread is
+// preempted out of the cache — possibly in the middle of a linked call's
+// return-address push, whose borrowed rax the recovery must put back. Each
+// call does only straight-line work, which also slows the recursion enough
+// that the signal lands long before the stack overflows. A helper child raises
+// the signal; if delivery regresses, the child's watchdog kill bounds the
+// failure instead of hanging the suite.
 
 #include <signal.h>
 #include <stdint.h>
