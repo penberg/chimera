@@ -2,9 +2,10 @@
 //
 // The indirect-branch variant of async-tight-loop: a computed-goto dispatch
 // loop that closes via an indirect jump kept resident in the inline IB cache,
-// never returning to the run loop. Delivery therefore depends on the safepoint
-// poll inside the shared IB-lookup routine rather than the back-edge poll. A
-// watchdog child bounds a regression to a non-zero exit instead of a hang.
+// never returning to the run loop. A signal landing inside the shared IB-lookup
+// routine (mid-hash, mid-probe, on the hit jump) must be recovered from that
+// routine's borrowed slots, not just from a block body. A watchdog child
+// bounds a regression to a non-zero exit instead of a hang.
 
 #include <signal.h>
 #include <sys/time.h>
