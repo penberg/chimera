@@ -52,6 +52,7 @@ const SIG_IGN: u64 = 1;
 const SA_RESTORER: u64 = 0x0400_0000;
 
 /// `ss_flags` bit: the alternate stack is disabled.
+const SS_ONSTACK: i32 = 1;
 const SS_DISABLE: i32 = 2;
 
 /// Signals that can never be caught, blocked, or ignored.
@@ -992,13 +993,22 @@ impl Signals {
         }
     }
 
-    /// Service guest `sigaltstack`.
-    pub fn sigaltstack(&mut self, ss: u64, old_ss: u64) -> SyscallResult {
+    /// Service guest `sigaltstack`. `rsp` is the guest's stack pointer, which
+    /// decides the reported status: the flags word on the way out is not the
+    /// one the guest registered but whether it is *running* on the stack right
+    /// now, which the kernel answers by comparing the stack pointer against
+    /// the registered range (`on_sig_stack`). A handler that asks whether it
+    /// is on its alternate stack has no other way to find out.
+    pub fn sigaltstack(&mut self, ss: u64, old_ss: u64, rsp: u64) -> SyscallResult {
         if old_ss != 0 {
             let cur = match self.altstack {
-                Some((sp, size, fl)) => StackT {
+                Some((sp, size, _)) => StackT {
                     ss_sp: sp,
-                    ss_flags: fl,
+                    ss_flags: if (sp..sp + size).contains(&rsp) {
+                        SS_ONSTACK
+                    } else {
+                        0
+                    },
                     _pad: 0,
                     ss_size: size,
                 },
@@ -1068,7 +1078,14 @@ impl Signals {
             return;
         }
 
-        let on_alt = act.flags & libc::SA_ONSTACK as u64 != 0 && self.altstack.is_some();
+        // Switch to the alternate stack only if the guest is not already on
+        // it: a handler interrupted by a second signal must have that frame
+        // stacked below its own, and restarting at the top would build it over
+        // the frame the outer handler is still using.
+        let on_alt = act.flags & libc::SA_ONSTACK as u64 != 0
+            && self
+                .altstack
+                .is_some_and(|(base, size, _)| !(base..base + size).contains(&state.regs[RSP]));
         let mut sp = if on_alt {
             let (base, size, _) = self.altstack.unwrap();
             base + size
