@@ -1,33 +1,54 @@
-//! The clone family: forks and the `posix_spawn` shape.
+//! The clone family: threads, forks, and the `posix_spawn` shape.
 //!
-//! A fork is forwarded, but the child comes back with its dispatch
-//! configuration cleared and must re-arm before its first guest instruction
-//! (see [`forward_fork`]). The `posix_spawn` shape, `clone(CLONE_VM |
-//! CLONE_VFORK)`, degrades to a fork with a pipe carrying the child's exec
-//! outcome back (see [`spawned`]), because a child sharing the arena bump
-//! pointer and the `fs` cells would race its parent. A thread-shaped clone
-//! is refused: a second native guest thread would race the one thread's
-//! state here.
+//! None of it can simply be forwarded. A thread-shaped `clone` would make a
+//! task that returns from the syscall *inside Chimera's trap handler*, on the
+//! guest's thread stack, with no per-thread state and — since dispatch
+//! configuration survives a clone no better than it survives a fork — no
+//! interception at all; Chimera creates the host thread itself (see
+//! [`spawn_thread`]). A fork *is* forwarded, but the child comes back with
+//! its dispatch configuration cleared and must re-arm before its first guest
+//! instruction (see [`forward_fork`]). And the `posix_spawn` shape,
+//! `clone(CLONE_VM | CLONE_VFORK)`, degrades to a fork with a pipe carrying
+//! the child's exec outcome back (see [`spawned`]), because a child sharing
+//! the arena bump pointer and the `fs` cells would race its parent.
 
-use std::ptr;
+use std::{ptr, sync::Arc};
 
-use crate::{SyscallResult, SystemCall};
+use crate::{SyscallResult, SystemCall, sys::mmap::copy_to_guest};
 
 use super::{
     super::syscall::{CLONE_CLEAR_SIGHAND, Clone3Args, host_syscall, is_thread_clone},
+    SigsysInfo,
     signal::reset_guest_signals,
     sud_on,
-    thread::Thread,
+    thread::{Thread, enter_thread},
 };
 
-/// `clone`, split by shape: the `posix_spawn` shape degrades to a fork;
-/// `CLONE_VM` in any other form — a thread, or a second process sharing this
-/// address space — is refused; anything else is a fork.
-pub fn do_clone(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t) {
+/// `clone`, split by shape: a thread runs on a host thread; the
+/// `posix_spawn` shape degrades to a fork; `CLONE_VM` without either — a
+/// second process sharing this address space, and with it the arena bump
+/// pointer and every thread's state — is refused; anything else is a fork.
+pub fn do_clone(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t, info: &SigsysInfo) {
     let flags = call.args[0];
+    if is_thread_clone(flags) {
+        let result = spawn_thread(
+            t,
+            uc,
+            info,
+            CloneRequest {
+                flags,
+                child_stack: call.args[1],
+                parent_tid: call.args[2],
+                child_tid: call.args[3],
+                tls: call.args[4],
+            },
+        );
+        call.set_result(result);
+        return;
+    }
     let vm = flags & libc::CLONE_VM as u64 != 0;
     let vfork = flags & libc::CLONE_VFORK as u64 != 0;
-    if is_thread_clone(flags) || (vm && !vfork) {
+    if vm && !vfork {
         call.set_result(SyscallResult::Error(libc::EPERM));
         return;
     }
@@ -49,12 +70,12 @@ pub fn do_clone(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t) {
     forward_fork(t, call, uc, None);
 }
 
-/// `clone3`, split the same way as [`do_clone`]. A shape that needs patching
-/// before it reaches the host is forwarded from a private copy of the
-/// `clone_args` (see [`Clone3Args`]); an unreadable or missized struct fails
-/// closed rather than being forwarded for the kernel's verdict, since a task
-/// the kernel made would run unintercepted.
-pub fn do_clone3(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t) {
+/// `clone3`, split the same three ways as [`do_clone`]. A shape that needs
+/// patching before it reaches the host is forwarded from a private copy of
+/// the `clone_args` (see [`Clone3Args`]); an unreadable or missized struct
+/// fails closed rather than being forwarded for the kernel's verdict, since
+/// a thread the kernel made would run unintercepted.
+pub fn do_clone3(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t, info: &SigsysInfo) {
     let mut cargs = match Clone3Args::read(call.args[0], call.args[1]) {
         Ok(cargs) => cargs,
         Err(errno) => {
@@ -63,9 +84,26 @@ pub fn do_clone3(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t) {
         }
     };
     let mut flags = cargs.flags();
+    if is_thread_clone(flags) {
+        let fields = cargs.fields();
+        let result = spawn_thread(
+            t,
+            uc,
+            info,
+            CloneRequest {
+                flags,
+                child_stack: cargs.child_stack_top(),
+                parent_tid: fields[3],
+                child_tid: fields[2],
+                tls: fields[7],
+            },
+        );
+        call.set_result(result);
+        return;
+    }
     let vm = flags & libc::CLONE_VM as u64 != 0;
     let vfork = flags & libc::CLONE_VFORK as u64 != 0;
-    if is_thread_clone(flags) || (vm && !vfork) {
+    if vm && !vfork {
         call.set_result(SyscallResult::Error(libc::EPERM));
         return;
     }
@@ -95,6 +133,107 @@ pub fn do_clone3(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t) {
     }
 }
 
+/// The arguments a thread-creating `clone` carries, in whichever shape it
+/// arrived.
+struct CloneRequest {
+    flags: u64,
+    child_stack: u64,
+    parent_tid: u64,
+    child_tid: u64,
+    tls: u64,
+}
+
+/// Create a guest thread on a host thread of its own.
+///
+/// The child enters guest code exactly where the kernel would have put it:
+/// at the instruction after the guest's own `syscall`, with the parent's
+/// register file, `rax` zeroed to report the child's side of the clone, and
+/// its own stack. The parent gets the child's kernel TID, which is the TID
+/// the guest sees, so its later `futex` and `tgkill` reach this host thread.
+fn spawn_thread(
+    t: &Thread,
+    uc: &libc::ucontext_t,
+    info: &SigsysInfo,
+    req: CloneRequest,
+) -> SyscallResult {
+    let process = Arc::clone(&t.process);
+    let mut child_ctx = uc.uc_mcontext.gregs;
+    child_ctx[libc::REG_RAX as usize] = 0;
+    child_ctx[libc::REG_RSP as usize] = req.child_stack as libc::greg_t;
+    child_ctx[libc::REG_RIP as usize] = info.call_addr as libc::greg_t;
+    // `CLONE_SETTLS` gives the child its own thread pointer; without it the
+    // child inherits the parent's, as the kernel does.
+    let guest_fs = if req.flags & libc::CLONE_SETTLS as u64 != 0 {
+        req.tls
+    } else {
+        t.guest_fs.get()
+    };
+    let clear_child_tid = (req.flags & libc::CLONE_CHILD_CLEARTID as u64 != 0
+        && req.child_tid != 0)
+        .then_some(req.child_tid);
+    let inherited_mask = t.sig.mask.get();
+
+    // The parent must return the child's TID, but only the child can read its
+    // own; hand it back over a one-shot channel and wait for it.
+    let (tx, rx) = std::sync::mpsc::channel::<i32>();
+    let spawned = std::thread::Builder::new()
+        .name("chimera-guest".to_string())
+        .spawn(move || {
+            // Leaked, not stack-held: the `gs` base points at this for as long
+            // as the thread runs guest code, and the trap handler dereferences
+            // it from contexts that know nothing of this frame.
+            let child: &'static Thread = Box::leak(Box::new(Thread::new(process, false)));
+            child.guest_fs.set(guest_fs);
+            child.clear_child_tid.set(clear_child_tid);
+            // A new thread inherits its creator's signal mask.
+            child.sig.mask.set(inherited_mask);
+
+            // Replicate the kernel's set-TID writes before any guest code
+            // runs: the kernel fills these at clone time, so the child must
+            // observe its own TID from its first instruction. glibc points
+            // them at the thread's control block and reads the value during
+            // early thread setup and as the thread's identity for, among
+            // other things, `pthread_rwlock` writer ownership. Both are
+            // guest-controlled addresses, so the stores are best-effort — the
+            // kernel's own `put_user` there is unchecked.
+            if req.flags & libc::CLONE_PARENT_SETTID as u64 != 0 {
+                copy_to_guest(req.parent_tid, &child.tid.get().to_ne_bytes());
+            }
+            if req.flags & libc::CLONE_CHILD_SETTID as u64 != 0 {
+                copy_to_guest(req.child_tid, &child.tid.get().to_ne_bytes());
+            }
+            let _ = tx.send(child.tid.get());
+
+            let code = match enter_thread(child, &child_ctx) {
+                Ok(code) => code,
+                Err(err) => {
+                    eprintln!("chimera: guest thread failed: {err}");
+                    127
+                }
+            };
+            // A `fork` in this thread made it the only thread — and the
+            // leader — of a whole new process (see `forward_fork`). This host
+            // thread is all that process has, so its guest's status is the
+            // process's, and simply returning would end the thread and leave
+            // the process to exit 0 behind it.
+            if child.is_leader.get() {
+                std::process::exit(code);
+            }
+        });
+
+    match spawned {
+        // The handle is dropped: the host thread is detached and reclaims
+        // itself when its closure returns, and the child is tracked by its
+        // kernel TID rather than by a retained handle, which under thread
+        // churn would only accumulate.
+        Ok(_handle) => match rx.recv() {
+            Ok(tid) => SyscallResult::Ok(tid as i64),
+            Err(_) => SyscallResult::Error(libc::EAGAIN),
+        },
+        Err(_) => SyscallResult::Error(libc::EAGAIN),
+    }
+}
+
 /// Forward a fork-shaped call and re-arm dispatch in the child.
 ///
 /// The kernel does **not** inherit the syscall-user-dispatch configuration
@@ -107,18 +246,20 @@ pub fn do_clone3(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t) {
 /// forwarded, and the whole backend's confinement of child processes rests
 /// on it.
 ///
-/// The handler's locks are held across the copy, the `pthread_atfork`
-/// discipline the translating backend applies for the same reason (see
-/// `SystemCalls::lock_for_fork`).
+/// The runtime's and the handler's locks are held across the copy — the
+/// `pthread_atfork` discipline, applied at the one place a fork is forwarded
+/// (see `Process::lock_for_fork` and `SystemCalls::lock_for_fork`).
 pub fn forward_fork(
     t: &Thread,
     call: &mut SystemCall,
     uc: &mut libc::ucontext_t,
     child_stack: Option<u64>,
 ) {
-    let hold = t.process.handler.lock_for_fork();
+    let process_hold = t.process.lock_for_fork();
+    let handler_hold = t.process.handler.lock_for_fork();
     let result = host_syscall(call);
-    drop(hold);
+    drop(handler_hold);
+    drop(process_hold);
     if let SyscallResult::Ok(0) = result {
         // The guest asked for its child to run on a stack of its own (the
         // `posix_spawn` shape); the kernel was not allowed to install it, so
@@ -140,6 +281,7 @@ pub fn forward_fork(
         // copied, so it has to be cleared by hand or the child would take a
         // signal only its parent was sent.
         t.sig.pending.clear();
+        t.become_fork_child();
     }
     call.set_result(result);
 }

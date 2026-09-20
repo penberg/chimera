@@ -1,28 +1,41 @@
-//! The guest thread: its state, and how the host thread enters and leaves
+//! One guest thread: its state, and how a host thread enters and leaves
 //! guest code.
 //!
-//! The guest runs on the host thread that called [`super::execv`]. What the
-//! trap handler needs from that thread — the two `fs` bases it switches
-//! between, its signal state, the frame its `exit` unwinds to — lives in
-//! [`Thread`], reached through the `gs` base (see [`this_thread`]). The
-//! thread enters guest code through [`enter`] and leaves it for good through
-//! [`unwind`], which lands back in the entering frame to retire the guest in
-//! [`finish`].
+//! Every guest thread is a host thread. What belongs to one thread alone —
+//! the two `fs` bases it switches between, its signal mask and deferred
+//! signals, its alternate stack, the frame its `exit` unwinds to — lives in
+//! [`Thread`], reached from the trap handler through the `gs` base (see
+//! [`this_thread`]). A thread enters guest code through [`enter`] (the
+//! leader, from a fresh image) or [`enter_thread`] (a clone child, from its
+//! parent's registers), and leaves it for good through [`unwind`], which
+//! lands back in the entering frame to retire the thread in [`finish`].
+//!
+//! A group-wide stop travels by signal. A guest thread runs natively, so
+//! there is no safepoint for it to poll; the reserved stop signal is the
+//! safepoint, taken on the spot in guest code and deferred to the trap's
+//! safepoint inside the runtime (see [`on_stop`]).
 
 use std::{
     cell::{Cell, UnsafeCell},
     io, mem, ptr,
+    sync::{Arc, atomic::Ordering},
 };
 
 use crate::{Error, SyscallResult, SystemCall, sys::mmap::copy_to_guest};
 
-use super::{super::syscall::host_syscall, Process, signal::Signals, sud_off, sud_on};
+use super::{
+    super::syscall::host_syscall,
+    EXEMPT_FLOOR, Process,
+    exec::install_image,
+    signal::{Signals, sig_bit, sync_host_mask},
+    sud_off, sud_on,
+};
 
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
 const ARCH_SET_GS: u64 = 0x1001;
 
-/// The guest thread. A `fork` child inherits its copy, contexts and all, so
+/// One guest thread. A `fork` child inherits its copy, contexts and all, so
 /// the child unwinds through its own frame exactly like the parent.
 #[repr(C)]
 pub struct Thread {
@@ -33,15 +46,27 @@ pub struct Thread {
     /// move. `Cell` is `repr(transparent)`, so the field is still a bare
     /// pointer at offset 0 as far as the load is concerned.
     self_ptr: Cell<*const Thread>,
-    /// The process-wide state.
-    pub process: Process,
+    /// The state shared with every other thread of the guest process.
+    pub process: Arc<Process>,
     /// The runtime's `fs` base, restored on every trap entry so the handler's
     /// Rust code sees its own TLS; the guest owns the real `fs` while it runs
-    /// (its TLS accesses are native).
+    /// (its TLS accesses are native). Per thread, since each host thread has
+    /// TLS of its own.
     pub runtime_fs: u64,
     /// The guest's `fs` base, kept by the virtualized
     /// `arch_prctl(ARCH_SET_FS)` and reinstated when the handler returns.
     pub guest_fs: Cell<u64>,
+    /// This thread's kernel TID, which is also the TID the guest sees. A
+    /// `Cell` because a fork child keeps the struct and takes a new TID.
+    pub tid: Cell<i32>,
+    /// Whether this is the thread group's leader — the one whose run
+    /// returning ends the process, and the one an `exit_group` from a sibling
+    /// hands the status to. A fork child is promoted to leader whichever
+    /// thread forked, since it is its new process's only thread.
+    pub is_leader: Cell<bool>,
+    /// The `CLONE_CHILD_CLEARTID` word to zero and wake on exit, which is
+    /// what a `pthread_join` blocks on.
+    pub clear_child_tid: Cell<Option<u64>>,
     /// The write end of the pipe a `posix_spawn` child reports its `execve`
     /// outcome on; set only in such a child. See `clone::spawned`.
     pub spawn_report_fd: Cell<Option<i32>>,
@@ -49,21 +74,26 @@ pub struct Thread {
     /// to the blocked parent only if the child exits without ever committing
     /// one.
     pub spawn_exec_errno: Cell<Option<i32>>,
+    /// A group stop that arrived while this thread was inside the runtime and
+    /// could not be taken where it landed; honored at the next safepoint.
+    /// See [`on_stop`].
+    pub stop_requested: Cell<bool>,
     /// Set by the `exit`/`exit_group` intercept just before unwinding.
     exit: Cell<Option<i32>>,
     /// Where the unwind lands: the frame that entered the guest, captured
     /// with `getcontext`. Boxed so the `fpregs` self-pointer `getcontext`
     /// plants stays valid.
     exit_ctx: Box<UnsafeCell<libc::ucontext_t>>,
-    /// The guest's signal state: mask, deferred signals, and alternate stack.
-    /// Dispositions live in [`Process::actions`].
+    /// The guest's per-thread signal state: mask, deferred signals, and
+    /// alternate stack. Dispositions are process-wide and live in
+    /// [`Process::actions`].
     pub sig: Signals,
 }
 
 impl Thread {
-    /// Build the thread's state for the calling host thread. `runtime_fs` is
-    /// read here, so this must run *on* the thread it describes.
-    pub fn new(process: Process) -> Self {
+    /// Build a thread's state for the calling host thread. `runtime_fs` and
+    /// `tid` are read here, so this must run *on* the thread it describes.
+    pub fn new(process: Arc<Process>, is_leader: bool) -> Self {
         let runtime_fs = current_fs();
         Self {
             self_ptr: Cell::new(ptr::null()),
@@ -74,8 +104,12 @@ impl Thread {
             // no TLS of its own, and leaving the base coherent keeps the
             // host thread usable in the meantime.
             guest_fs: Cell::new(runtime_fs),
+            tid: Cell::new(gettid()),
+            is_leader: Cell::new(is_leader),
+            clear_child_tid: Cell::new(None),
             spawn_report_fd: Cell::new(None),
             spawn_exec_errno: Cell::new(None),
+            stop_requested: Cell::new(false),
             exit: Cell::new(None),
             exit_ctx: Box::new(UnsafeCell::new(unsafe { mem::zeroed() })),
             sig: Signals::new(),
@@ -105,6 +139,20 @@ impl Thread {
             _ => self.process.handler.do_syscall(call),
         }
     }
+
+    /// Re-describe this thread as the only one of a fork child: a fork
+    /// copies just the calling thread, so whatever it was in the parent, in
+    /// the child it is the whole process — a new TID, the leader, and a
+    /// roster of one.
+    pub fn become_fork_child(&self) {
+        self.tid.set(gettid());
+        self.is_leader.set(true);
+        self.process.reset_after_fork(self.tid.get());
+    }
+}
+
+pub fn gettid() -> i32 {
+    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
 }
 
 /// The calling thread's [`Thread`], read out of the `gs` base.
@@ -112,12 +160,13 @@ impl Thread {
 /// The trap handler cannot use ordinary thread-local storage to find this.
 /// It is entered with `fs` still holding the *guest's* thread pointer, so
 /// every Rust thread-local — and `errno`, and the allocator's per-thread
-/// state — would resolve against guest memory, and the runtime `fs` base it
-/// needs to restore has to come from somewhere TLS-free. `gs` is that
-/// somewhere: Linux x86-64 userspace leaves it unused (thread pointers live
-/// in `fs`), so Chimera claims it, points it at the thread's state, and
-/// reads the self-pointer parked at offset 0 with a single instruction that
-/// touches no TLS at all.
+/// state — would resolve against guest memory; and the runtime `fs` base it
+/// needs to restore is itself per-thread, so the lookup that would tell it
+/// what to restore cannot itself depend on TLS. `gs` closes the circle:
+/// Linux x86-64 userspace leaves it unused (thread pointers live in `fs`),
+/// so Chimera claims it, points it at each thread's own state, and reads the
+/// self-pointer parked at offset 0 with a single instruction that touches no
+/// TLS at all.
 pub fn this_thread() -> &'static Thread {
     let t: *const Thread;
     unsafe {
@@ -144,25 +193,78 @@ fn set_this_thread(thread: &'static Thread) -> Result<(), Error> {
     }
 }
 
-/// Bring the host thread up as the guest thread and run the guest to
-/// completion: publish the state for the trap handler, install the alternate
-/// stack, arm dispatch, and enter guest code at `rip`/`rsp`. Returns the
-/// guest's exit status when its `exit`/`exit_group` unwinds back here.
+/// Bring the leader up as a guest thread and run its guest to completion:
+/// publish it for the trap handler, install the alternate stack, arm
+/// dispatch, and enter guest code at `rip`/`rsp`. Returns the guest's exit
+/// status when its `exit`/`exit_group` unwinds back here.
 pub fn enter(thread: &'static Thread, rip: u64, rsp: u64) -> Result<i32, Error> {
     set_this_thread(thread)?;
     install_altstack()?;
+    thread.process.register(thread.tid.get());
 
-    // The unwind target: `exit`/`exit_group` in the trap handler
-    // `setcontext`s back here, and the second pass returns the code.
+    let mut next = Some((rip, rsp));
+    // The back edge is invisible to the compiler — control returns to the
+    // `getcontext` below through a `setcontext` in a signal handler, not by
+    // falling off the end — so the body does read as straight-line code that
+    // ends in a diverging call.
+    #[allow(clippy::never_loop)]
+    loop {
+        // The unwind target: `exit`/`exit_group` and the group-stop handler
+        // `setcontext` back here, and the pass that follows takes one of the
+        // branches below.
+        unsafe { libc::getcontext(thread.exit_ctx.get()) };
+
+        // A sibling's `execve` committed and handed the image over. This
+        // thread is the group's survivor: wait out the stragglers, install,
+        // and run the new program here.
+        if let Some(prepared) = thread.process.take_exec_request() {
+            // The stop that brought this thread here was the exec's doing,
+            // not an exit; clearing both is what lets the new image run
+            // instead of ending at its first syscall.
+            thread.exit.set(None);
+            thread.stop_requested.set(false);
+            thread.process.wait_quiesce(thread.tid.get());
+            next = Some(install_image(thread, prepared)?);
+            thread.process.exec_installed();
+        } else if let Some(code) = thread.exit.get() {
+            return Ok(finish(thread, code));
+        }
+
+        let (rip, rsp) = next
+            .take()
+            .expect("a resumed leader always has an image to enter");
+        if sud_on() != 0 {
+            return Err(Error::last_os_error("enabling syscall user dispatch"));
+        }
+        unsafe { enter_guest(rip, rsp) }
+    }
+}
+
+/// Bring a clone child up and run its guest, resuming from the register file
+/// its parent's `clone` was trapped with. The counterpart of [`enter`] for
+/// the leader, which starts from a fresh image instead.
+pub fn enter_thread(thread: &'static Thread, gregs: &[libc::greg_t; 23]) -> Result<i32, Error> {
+    set_this_thread(thread)?;
+    install_altstack()?;
+    thread.process.register(thread.tid.get());
+    sync_host_mask(thread);
+
     unsafe { libc::getcontext(thread.exit_ctx.get()) };
     if let Some(code) = thread.exit.get() {
-        return Ok(finish(code));
+        return Ok(finish(thread, code));
     }
 
     if sud_on() != 0 {
         return Err(Error::last_os_error("enabling syscall user dispatch"));
     }
-    unsafe { enter_guest(rip, rsp) }
+    unsafe {
+        let mut ctx: libc::ucontext_t = mem::zeroed();
+        libc::getcontext(&mut ctx);
+        ctx.uc_mcontext.gregs = *gregs;
+        set_fs(thread.guest_fs.get());
+        libc::setcontext(&ctx);
+        libc::abort();
+    }
 }
 
 /// Jump into the guest: capture a context, aim it at the guest entry with the
@@ -208,10 +310,10 @@ pub fn aim_context(gregs: &mut [libc::greg_t; 23], rip: u64, rsp: u64) {
     gregs[libc::REG_RIP as usize] = rip as libc::greg_t;
 }
 
-/// Leave guest code for good, with `code` as its status: jump to the frame
-/// that entered the guest, which retires the run through [`finish`]. Never
-/// returns, and runs no destructors — whatever the caller holds is
-/// abandoned.
+/// Leave guest code for good on this thread, with `code` as its status: jump
+/// to the frame that entered the guest, which retires the thread through
+/// [`finish`]. Never returns, and runs no destructors — whatever the caller
+/// holds is abandoned.
 pub fn unwind(t: &Thread, code: i32) -> ! {
     // A spawn child ending without a committed exec is the failure case its
     // parent is still blocked on.
@@ -223,11 +325,36 @@ pub fn unwind(t: &Thread, code: i32) -> ! {
     }
 }
 
-/// Retire the guest whose `exit` has unwound: disarm dispatch, so the
-/// embedder's own syscalls no longer trap, and hand the status back.
-fn finish(code: i32) -> i32 {
+/// Retire a guest thread whose `exit` has unwound: honor its
+/// `CLONE_CHILD_CLEARTID` word, leave the roster, and settle the status the
+/// process reports. A leader that outlives its own guest waits for the last
+/// sibling first, since POSIX keeps the process alive until then and reports
+/// that last thread's status.
+fn finish(thread: &Thread, code: i32) -> i32 {
+    clear_tid_and_wake(thread);
+    thread.process.record_exit_status(code);
+    thread.process.unregister(thread.tid.get());
+    if !thread.is_leader.get() {
+        return code;
+    }
+    let status = thread.process.wait_for_others(thread.tid.get());
     sud_off();
-    code
+    status
+}
+
+/// Honor `CLONE_CHILD_CLEARTID`/`set_tid_address` on the way out: zero the
+/// registered word and wake one futex waiter on it, exactly as the kernel
+/// does for a real task, which is what a `pthread_join` is blocked on. The
+/// word is guest memory that may already be unmapped, so the store is
+/// best-effort — the kernel's own `put_user` there is unchecked too.
+fn clear_tid_and_wake(thread: &Thread) {
+    let Some(addr) = thread.clear_child_tid.get() else {
+        return;
+    };
+    copy_to_guest(addr, &0u32.to_ne_bytes());
+    unsafe {
+        libc::syscall(libc::SYS_futex, addr, libc::FUTEX_WAKE, 1, 0, 0, 0);
+    }
 }
 
 /// Whether the CPU and kernel expose `rdfsbase`/`wrfsbase` to userspace
@@ -313,4 +440,102 @@ pub fn chimera_altstack() -> libc::stack_t {
     unsafe { libc::sigaltstack(ptr::null(), &mut ss) };
     ss.ss_flags = 0;
     ss
+}
+
+/// The signal Chimera reserves to stop a guest thread. A guest thread
+/// executes natively, so nothing polls a flag; the highest real-time signal
+/// is the one least likely to collide with something the guest installs, and
+/// the guest's own `rt_sigaction` for it is recorded but never honored.
+pub fn stop_signal() -> i32 {
+    libc::SIGRTMAX()
+}
+
+/// Install the handler for the reserved stop signal. `SA_ONSTACK` puts the
+/// unwind on Chimera's alternate stack rather than whatever guest stack was
+/// interrupted, and the mask is full because the handler never returns to
+/// what it interrupted.
+pub fn install_stop_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = mem::zeroed();
+        sa.sa_sigaction = on_stop as *const () as usize;
+        libc::sigfillset(&mut sa.sa_mask);
+        libc::sigdelset(&mut sa.sa_mask, libc::SIGSEGV);
+        libc::sigdelset(&mut sa.sa_mask, libc::SIGBUS);
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        libc::sigaction(stop_signal(), &sa, ptr::null_mut());
+    }
+}
+
+/// End this guest thread on the group's behalf: a sibling issued `exit_group`
+/// or committed an `execve`.
+///
+/// Where the thread can be ended depends on what the signal interrupted, the
+/// same split `signal::on_guest_signal` makes. Guest code holds nothing of
+/// Chimera's, so a thread interrupted there unwinds on the spot — which is
+/// the whole point of the mechanism, since a guest spinning without a syscall
+/// in sight has no other way to be reached. Runtime code is different: this
+/// handler never returns to what it interrupted, so a lock held at that
+/// moment — one of the runtime's, or one inside the embedder's handler —
+/// would be abandoned still locked and strand every thread that wants it
+/// next. Those are flagged and taken at the safepoint in the trap handler,
+/// where the syscall being serviced has finished and nothing is held.
+extern "C" fn on_stop(_signo: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut libc::c_void) {
+    let t = this_thread();
+    let entry_fs = current_fs();
+    set_fs(t.runtime_fs);
+    let uc = unsafe { &mut *(uc as *mut libc::ucontext_t) };
+    let rip = uc.uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
+    if t.sig.in_runtime.get() || rip >= EXEMPT_FLOOR {
+        t.stop_requested.set(true);
+        set_fs(entry_fs);
+        return;
+    }
+    unwind(t, t.process.exit_code.load(Ordering::Relaxed));
+}
+
+/// Block the reserved stop signal for as long as this value lives.
+///
+/// The stop handler does not return to what it interrupted — it unwinds the
+/// thread — so any lock held at the moment it lands is abandoned still
+/// locked, and the next thread to want it waits forever. The `execve` install
+/// path holds exactly such a lock while it tears the old image down, and it
+/// is also the one path a concurrent exec might try to stop. Blocking the
+/// signal makes the teardown uninterruptible; the stop is merely deferred,
+/// and lands at the release.
+pub struct StopBlocked(u64);
+
+impl StopBlocked {
+    pub fn new() -> Self {
+        let set = sig_bit(stop_signal());
+        let mut old: u64 = 0;
+        host_syscall(&SystemCall::new(
+            libc::SYS_rt_sigprocmask as u64,
+            [
+                libc::SIG_BLOCK as u64,
+                &set as *const u64 as u64,
+                &mut old as *mut u64 as u64,
+                8,
+                0,
+                0,
+            ],
+        ));
+        Self(old)
+    }
+}
+
+impl Drop for StopBlocked {
+    fn drop(&mut self) {
+        let set = self.0;
+        host_syscall(&SystemCall::new(
+            libc::SYS_rt_sigprocmask as u64,
+            [
+                libc::SIG_SETMASK as u64,
+                &set as *const u64 as u64,
+                0,
+                8,
+                0,
+                0,
+            ],
+        ));
+    }
 }

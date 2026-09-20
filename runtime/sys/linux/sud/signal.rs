@@ -13,12 +13,13 @@
 //! Chimera's handler carries no `SA_RESTART`, so the kernel hands the
 //! interruption back as `EINTR` for [`restart_wanted`] to rule on.
 //!
-//! Dispositions live in [`Process::actions`]; everything else here belongs
-//! to the thread.
+//! Dispositions are process-wide, as POSIX requires, and live in
+//! [`Process::actions`]; everything else here is one thread's.
 
 use std::{
     cell::{Cell, UnsafeCell},
     mem, ptr,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use crate::{
@@ -118,23 +119,58 @@ impl Default for GuestAction {
     }
 }
 
-/// One signal disposition. A `Cell` of a `Copy` value rather than a
-/// `RefCell`: [`on_guest_signal`] reads the table from a handler that can
-/// interrupt `rt_sigaction` mid-update, and a borrow held across that
-/// interruption would panic.
-pub struct ActionSlot(Cell<GuestAction>);
+/// One signal disposition, published for lock-free reads.
+///
+/// The trap handler cannot take a lock to read this. A guest signal arriving
+/// mid-service runs [`on_guest_signal`] on the same thread, which reads the
+/// disposition to decide what to do with it; if the interrupted code held a
+/// mutex over the table, that read would deadlock against itself. So the slot
+/// is a seqlock: writers — `rt_sigaction`, which is rare — bump `seq` to an
+/// odd value, store, and bump it to even, while a reader retries until it
+/// sees one even value twice with no change across the load. That is enough
+/// to make a torn read impossible without any reader ever blocking.
+pub struct ActionSlot {
+    seq: AtomicU32,
+    handler: AtomicU64,
+    flags: AtomicU64,
+    mask: AtomicU64,
+}
 
 impl ActionSlot {
     pub fn new() -> Self {
-        Self(Cell::new(GuestAction::default()))
+        Self {
+            seq: AtomicU32::new(0),
+            handler: AtomicU64::new(libc::SIG_DFL as u64),
+            flags: AtomicU64::new(0),
+            mask: AtomicU64::new(0),
+        }
     }
 
     fn load(&self) -> GuestAction {
-        self.0.get()
+        loop {
+            let before = self.seq.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let action = GuestAction {
+                handler: self.handler.load(Ordering::Relaxed),
+                flags: self.flags.load(Ordering::Relaxed),
+                mask: self.mask.load(Ordering::Relaxed),
+            };
+            if self.seq.load(Ordering::Acquire) == before {
+                return action;
+            }
+        }
     }
 
     fn store(&self, action: GuestAction) {
-        self.0.set(action);
+        let seq = self.seq.load(Ordering::Relaxed);
+        self.seq.store(seq.wrapping_add(1), Ordering::Release);
+        self.handler.store(action.handler, Ordering::Relaxed);
+        self.flags.store(action.flags, Ordering::Relaxed);
+        self.mask.store(action.mask, Ordering::Relaxed);
+        self.seq.store(seq.wrapping_add(2), Ordering::Release);
     }
 }
 

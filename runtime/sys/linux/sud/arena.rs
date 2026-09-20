@@ -6,9 +6,13 @@
 //! therefore mapped into an arena below the line, and so is every `NULL`-hint
 //! guest `mmap`, which is what extends the guarantee past load time — a JIT
 //! writes its code into arena pages, so the syscall instructions it emits
-//! trap like any other. The arena is one bump allocator over a fixed range.
+//! trap like any other. The arena is one bump allocator over a fixed range,
+//! shared by every thread of the process because the address space is.
 
-use std::cell::{Cell, RefCell};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use crate::{Error, SyscallResult, SystemCall};
 
@@ -33,20 +37,22 @@ const _: () = assert!(GUEST_ARENA_CEILING <= EXEMPT_FLOOR);
 const ARENA_IMAGE_GAP: u64 = 2 * 1024 * 1024;
 
 pub struct Arena {
-    /// The bump pointer, only ever advanced.
-    bump: Cell<u64>,
+    /// The bump pointer. Only ever advanced: a concurrent `mmap` that loses
+    /// the race for a hint sees `EEXIST` and moves past it, so the pointer
+    /// converges on free space without a lock.
+    bump: AtomicU64,
     /// Mappings owned by the current guest image, in the arena or not —
     /// `ET_EXEC` segments sit at their fixed low addresses and the initial
     /// stack where the kernel put it — torn down together with the arena when
     /// an `execve` replaces the image.
-    regions: RefCell<Vec<(u64, u64)>>,
+    regions: Mutex<Vec<(u64, u64)>>,
 }
 
 impl Arena {
     pub fn new() -> Self {
         Self {
-            bump: Cell::new(GUEST_ARENA_BASE),
-            regions: RefCell::new(Vec::new()),
+            bump: AtomicU64::new(GUEST_ARENA_BASE),
+            regions: Mutex::new(Vec::new()),
         }
     }
 
@@ -70,7 +76,7 @@ impl Arena {
             None => (main.entry, 0, None),
         };
         let (rsp, stack_start, stack_len) = build_stack(argv, envp, execfn, &main, interp_base)?;
-        let mut regions = self.regions.borrow_mut();
+        let mut regions = self.regions.lock().unwrap();
         regions.extend(&main.regions);
         if let Some(interp) = &interp {
             regions.extend(&interp.regions);
@@ -82,11 +88,11 @@ impl Arena {
     /// Map one image, drawing `ET_DYN` placement from the bump pointer and
     /// advancing it past whatever landed in the arena.
     fn load(&self, parsed: &ParsedElf) -> Result<LoadedElf, Error> {
-        let elf = map_elf_native(parsed, self.bump.get())?;
+        let elf = map_elf_native(parsed, self.bump.load(Ordering::Relaxed))?;
         for &(start, len) in &elf.regions {
             if (GUEST_ARENA_BASE..GUEST_ARENA_CEILING).contains(&start) {
                 let end = (start + len + ARENA_IMAGE_GAP + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-                self.bump.set(self.bump.get().max(end));
+                self.bump.fetch_max(end, Ordering::Relaxed);
             }
         }
         Ok(elf)
@@ -97,10 +103,10 @@ impl Arena {
     /// explicit high hint, past the arena's ceiling — are not tracked and
     /// leak across an `execve`.
     pub fn teardown(&self) {
-        for (start, len) in self.regions.borrow_mut().drain(..) {
+        for (start, len) in self.regions.lock().unwrap().drain(..) {
             unsafe { libc::munmap(start as *mut libc::c_void, len as usize) };
         }
-        let watermark = self.bump.replace(GUEST_ARENA_BASE);
+        let watermark = self.bump.swap(GUEST_ARENA_BASE, Ordering::Relaxed);
         if watermark > GUEST_ARENA_BASE {
             unsafe {
                 libc::munmap(
@@ -124,7 +130,7 @@ impl Arena {
         }
         let len = (call.args[1] + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         loop {
-            let hint = self.bump.get();
+            let hint = self.bump.load(Ordering::Relaxed);
             if hint + len > GUEST_ARENA_CEILING {
                 // Arena exhausted; let the kernel place it and accept that a
                 // syscall from such a page would go unintercepted.
@@ -145,16 +151,23 @@ impl Arena {
             let result = host_syscall(&placed);
             match result {
                 SyscallResult::Error(libc::EEXIST) => {
-                    self.bump.set(hint + len.max(ARENA_IMAGE_GAP));
+                    self.bump
+                        .fetch_max(hint + len.max(ARENA_IMAGE_GAP), Ordering::Relaxed);
                 }
                 _ => {
                     if matches!(result, SyscallResult::Ok(_)) {
-                        self.bump.set(hint + len);
+                        self.bump.fetch_max(hint + len, Ordering::Relaxed);
                     }
                     call.set_result(result);
                     return;
                 }
             }
         }
+    }
+
+    /// Take the arena's lock, to be held across a forwarded `fork` (see
+    /// `Process::lock_for_fork`).
+    pub fn lock_for_fork(&self) -> std::sync::MutexGuard<'_, Vec<(u64, u64)>> {
+        self.regions.lock().unwrap()
     }
 }

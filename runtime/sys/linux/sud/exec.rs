@@ -4,9 +4,11 @@
 //! clears syscall user dispatch across a real `execve`, so the replacement
 //! would run unintercepted. Chimera tears the guest image down, loads the new
 //! one into a fresh arena, and points the trapped context at its entry so
-//! `sigreturn` lands on the new program.
+//! `sigreturn` lands on the new program. An exec from a thread that is not
+//! the group leader hands the image to the leader instead (see
+//! [`do_execve`]).
 
-use std::os::fd::AsRawFd;
+use std::{mem, os::fd::AsRawFd};
 
 use crate::{Error, SyscallResult, SystemCall};
 
@@ -14,7 +16,7 @@ use super::{
     super::exec::{ExecRequest, PreparedExec, close_cloexec_fds, exec_errno, prepare_exec},
     clone::report_spawn,
     signal::reset_guest_signals,
-    thread::{Thread, aim_context, unwind},
+    thread::{StopBlocked, Thread, aim_context, unwind},
 };
 
 /// Emulated `execve`: validate and parse in place (a failure reports
@@ -40,6 +42,30 @@ pub fn do_execve(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t) {
     // about to close it.
     report_spawn(t, 0);
 
+    if !t.is_leader.get() {
+        // Linux hands the exec'ing thread the leader's identity, so the new
+        // image's only thread has `tid == pid`. Chimera cannot move a TID
+        // between host threads, so it moves the *image* instead: the leader
+        // is stopped, picks the request up in `thread::enter`, and runs the
+        // new program on the host thread whose TID already is the pid. This
+        // thread's own guest ends here, like every other sibling `de_thread`
+        // takes.
+        match t.process.publish_exec(prepared) {
+            None => t.process.stop_others(t.tid.get()),
+            // Refused: a sibling's exec is already dissolving this group,
+            // this thread with it, so there is nothing more to do — the stop
+            // already in flight takes it like any other sibling. The image it
+            // prepared is deliberately leaked rather than dropped: closing
+            // its files here would race the winner's close-on-exec sweep,
+            // which is enumerating descriptors on another thread, and a
+            // number freed mid-sweep can be reissued to something the runtime
+            // still owns and then closed out from under it. The winner's
+            // sweep closes these instead, exactly once.
+            Some(rejected) => mem::forget(rejected),
+        }
+        unwind(t, 0);
+    }
+
     match install_image(t, prepared) {
         Ok((rip, rsp)) => {
             aim_context(&mut uc.uc_mcontext.gregs, rip, rsp);
@@ -54,9 +80,11 @@ pub fn do_execve(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t) {
     }
 }
 
-/// Replace the guest image with a prepared one; returns the entry `rip` and
-/// initial `rsp` of the new program.
+/// Replace the guest image with a prepared one on the calling thread, which
+/// becomes the group's leader; returns the entry `rip` and initial `rsp` of
+/// the new program.
 pub fn install_image(t: &Thread, prepared: PreparedExec) -> Result<(u64, u64), Error> {
+    let _uninterruptible = StopBlocked::new();
     let PreparedExec {
         req,
         parsed,
@@ -65,6 +93,17 @@ pub fn install_image(t: &Thread, prepared: PreparedExec) -> Result<(u64, u64), E
     let ExecRequest {
         path, argv, envp, ..
     } = req;
+
+    // Linux's `de_thread`: every other thread of the group dies before a new
+    // image is installed, whichever thread called exec. Here it is also a
+    // safety requirement — the teardown below unmaps the arena, and a sibling
+    // still executing guest code out of it would fault on the next
+    // instruction.
+    t.process.quiesce_others(t.tid.get());
+    // The exec'ing thread takes the group over. If it was not the leader, the
+    // old leader has just unwound and is waiting for the group to end; this
+    // thread is now the group, and its status is the process's.
+    t.is_leader.set(true);
 
     // The handler first: a descriptor table's close-on-exec flags live in
     // the table, invisible to the host-fd sweep.
