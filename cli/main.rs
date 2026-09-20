@@ -199,6 +199,7 @@ fn run(mut cmd: RunCmd) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    sandbox.backend(cmd.backend);
     if let Some(mib) = cmd.code_cache_size {
         sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
     }

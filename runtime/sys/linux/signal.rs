@@ -88,11 +88,11 @@ pub struct GuestSigaction {
 /// The kernel `rt_sigaction` struct (x86-64), as the raw syscall sees it.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct KernelSigaction {
-    handler: u64,
-    flags: u64,
-    restorer: u64,
-    mask: u64,
+pub struct KernelSigaction {
+    pub handler: u64,
+    pub flags: u64,
+    pub restorer: u64,
+    pub mask: u64,
 }
 
 /// `stack_t` as the kernel lays it out on x86-64.
