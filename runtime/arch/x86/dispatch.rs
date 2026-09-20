@@ -25,7 +25,7 @@ use crate::{
     process::Process,
     sys::{
         linux::signal::Signals,
-        mmap::{AddressSpace, copy_from_guest, copy_to_guest},
+        mmap::{AddressSpace, copy_to_guest},
     },
 };
 
@@ -366,7 +366,8 @@ impl Thread {
     }
 
     /// `clone3(CLONE_VM)`: the arguments come from the base `clone_args`
-    /// struct already copied out of guest memory by [`read_clone3_args`], as
+    /// struct already copied out of guest memory (see
+    /// `crate::sys::linux::syscall::Clone3Args`), as
     /// 8 `u64` fields (uapi `<linux/sched.h>` order): flags, pidfd, child_tid,
     /// parent_tid, exit_signal, stack, stack_size, tls. Unlike `clone`, the
     /// `stack` field is the *lowest* address of the child stack and
@@ -705,33 +706,6 @@ impl Thread {
         }
         Ok(())
     }
-}
-
-/// The base `struct clone_args` (`CLONE_ARGS_SIZE_VER0`): the 8 `u64` fields
-/// every `clone3` must supply. The kernel rejects a smaller struct with
-/// `EINVAL` and one larger than a page with `E2BIG`.
-const CLONE_ARGS_SIZE_VER0: u64 = 64;
-pub const CLONE_ARGS_SIZE_MAX: u64 = 4096;
-
-/// Copy the base `clone_args` struct a `clone3` points at out of guest
-/// memory, fault-safely (see [`copy_from_guest`]). `None` — returned for an
-/// unreadable struct and for a guest-declared `size` outside the kernel's
-/// accepted range — tells the caller to forward the call, so the kernel
-/// reports the authoritative error (`EFAULT`, `EINVAL`, `E2BIG`) exactly as
-/// it would natively.
-pub fn read_clone3_args(args_ptr: u64, size: u64) -> Option<[u64; 8]> {
-    if !(CLONE_ARGS_SIZE_VER0..=CLONE_ARGS_SIZE_MAX).contains(&size) {
-        return None;
-    }
-    let mut raw = [0u8; CLONE_ARGS_SIZE_VER0 as usize];
-    if !copy_from_guest(args_ptr, &mut raw) {
-        return None;
-    }
-    let mut args = [0u64; 8];
-    for (slot, chunk) in args.iter_mut().zip(raw.chunks_exact(8)) {
-        *slot = u64::from_ne_bytes(chunk.try_into().unwrap());
-    }
-    Some(args)
 }
 
 /// Whether a syscall interrupted by a signal must always fail with `EINTR`,
