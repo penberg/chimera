@@ -9,7 +9,9 @@ EXCLUDE := $(if $(filter Darwin,$(shell uname -s)),--exclude fs,)
 build:
 	cargo build --quiet
 
-check: conformance-native conformance
+# Every mode the suite runs in: without Chimera, translated, translated with
+# the overlay bypassed, and native behind syscall user dispatch.
+check: conformance-native conformance conformance-unsafe conformance-sud
 .PHONY: check
 
 clean:
