@@ -204,10 +204,10 @@ mod host {
 
     use super::{SyscallResult, SystemCall, SystemCalls, host_syscall};
     use crate::{
-        arch::dispatch::{CLONE_ARGS_SIZE_MAX, RSP, Thread, read_clone3_args},
-        sys::{
-            linux::exec::{exec_errno, prepare_exec},
-            mmap::copy_from_guest,
+        arch::dispatch::{RSP, Thread},
+        sys::linux::{
+            exec::{exec_errno, prepare_exec},
+            syscall::{CLONE_CLEAR_SIGHAND, Clone3Args, is_thread_clone},
         },
     };
 
@@ -557,75 +557,52 @@ mod host {
             // kernel would reject falls through to a plain forward, so the kernel
             // reports the authoritative `EFAULT`/`EINVAL`/`E2BIG`). Then split the
             // same three ways as `clone`: a thread runs on a host thread; a
-            // `CLONE_VM`-without-`CLONE_THREAD` spawn is forked (the stripped
-            // flags written back into the guest struct first); everything else is
-            // an ordinary forwarded `fork`.
-            libc::SYS_clone3 => match read_clone3_args(call.args[0], call.args[1]) {
-                Some(cargs) if is_thread_clone(cargs[0]) => {
-                    let tid = thread.clone3_vm(&cargs);
+            // `CLONE_VM`-without-`CLONE_THREAD` spawn is forked from a private
+            // copy with the shape stripped (see [`Clone3Args`]); everything else
+            // is an ordinary forwarded `fork`.
+            libc::SYS_clone3 => match Clone3Args::read(call.args[0], call.args[1]) {
+                Ok(cargs) if is_thread_clone(cargs.flags()) => {
+                    let tid = thread.clone3_vm(&cargs.fields());
                     call.set_return(tid);
                 }
-                // `vfork`/`posix_spawn` (see the `SYS_clone` arm above).
-                Some(cargs)
-                    if cargs[0] & libc::CLONE_VM as u64 != 0
-                        && cargs[0] & libc::CLONE_THREAD as u64 == 0
-                        && cargs[0] & libc::CLONE_VFORK as u64 != 0 =>
+                // `vfork`/`posix_spawn` (see the `SYS_clone` arm above): strip
+                // `CLONE_VM`/`CLONE_VFORK` and zero the stack fields so the host
+                // `fork` keeps Chimera's own stack, then set the guest child's
+                // `rsp` to the stack top.
+                Ok(mut cargs)
+                    if cargs.flags() & libc::CLONE_VM as u64 != 0
+                        && cargs.flags() & libc::CLONE_THREAD as u64 == 0
+                        && cargs.flags() & libc::CLONE_VFORK as u64 != 0 =>
                 {
-                    // `clone_args`: [flags, pidfd, child_tid, parent_tid,
-                    // exit_signal, stack, stack_size, tls]. The child runs on
-                    // `stack + stack_size`. Strip `CLONE_VM`/`CLONE_VFORK` and
-                    // zero the stack fields so the host `fork` keeps Chimera's
-                    // own stack, then set the guest child's `rsp` to the stack
-                    // top. `clone3` only requires the struct to be readable, so
-                    // rather than rewrite the guest's copy (illegal if it is in a
-                    // read-only mapping, and observable to the caller after),
-                    // forward a private edited copy in Chimera's own memory.
-                    let guest_stack_top = if cargs[5] != 0 {
-                        cargs[5].wrapping_add(cargs[6])
-                    } else {
-                        0
-                    };
-                    let size = call.args[1] as usize;
-                    let mut buf = [0u8; CLONE_ARGS_SIZE_MAX as usize];
-                    if !copy_from_guest(call.args[0], &mut buf[..size]) {
-                        // Unreadable at the declared size: let the kernel report
-                        // the authoritative EFAULT by forwarding the original.
-                        forked(thread, call, handler, 0);
-                    } else {
-                        let stripped = cargs[0]
-                            & !((libc::CLONE_VM | libc::CLONE_VFORK) as u64 | CLONE_CLEAR_SIGHAND);
-                        buf[0..8].copy_from_slice(&stripped.to_ne_bytes());
-                        buf[40..56].fill(0); // stack, stack_size
-                        call.args[0] = buf.as_ptr() as u64;
-                        spawned(thread, call, handler, guest_stack_top);
-                        if cargs[0] & CLONE_CLEAR_SIGHAND != 0 && call.return_value() == 0 {
-                            thread.signals_mut().clear_sighand();
-                        }
+                    let flags = cargs.flags();
+                    let guest_stack_top = cargs.child_stack_top();
+                    cargs.set_flags(
+                        flags
+                            & !((libc::CLONE_VM | libc::CLONE_VFORK) as u64 | CLONE_CLEAR_SIGHAND),
+                    );
+                    cargs.clear_stack();
+                    call.args[0] = cargs.as_ptr();
+                    spawned(thread, call, handler, guest_stack_top);
+                    if flags & CLONE_CLEAR_SIGHAND != 0 && call.return_value() == 0 {
+                        thread.signals_mut().clear_sighand();
                     }
                 }
                 // A separate shared-memory process (no `CLONE_VFORK`): refused,
                 // as for `clone`.
-                Some(cargs)
-                    if cargs[0] & libc::CLONE_VM as u64 != 0
-                        && cargs[0] & libc::CLONE_THREAD as u64 == 0 =>
+                Ok(cargs)
+                    if cargs.flags() & libc::CLONE_VM as u64 != 0
+                        && cargs.flags() & libc::CLONE_THREAD as u64 == 0 =>
                 {
                     call.set_result(SyscallResult::Error(libc::EPERM));
                 }
                 // A fork-shaped `clone3` can carry `CLONE_CLEAR_SIGHAND` too:
                 // strip it from a forwarded private copy, as in the spawn arm.
-                Some(cargs) if cargs[0] & CLONE_CLEAR_SIGHAND != 0 => {
-                    let size = call.args[1] as usize;
-                    let mut buf = [0u8; CLONE_ARGS_SIZE_MAX as usize];
-                    if !copy_from_guest(call.args[0], &mut buf[..size]) {
-                        forked(thread, call, handler, 0);
-                    } else {
-                        let stripped = cargs[0] & !CLONE_CLEAR_SIGHAND;
-                        buf[0..8].copy_from_slice(&stripped.to_ne_bytes());
-                        call.args[0] = buf.as_ptr() as u64;
-                        forked(thread, call, handler, 0);
-                        if call.return_value() == 0 {
-                            thread.signals_mut().clear_sighand();
-                        }
+                Ok(mut cargs) if cargs.flags() & CLONE_CLEAR_SIGHAND != 0 => {
+                    cargs.set_flags(cargs.flags() & !CLONE_CLEAR_SIGHAND);
+                    call.args[0] = cargs.as_ptr();
+                    forked(thread, call, handler, 0);
+                    if call.return_value() == 0 {
+                        thread.signals_mut().clear_sighand();
                     }
                 }
                 _ => forked(thread, call, handler, 0),
@@ -804,28 +781,6 @@ mod host {
         }
 
         handler.post_syscall(call);
-    }
-
-    /// `clone3`'s reset-the-child's-signal-dispositions flag (bit 32; `libc`'s
-    /// `c_int` constant truncates it to 0). Only `clone3` accepts it — the
-    /// legacy `clone` entry keeps just the low 32 flag bits. It must never
-    /// reach the host `clone3`: the kernel would flush *Chimera's* handlers —
-    /// the syscall interrupt, the guest-signal catcher — out of the child's
-    /// slots, and the first exit-time interrupt would then kill the child
-    /// with the runtime's reserved signal. It is stripped from the forwarded
-    /// call and applied to the child's virtual table instead
-    /// ([`crate::sys::linux::signal::Signals::clear_sighand`]).
-    const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
-
-    /// Whether clone flags describe a new thread of the calling process. The
-    /// kernel demands the full shape — `CLONE_THREAD` requires `CLONE_SIGHAND`,
-    /// which requires `CLONE_VM` (anything less is `EINVAL`) — so gating the
-    /// host-thread intercept on all three bits means a malformed thread clone
-    /// falls through to forwarding and gets the kernel's authoritative error.
-    fn is_thread_clone(flags: u64) -> bool {
-        const THREAD_SHAPE: u64 =
-            libc::CLONE_THREAD as u64 | libc::CLONE_SIGHAND as u64 | libc::CLONE_VM as u64;
-        flags & THREAD_SHAPE == THREAD_SHAPE
     }
 
     /// Forward a `fork`-shaped duplication and fix up the child. The fork runs

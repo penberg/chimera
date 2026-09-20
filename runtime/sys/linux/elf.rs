@@ -229,6 +229,19 @@ pub fn parse_elf(path: &Path) -> Result<ParsedElf, Error> {
 /// Map a parsed ELF image into memory. The commit phase: the reservation and
 /// `PT_LOAD` mappings it makes cannot be rolled back.
 pub fn map_elf(parsed: &ParsedElf) -> Result<LoadedElf, Error> {
+    map_elf_at(parsed, None)
+}
+
+/// Map a parsed ELF image for native execution behind syscall user dispatch:
+/// executable segments keep `PROT_EXEC` (there is no translator to run them
+/// for the guest), and an `ET_DYN` image is placed at `hint`, which the SUD
+/// driver draws from its low guest arena so the image sits outside the
+/// dispatch-exempt region (see [`crate::sys::linux::sud`]).
+pub fn map_elf_native(parsed: &ParsedElf, hint: u64) -> Result<LoadedElf, Error> {
+    map_elf_at(parsed, Some(hint))
+}
+
+fn map_elf_at(parsed: &ParsedElf, native_hint: Option<u64>) -> Result<LoadedElf, Error> {
     let ParsedElf {
         ehdr,
         phdrs,
@@ -241,12 +254,18 @@ pub fn map_elf(parsed: &ParsedElf) -> Result<LoadedElf, Error> {
 
     let base = if ehdr.e_type == ET_DYN {
         let total = (hi - lo) as usize;
+        let (addr, place) = match native_hint {
+            // The address matters, so a taken hint is an error, not a silent
+            // relocation into the exempt region.
+            Some(hint) => (hint as *mut libc::c_void, libc::MAP_FIXED_NOREPLACE),
+            None => (ptr::null_mut(), 0),
+        };
         let reservation = unsafe {
             libc::mmap(
-                ptr::null_mut(),
+                addr,
                 total,
                 libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | place,
                 -1,
                 0,
             )
@@ -282,15 +301,21 @@ pub fn map_elf(parsed: &ParsedElf) -> Result<LoadedElf, Error> {
         if ph.p_flags & PF_W != 0 {
             prot |= libc::PROT_WRITE;
         }
-        // W^X: Chimera never executes guest pages natively — the dispatcher
-        // reads them and runs translated blocks from the code cache — so an
-        // executable segment is mapped read-only rather than `PROT_EXEC`. This
-        // mirrors the `PROT_EXEC` stripping the syscall driver applies to the
-        // libraries the dynamic linker maps later; here it covers the
-        // executable and interpreter images the runtime maps itself, which
-        // never pass through that path. `PROT_READ` keeps them translatable.
+        // W^X: under translation Chimera never executes guest pages natively —
+        // the dispatcher reads them and runs translated blocks from the code
+        // cache — so an executable segment is mapped read-only rather than
+        // `PROT_EXEC`. This mirrors the `PROT_EXEC` stripping the syscall
+        // driver applies to the libraries the dynamic linker maps later; here
+        // it covers the executable and interpreter images the runtime maps
+        // itself, which never pass through that path. `PROT_READ` keeps them
+        // translatable. Under syscall user dispatch the CPU itself executes
+        // the segment, so the native loader keeps `PROT_EXEC`.
         if ph.p_flags & PF_X != 0 {
-            prot |= libc::PROT_READ;
+            prot |= if native_hint.is_some() {
+                libc::PROT_EXEC | libc::PROT_READ
+            } else {
+                libc::PROT_READ
+            };
         }
 
         let fixed = if ehdr.e_type == ET_EXEC {

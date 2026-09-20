@@ -53,6 +53,37 @@ pub fn mpk_enabled() -> bool {
     arch::mpk_enabled()
 }
 
+/// How a [`Sandbox`] executes its guest and intercepts its system calls. An
+/// embedder written against one backend runs unmodified on the other.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Backend {
+    /// Same-ISA dynamic binary translation, the default: every guest
+    /// instruction runs from the translated-code cache, so interception
+    /// covers control flow as well as system calls.
+    Translate,
+    /// Native execution behind Linux syscall user dispatch
+    /// (`prctl(PR_SET_SYSCALL_USER_DISPATCH)`, Linux 5.11): guest
+    /// instructions run unmodified on the CPU and each system call traps to
+    /// the same [`SystemCalls`] handler via `SIGSYS`. Native speed, but only
+    /// syscall *sites* are confined, not control flow: a hostile guest can
+    /// branch to a syscall instruction in the runtime's own text. For guests
+    /// that are not the adversary.
+    SyscallUserDispatch,
+}
+
+impl std::str::FromStr for Backend {
+    type Err = String;
+
+    /// The short names the `chimera` CLI accepts: `dbt` and `sud`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "dbt" => Ok(Self::Translate),
+            "sud" => Ok(Self::SyscallUserDispatch),
+            other => Err(format!("unknown backend {other:?} (expected dbt or sud)")),
+        }
+    }
+}
+
 /// A sandboxed guest program, configured but not yet running.
 pub struct Sandbox {
     program: PathBuf,
@@ -60,6 +91,7 @@ pub struct Sandbox {
     envs: Option<Vec<(OsString, OsString)>>,
     handler: Box<dyn SystemCalls>,
     code_cache_size: usize,
+    backend: Backend,
 }
 
 impl Sandbox {
@@ -77,7 +109,15 @@ impl Sandbox {
             envs: None,
             handler: Box::new(Passthrough),
             code_cache_size: DEFAULT_CODE_CACHE_SIZE,
+            backend: Backend::Translate,
         })
+    }
+
+    /// Select the execution backend. Replaces the default
+    /// [`Backend::Translate`].
+    pub fn backend(&mut self, backend: Backend) -> &mut Self {
+        self.backend = backend;
+        self
     }
 
     /// Append a single argument to the guest's argv.
@@ -140,13 +180,18 @@ impl Sandbox {
             ));
         }
         let handler = std::mem::replace(&mut self.handler, Box::new(Passthrough));
-        let code = sys::exec::execv(
-            &self.program,
-            &self.args,
-            self.envs.as_deref(),
-            handler,
-            self.code_cache_size,
-        )?;
+        let code = match self.backend {
+            Backend::Translate => sys::exec::execv(
+                &self.program,
+                &self.args,
+                self.envs.as_deref(),
+                handler,
+                self.code_cache_size,
+            )?,
+            Backend::SyscallUserDispatch => {
+                sys::linux::sud::execv(&self.program, &self.args, self.envs.as_deref(), handler)?
+            }
+        };
         Ok(ExitStatus { code })
     }
 }

@@ -41,3 +41,15 @@ jobs:
       - name: conformance
         if: runner.os == 'Linux'
         run: make conformance
+
+      # The overlay bypassed, so the passthrough path it normally shields is
+      # exercised directly.
+      - name: conformance (unsafe)
+        if: runner.os == 'Linux'
+        run: make conformance-unsafe
+
+      # The same suite against the other execution backend, which runs the
+      # guest natively behind syscall user dispatch. Needs Linux 5.11+.
+      - name: conformance (syscall user dispatch)
+        if: runner.os == 'Linux'
+        run: make conformance-sud

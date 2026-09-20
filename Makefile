@@ -9,7 +9,9 @@ EXCLUDE := $(if $(filter Darwin,$(shell uname -s)),--exclude fs,)
 build:
 	cargo build --quiet
 
-check: conformance-native conformance
+# Every mode the suite runs in: without Chimera, translated, translated with
+# the overlay bypassed, and native behind syscall user dispatch.
+check: conformance-native conformance conformance-unsafe conformance-sud
 .PHONY: check
 
 clean:
@@ -34,3 +36,9 @@ conformance-native:
 conformance-unsafe: build
 	python3 testing/lit.py $(EXCLUDE) --runner "$(RUNNER) --unsafe"
 .PHONY: conformance-unsafe
+
+# The suite against the syscall-user-dispatch backend, which runs the guest
+# natively rather than translating it. Requires Linux 5.11 or newer.
+conformance-sud: build
+	python3 testing/lit.py --runner "$(RUNNER) --backend sud"
+.PHONY: conformance-sud

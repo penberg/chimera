@@ -51,9 +51,10 @@ const SIG_IGN: u64 = 1;
 /// `sa_flags` bit (not always exposed by `libc`): the guest supplied a restorer.
 const SA_RESTORER: u64 = 0x0400_0000;
 
-/// `ss_flags` bit: the alternate stack is disabled.
-const SS_ONSTACK: i32 = 1;
-const SS_DISABLE: i32 = 2;
+/// `ss_flags` bits: the thread is running on the alternate stack, and the
+/// alternate stack is disabled.
+pub const SS_ONSTACK: i32 = 1;
+pub const SS_DISABLE: i32 = 2;
 
 /// Signals that can never be caught, blocked, or ignored.
 const SIGKILL: u64 = 9;
@@ -88,11 +89,11 @@ pub struct GuestSigaction {
 /// The kernel `rt_sigaction` struct (x86-64), as the raw syscall sees it.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct KernelSigaction {
-    handler: u64,
-    flags: u64,
-    restorer: u64,
-    mask: u64,
+pub struct KernelSigaction {
+    pub handler: u64,
+    pub flags: u64,
+    pub restorer: u64,
+    pub mask: u64,
 }
 
 /// `stack_t` as the kernel lays it out on x86-64.
