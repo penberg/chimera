@@ -3,7 +3,7 @@
 //!
 //! The guest runs on the host thread that called [`super::execv`]. What the
 //! trap handler needs from that thread — the two `fs` bases it switches
-//! between, the frame its `exit` unwinds to — lives in
+//! between, its signal state, the frame its `exit` unwinds to — lives in
 //! [`Thread`], reached through the `gs` base (see [`this_thread`]). The
 //! thread enters guest code through [`enter`] and leaves it for good through
 //! [`unwind`], which lands back in the entering frame to retire the guest in
@@ -16,7 +16,7 @@ use std::{
 
 use crate::{Error, SyscallResult, SystemCall, sys::mmap::copy_to_guest};
 
-use super::{super::syscall::host_syscall, Process, sud_off, sud_on};
+use super::{super::syscall::host_syscall, Process, signal::Signals, sud_off, sud_on};
 
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
@@ -55,6 +55,9 @@ pub struct Thread {
     /// with `getcontext`. Boxed so the `fpregs` self-pointer `getcontext`
     /// plants stays valid.
     exit_ctx: Box<UnsafeCell<libc::ucontext_t>>,
+    /// The guest's signal state: mask, deferred signals, and alternate stack.
+    /// Dispositions live in [`Process::actions`].
+    pub sig: Signals,
 }
 
 impl Thread {
@@ -75,6 +78,7 @@ impl Thread {
             spawn_exec_errno: Cell::new(None),
             exit: Cell::new(None),
             exit_ctx: Box::new(UnsafeCell::new(unsafe { mem::zeroed() })),
+            sig: Signals::new(),
         }
     }
 
@@ -272,8 +276,8 @@ pub fn set_fs(base: u64) {
     ));
 }
 
-/// The trap handler needs a stack of its own: an `execve` intercept unmaps
-/// the old guest stack — the very stack the handler would otherwise be
+/// The handlers need a stack of their own: an `execve` intercept unmaps the
+/// old guest stack — the very stack the trap handler would otherwise be
 /// running on.
 fn install_altstack() -> Result<(), Error> {
     const ALT_STACK_SIZE: usize = 1024 * 1024;
@@ -299,4 +303,14 @@ fn install_altstack() -> Result<(), Error> {
         return Err(Error::last_os_error("sigaltstack"));
     }
     Ok(())
+}
+
+/// Chimera's own alternate stack, as a `stack_t`. Installed once by
+/// [`install_altstack`] and recorded so a frame Chimera builds can name it
+/// for `rt_sigreturn` to restore.
+pub fn chimera_altstack() -> libc::stack_t {
+    let mut ss: libc::stack_t = unsafe { mem::zeroed() };
+    unsafe { libc::sigaltstack(ptr::null(), &mut ss) };
+    ss.ss_flags = 0;
+    ss
 }

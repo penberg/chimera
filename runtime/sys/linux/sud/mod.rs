@@ -29,11 +29,12 @@
 //!
 //! The pieces: [`arena`] owns the guest half of the address space;
 //! [`thread`] holds the guest thread's state and how the host thread enters
-//! and leaves guest code; [`signal`] forwards the guest's signal calls with
-//! the substitutions dispatch forces; [`clone`] covers the forwarded fork
-//! that must re-arm dispatch in the child; and [`exec`] emulates `execve` in
-//! place. The guest is one thread: a thread-shaped `clone` is refused, since
-//! a second native guest thread would race the state here.
+//! and leaves guest code; [`signal`] mirrors the guest's signal state and
+//! delivers signals against the guest's own context; [`clone`] covers the
+//! forwarded fork that must re-arm dispatch in the child; and [`exec`]
+//! emulates `execve` in place. The guest is one thread: a thread-shaped
+//! `clone` is refused, since a second native guest thread would race the
+//! state here.
 
 mod arena;
 mod clone;
@@ -48,6 +49,7 @@ use crate::{Error, SyscallResult, SystemCall, SystemCalls};
 use super::{elf::parse_elf, exec::initial_request, fault, syscall::host_syscall};
 
 use arena::Arena;
+use signal::{ActionSlot, NSIG};
 use thread::{Thread, set_fs, this_thread};
 
 const PR_SET_SYSCALL_USER_DISPATCH: libc::c_int = 59;
@@ -72,10 +74,13 @@ pub struct SigsysInfo {
     arch: u32,
 }
 
-/// The process-wide guest state: the embedder's handler and the guest arena.
+/// The process-wide guest state: the embedder's handler, the signal
+/// dispositions, and the guest arena.
 pub struct Process {
     /// The embedder's system-call handler.
     pub handler: Box<dyn SystemCalls>,
+    /// The guest's signal dispositions, indexed by signal number.
+    actions: [ActionSlot; NSIG],
     pub arena: Arena,
 }
 
@@ -83,8 +88,14 @@ impl Process {
     fn new(handler: Box<dyn SystemCalls>) -> Self {
         Self {
             handler,
+            actions: std::array::from_fn(|_| ActionSlot::new()),
             arena: Arena::new(),
         }
+    }
+
+    /// The disposition slot for `signo`, which the caller has range-checked.
+    pub fn action(&self, signo: i32) -> &ActionSlot {
+        &self.actions[signo as usize]
     }
 }
 
@@ -195,23 +206,20 @@ fn sud_off() -> i64 {
 
 /// Install the dispatch trap handler.
 ///
-/// Its `sa_mask` is full: a guest signal must not interrupt the handler
-/// mid-service, since its handler would then run against the runtime's `fs`
-/// base, on Chimera's alternate stack, and against a context that describes
-/// the runtime rather than the guest. The cost is that a guest signal no
-/// longer interrupts a *forwarded* blocking syscall: an unhandled `SIGINT`
-/// arriving while the guest is parked in `read` waits for the read to
-/// finish. Deferring delivery to a safepoint, the way the translating
-/// backend does, is what a full implementation needs here. `SIGSEGV` and
-/// `SIGBUS` stay unblocked: they are synchronous faults, and the handler
-/// itself takes them when a guarded copy reads bad guest memory.
+/// Its `sa_mask` is empty, so guest signals stay deliverable for the duration
+/// of the trap: that is what lets one interrupt a *forwarded* blocking
+/// syscall, so an unhandled `SIGINT` arriving while the guest is parked in
+/// `read` is felt rather than waited out. What arrives goes to
+/// `signal::on_guest_signal`, which defers it to the safepoint at the tail
+/// of [`on_sigsys`] rather than letting the guest's handler run against the
+/// runtime's context. The kernel blocks `SIGSYS` inside its own handler,
+/// which is harmless: every syscall the runtime issues comes from the exempt
+/// range and traps nothing.
 fn install_sigsys_handler() {
     unsafe {
         let mut sa: libc::sigaction = mem::zeroed();
         sa.sa_sigaction = on_sigsys as *const () as usize;
-        libc::sigfillset(&mut sa.sa_mask);
-        libc::sigdelset(&mut sa.sa_mask, libc::SIGSEGV);
-        libc::sigdelset(&mut sa.sa_mask, libc::SIGBUS);
+        libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         libc::sigaction(libc::SIGSYS, &sa, ptr::null_mut());
     }
@@ -220,13 +228,21 @@ fn install_sigsys_handler() {
 /// One trapped guest syscall. The first statements run with the *guest's*
 /// `fs` base, so nothing before `set_fs` may touch TLS — no libc wrappers, no
 /// `errno`, no thread locals.
+///
+/// The tail is the backend's safepoint. A guest signal that arrived while the
+/// syscall was being serviced was deferred by `signal::on_guest_signal`,
+/// because the context it interrupted was the runtime's; here the context
+/// describes the guest again — the syscall has its result — so the deferred
+/// signals can be delivered against it.
 extern "C" fn on_sigsys(_signo: libc::c_int, info: *mut libc::siginfo_t, uc: *mut libc::c_void) {
     let t = this_thread();
     set_fs(t.runtime_fs);
+    t.sig.in_runtime.set(true);
 
     let uc = unsafe { &mut *(uc as *mut libc::ucontext_t) };
     let info = unsafe { &*(info as *const SigsysInfo) };
     let nr = info.syscall as u32 as u64;
+    t.sig.refresh_from(uc);
     let gregs = &uc.uc_mcontext.gregs;
     let args = [
         gregs[libc::REG_RDI as usize] as u64,
@@ -239,6 +255,19 @@ extern "C" fn on_sigsys(_signo: libc::c_int, info: *mut libc::siginfo_t, uc: *mu
     let mut call = SystemCall::new(nr, args);
     dispatch(t, &mut call, uc);
     uc.uc_mcontext.gregs[libc::REG_RAX as usize] = call.return_value() as libc::greg_t;
+
+    // A syscall the kernel handed back as `EINTR` was interrupted by a signal
+    // Chimera caught and deferred; whether the guest ever sees the `EINTR` is
+    // its own `SA_RESTART` choice, applied before the frame is built so the
+    // handler returns onto the restarted call.
+    if call.return_value() == -(libc::EINTR as i64) && signal::restart_wanted(t) {
+        signal::restart_syscall(uc, info, nr);
+    }
+
+    t.sig.in_runtime.set(false);
+    signal::publish_host_mask(t, uc);
+    let mask = t.sig.mask.get();
+    signal::deliver_pending(t, uc, mask, mask);
 
     set_fs(t.guest_fs.get());
 }
@@ -262,9 +291,11 @@ fn dispatch(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t) {
         libc::SYS_prctl if call.args[0] == PR_SET_SYSCALL_USER_DISPATCH as u64 => {
             call.set_result(SyscallResult::Error(libc::EPERM));
         }
-        libc::SYS_rt_sigaction => signal::do_sigaction(call),
-        libc::SYS_rt_sigprocmask => signal::do_sigprocmask(call),
-        libc::SYS_rt_sigsuspend => signal::do_sigsuspend(call),
+        libc::SYS_rt_sigaction => signal::do_sigaction(t, call),
+        libc::SYS_rt_sigprocmask => signal::do_sigprocmask(t, call),
+        libc::SYS_rt_sigsuspend => signal::do_sigsuspend(t, call, uc),
+        libc::SYS_rt_sigpending => signal::do_sigpending(t, call),
+        libc::SYS_sigaltstack => signal::do_sigaltstack(t, call),
         libc::SYS_clone => clone::do_clone(t, call, uc),
         libc::SYS_clone3 => clone::do_clone3(t, call, uc),
         // A real vfork child shares the arena bump pointer and `guest_fs`

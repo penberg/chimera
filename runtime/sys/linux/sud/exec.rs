@@ -84,7 +84,7 @@ pub fn install_image(t: &Thread, prepared: PreparedExec) -> Result<(u64, u64), E
         path.as_os_str().as_encoded_bytes(),
     )?;
 
-    reset_guest_signals();
+    reset_guest_signals(t);
     // A fresh image has no TLS yet; hand the handler epilogue a base that at
     // least keeps the host thread coherent until the new libc sets its own.
     t.guest_fs.set(t.runtime_fs);

@@ -91,7 +91,7 @@ pub fn do_clone3(t: &Thread, call: &mut SystemCall, uc: &mut libc::ucontext_t) {
         forward_fork(t, call, uc, child_stack);
     }
     if clear_sighand && matches!(call.result(), Some(SyscallResult::Ok(0))) {
-        reset_guest_signals();
+        reset_guest_signals(t);
     }
 }
 
@@ -135,6 +135,11 @@ pub fn forward_fork(
         // fork: the guest's `clone` is forwarded as a raw syscall and never
         // runs libc's handlers.
         crate::sys::mmap::reset_cached_pid();
+        // POSIX hands the child an empty pending set. The kernel clears its
+        // own; the deferred set Chimera keeps is ordinary memory the fork
+        // copied, so it has to be cleared by hand or the child would take a
+        // signal only its parent was sent.
+        t.sig.pending.clear();
     }
     call.set_result(result);
 }
