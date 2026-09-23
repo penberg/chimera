@@ -21,9 +21,21 @@
 .text
 
 // fn dispatch(ctx: *mut ThreadState /* rdi */, host_pc: u64 /* rsi */)
+//
+// A signal caught while the run loop was between its pending-signal check
+// and this entry sets TS_EXIT_REQUESTED (see `preempt`); the entry bows out
+// before touching any state so the loop iterates and delivers. The check
+// runs before anything is pushed, so the abort is a bare `ret`. A signal that
+// lands anywhere inside this routine after the check is redirected by the
+// preemption code instead, by aiming the pending jump at `exit_now`: through
+// rsi while it still carries host_pc (before `dispatch_host_pc_stashed`) and
+// through TS_HOST_PC once it has been stashed. Both labels, and
+// `dispatch_end`, exist only for that classification.
 .globl dispatch
 .type dispatch, @function
 dispatch:
+    cmp dword ptr gs:[{TS_EXIT_REQUESTED}], 0
+    jne 9f
     // Save Chimera callee-saved registers on the Chimera stack.
     push rbx
     push rbp
@@ -34,6 +46,8 @@ dispatch:
     // Stash Chimera state in ThreadState (reached via GS).
     mov gs:[{TS_CHIMERA_RSP}], rsp
     mov gs:[{TS_HOST_PC}], rsi
+.globl dispatch_host_pc_stashed
+dispatch_host_pc_stashed:
     // Install neither the guest's FS base nor its FP/SIMD state here; both are
     // done lazily by the translator's per-block prologue. The Rust code that
     // ran since the last cache exit holds Chimera's FS base (for its TLS) and
@@ -78,7 +92,23 @@ dispatch:
     mov rdi, [rdi + {TS_RDI}]
     // Jump to host_pc, which we stashed in TS_HOST_PC.
     jmp qword ptr gs:[{TS_HOST_PC}]
+9:
+    ret
+.globl dispatch_end
+dispatch_end:
 .size dispatch, . - dispatch
+
+// Leave the cache immediately with the guest register file as it stands.
+// The preemption code aims an interrupted thread here: every guest register
+// is live in the host registers (rax included, which `exit_block` expects
+// already stashed) and TS_RIP already names the guest PC to resume at, so
+// this is a block exit taken from an arbitrary instruction boundary.
+.globl exit_now
+.type exit_now, @function
+exit_now:
+    mov gs:[{TS_RAX}], rax
+    jmp exit_block
+.size exit_now, . - exit_now
 
 // Continuation of every per-block exit stub (normal exit).
 //

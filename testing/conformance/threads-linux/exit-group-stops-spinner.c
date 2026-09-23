@@ -7,8 +7,8 @@
 // main thread's run returns, so if the stop cannot pop it out of the code
 // cache, the process outlives the exit_group forever where native dies
 // instantly (caught here by the suite's per-test timeout). The stop request
-// arms the spinner's safepoint slot, which the translated back-edge polls
-// read.
+// interrupts the spinner with the reserved host signal, whose handler
+// preempts it straight out of the code cache.
 
 #include <pthread.h>
 #include <sys/syscall.h>

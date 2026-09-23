@@ -2,7 +2,8 @@
 //! (`dispatch`), the assembly trampolines that cross between Chimera and
 //! translated guest code (`trampoline`), the basic-block translator that emits
 //! x86-64 from x86-64 (`translate`), and the translated-block cache that links
-//! those blocks into one another (`cache`).
+//! those blocks into one another (`cache`), and the preemption of a thread
+//! executing translated code from a host signal catcher (`preempt`).
 
 use std::sync::OnceLock;
 
@@ -10,6 +11,7 @@ use crate::Error;
 
 pub mod cache;
 pub mod dispatch;
+pub mod preempt;
 pub mod trampoline;
 pub mod translate;
 

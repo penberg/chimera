@@ -7,7 +7,7 @@ use std::{
     arch::asm,
     mem::offset_of,
     ptr,
-    sync::atomic::{AtomicI32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicI32, AtomicPtr, AtomicUsize, Ordering},
 };
 
 use iced_x86::{
@@ -85,6 +85,280 @@ pub fn code_cache_contains(addr: usize) -> bool {
     lo != 0 && addr >= lo && addr < hi
 }
 
+/// Host-rip layout of the shared inline indirect-branch lookup routine,
+/// published when it is emitted so the preemption code can recover the guest
+/// state of a thread interrupted inside it: the routine's bounds `[lo, hi)`,
+/// the boundary past which every scratch slot it borrows has been written
+/// (`stashed`), and its miss label, which restores the guest registers from
+/// those slots and exits to the dispatcher with the branch target as the
+/// next guest PC.
+static IB_LOOKUP_LO: AtomicUsize = AtomicUsize::new(0);
+static IB_LOOKUP_STASHED: AtomicUsize = AtomicUsize::new(0);
+static IB_LOOKUP_MISS: AtomicUsize = AtomicUsize::new(0);
+static IB_LOOKUP_HI: AtomicUsize = AtomicUsize::new(0);
+
+/// See [`IB_LOOKUP_LO`]. `None` until the routine has been emitted.
+pub struct IbLookupSpan {
+    pub lo: usize,
+    pub stashed: usize,
+    pub miss: usize,
+    pub hi: usize,
+}
+
+pub fn ib_lookup_span() -> Option<IbLookupSpan> {
+    let lo = IB_LOOKUP_LO.load(Ordering::Acquire);
+    (lo != 0).then(|| IbLookupSpan {
+        lo,
+        stashed: IB_LOOKUP_STASHED.load(Ordering::Relaxed),
+        miss: IB_LOOKUP_MISS.load(Ordering::Relaxed),
+        hi: IB_LOOKUP_HI.load(Ordering::Relaxed),
+    })
+}
+
+/// The preemption metadata of the one code cache: a sorted, append-only
+/// index of every translated block ([`IndexEntry`], one per block, in host
+/// address order, which bump allocation makes the order of translation) and
+/// the arena holding each block's [`BlockMeta`]. Both are read by the host
+/// signal catcher, on a thread that is executing translated code while a
+/// sibling may be translating, so they are published lock-free: a block's
+/// metadata and index entry are written before the block is reachable, and
+/// the index length is the release point. Entries are never reclaimed short
+/// of a cache reset — a dropped block's code stays in place for a thread
+/// already in flight through it, and so does its metadata.
+static META_INDEX: AtomicPtr<IndexEntry> = AtomicPtr::new(ptr::null_mut());
+static META_INDEX_LEN: AtomicUsize = AtomicUsize::new(0);
+static META_ARENA: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+
+/// One translated block in the preemption index: where its host code starts
+/// (as an offset into the cache buffer) and where its [`BlockMeta`] lives (as
+/// an offset into the metadata arena).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IndexEntry {
+    host_off: u32,
+    meta_off: u32,
+}
+
+/// Per-block metadata the preemption code needs to recover a precise guest
+/// state from a host rip anywhere inside the block's host code, followed in
+/// the arena by its encoded [`Entry`] list (see [`Entry::encode`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockMeta {
+    /// Guest PC of the block's first instruction.
+    pub guest_pc: u64,
+    /// Guest PC of the terminator instruction.
+    pub term_ip: u64,
+    /// The terminator's taken successor (a branch target or call target), for
+    /// the recipes that resume there.
+    pub taken: u64,
+    /// The terminator's fall-through successor, for the recipes that resume there.
+    pub fall: u64,
+    /// Total host bytes of the block: prologue, body, terminator, stubs.
+    pub host_len: u32,
+    /// Byte length of the encoded entry list following this header.
+    pub entries_len: u32,
+    /// The `imm16` of a `ret imm16` terminator: the stack bytes its `lea`
+    /// releases after the pop.
+    pub rsp_adj: u16,
+}
+
+/// Recovery recipe codes, one per [`Entry`]. A code names, for every
+/// instruction boundary inside the entry's host span, how the precise guest
+/// state relates to the interrupted host state. Every code below `PRO`
+/// describes a body instruction: the guest registers are the host registers
+/// (less the entry's `fix` register, if any, parked in `riprel_scratch`) and
+/// the guest PC is the one accumulated over the preceding body entries.
+pub mod recipe {
+    /// A body instruction; the guest PC advances by `guest_len` past it.
+    pub const BODY: u8 = 0x00;
+    /// Inside a block prologue: the guest PC is the block's own, and the low
+    /// bits name which registers are parked in their prologue slots.
+    pub const PRO: u8 = 0x40;
+    /// `PRO` flag: guest rax is in the rax slot (`regs[0]`).
+    pub const PRO_RAX: u8 = 0x01;
+    /// `PRO` flag: guest rdx is in `fp_scratch`.
+    pub const PRO_RDX: u8 = 0x02;
+    /// `PRO` flag: the guest status flags are in `fp_flags` (`lahf`/`seto` form).
+    pub const PRO_FLAGS: u8 = 0x04;
+    /// Already bound for the dispatcher (a cold exit stub, a syscall or `int3`
+    /// exit sequence): leave the thread alone, it reaches the run loop on its own.
+    pub const FLOW: u8 = 0x80;
+    /// Guest registers are the host registers; resume at the terminator.
+    pub const PRECISE_T: u8 = 0x81;
+    /// Guest registers are the host registers; resume at `taken`.
+    pub const PRECISE_TAKEN: u8 = 0x82;
+    /// Guest registers are the host registers; resume at `fall`.
+    pub const PRECISE_FALL: u8 = 0x83;
+    /// Guest rax is in the rax slot; resume at the terminator.
+    pub const RAXSLOT_T: u8 = 0x84;
+    /// Guest rax is in the rax slot; resume at `taken`.
+    pub const RAXSLOT_TAKEN: u8 = 0x85;
+    /// Guest rax is in the rax slot; resume at the PC in the rbx slot
+    /// (`regs[1]`, where an indirect call parks its target across the push).
+    pub const RAXSLOT_RIP_RBXSLOT: u8 = 0x86;
+    /// Guest rax is in the rax slot; resume at the PC in the host rax (a
+    /// popped return address).
+    pub const RAXSLOT_RIP_RAX: u8 = 0x87;
+    /// [`RAXSLOT_RIP_RAX`], and the guest rsp is the host rsp plus `rsp_adj`
+    /// (a `ret imm16` interrupted between its pop and its stack release).
+    pub const RAXSLOT_RIP_RAX_RSPADJ: u8 = 0x88;
+}
+
+/// One span of a block's host code sharing a recovery recipe. A body
+/// instruction is one entry; a run of non-body instructions with the same
+/// recipe (a stub, a padded branch) may share one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub host_len: u8,
+    /// Guest bytes the PC advances past this span (body entries only).
+    pub guest_len: u8,
+    pub code: u8,
+    /// `1 + ThreadState register index` of a register parked in
+    /// `riprel_scratch` across this span (a far-RIP-relative rewrite), or 0.
+    pub fix: u8,
+}
+
+impl Entry {
+    /// Append the encoded form: one byte (`1..=15`) for the common body
+    /// instruction whose host and guest lengths agree and which parks nothing,
+    /// otherwise a zero byte followed by the four fields.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        if self.code == recipe::BODY
+            && self.fix == 0
+            && self.host_len == self.guest_len
+            && (1..=15).contains(&self.host_len)
+        {
+            out.push(self.host_len);
+        } else {
+            out.extend_from_slice(&[0, self.host_len, self.guest_len, self.code, self.fix]);
+        }
+    }
+
+    /// Decode one entry off the front of `bytes`, returning it and the rest.
+    pub fn decode(bytes: &[u8]) -> Option<(Entry, &[u8])> {
+        let (&b, rest) = bytes.split_first()?;
+        if b != 0 {
+            return Some((
+                Entry {
+                    host_len: b,
+                    guest_len: b,
+                    code: recipe::BODY,
+                    fix: 0,
+                },
+                rest,
+            ));
+        }
+        if rest.len() < 4 {
+            return None;
+        }
+        Some((
+            Entry {
+                host_len: rest[0],
+                guest_len: rest[1],
+                code: rest[2],
+                fix: rest[3],
+            },
+            &rest[4..],
+        ))
+    }
+}
+
+/// Append a non-body entry covering `out[start..]`, merging it into the
+/// previous entry when that one carries the same recipe and the merged span
+/// still fits; every instruction boundary inside a non-body span recovers
+/// identically, so a span's granularity is free.
+fn mark(entries: &mut Vec<Entry>, out: &[u8], start: usize, code: u8) {
+    debug_assert!(code >= recipe::PRO);
+    let len = out.len() - start;
+    if len == 0 {
+        return;
+    }
+    if let Some(last) = entries.last_mut()
+        && last.code == code
+        && last.fix == 0
+        && last.host_len as usize + len <= u8::MAX as usize
+    {
+        last.host_len += len as u8;
+        return;
+    }
+    entries.push(Entry {
+        host_len: u8::try_from(len).expect("non-body span exceeds 255 bytes"),
+        guest_len: 0,
+        code,
+        fix: 0,
+    });
+}
+
+/// Locate the entry of a block covering host offset `off`, given the block's
+/// encoded entry list and its starting guest PC. Returns the entry, the guest
+/// PC at the entry's first instruction boundary, and whether `off` is exactly
+/// that boundary (a body entry is one instruction, so any other offset inside
+/// it is not a boundary at all).
+pub fn walk_entries(mut bytes: &[u8], off: usize, mut guest_pc: u64) -> Option<(Entry, u64, bool)> {
+    let mut cur = 0usize;
+    while !bytes.is_empty() {
+        let (e, rest) = Entry::decode(bytes)?;
+        bytes = rest;
+        let end = cur + e.host_len as usize;
+        if off < end {
+            return Some((e, guest_pc, off == cur));
+        }
+        cur = end;
+        if e.code < recipe::PRO {
+            guest_pc = guest_pc.wrapping_add(e.guest_len as u64);
+        }
+    }
+    None
+}
+
+/// Find the translated block whose host code contains `rip`: its metadata,
+/// its encoded entry list, and `rip`'s offset from the block's host start.
+/// Lock-free, for the host signal catcher: a binary search over the published
+/// prefix of the index. `None` for a rip in the cache but inside no block (the
+/// inline lookup routine, or bytes nothing has been aimed at).
+pub fn lookup_block(rip: usize) -> Option<(&'static BlockMeta, &'static [u8], usize)> {
+    let base = CODE_CACHE_LO.load(Ordering::Relaxed);
+    let len = META_INDEX_LEN.load(Ordering::Acquire);
+    let index = META_INDEX.load(Ordering::Relaxed);
+    let arena = META_ARENA.load(Ordering::Relaxed);
+    if len == 0 || index.is_null() || arena.is_null() || rip < base {
+        return None;
+    }
+    let off = (rip - base) as u32;
+    let entries = unsafe { std::slice::from_raw_parts(index, len) };
+    // Last entry whose start is at or before `off`.
+    let i = entries
+        .partition_point(|e| e.host_off <= off)
+        .checked_sub(1)?;
+    let e = entries[i];
+    let meta = unsafe { &*(arena.add(e.meta_off as usize) as *const BlockMeta) };
+    let in_block = off - e.host_off;
+    if in_block >= meta.host_len {
+        return None;
+    }
+    let bytes = unsafe {
+        let p = arena.add(e.meta_off as usize + std::mem::size_of::<BlockMeta>());
+        std::slice::from_raw_parts(p, meta.entries_len as usize)
+    };
+    Some((meta, bytes, in_block as usize))
+}
+
+/// Index capacity in entries for a cache of `size` bytes: no translated block
+/// is shorter than 16 bytes (the smallest is an empty-body indirect jump:
+/// save rax, `jmp gs:[ib_lookup]`), so this bounds the block count.
+fn meta_index_cap(size: usize) -> usize {
+    size / 16 + 1
+}
+
+/// Metadata arena bytes for a cache of `size` bytes. A block's metadata is a
+/// 40-byte header plus roughly one byte per host instruction, well under its
+/// code size except for the pathological cache of minimal blocks; twice the
+/// code size covers that, and the reservation is virtual (`MAP_NORESERVE`).
+fn meta_arena_size(size: usize) -> usize {
+    size * 2
+}
+
 /// `PROT_NONE` guard reserved on each side of the RWX code buffer. The kernel
 /// places guest worker-thread stacks in the same high mmap area as the code
 /// cache, sometimes immediately adjacent to it; JavaScriptCore's stack scrubber
@@ -114,6 +388,13 @@ pub struct CodeCache {
     /// Host address of the shared lookup routine, emitted lazily into the code
     /// region on first use and re-emitted after [`CodeCache::reset`].
     ib_lookup: Option<u64>,
+    /// The preemption index and metadata arena (see [`META_INDEX`]); both
+    /// `mmap`'d lazily alongside the code buffer and bump-allocated with it.
+    index: *mut IndexEntry,
+    index_cap: usize,
+    arena: *mut u8,
+    arena_size: usize,
+    arena_used: usize,
 }
 
 impl CodeCache {
@@ -178,6 +459,48 @@ impl CodeCache {
             unsafe { libc::munmap(region, map_size) };
             return Err(err);
         }
+        let index_cap = meta_index_cap(size);
+        let arena_size = meta_arena_size(size);
+        let side = |bytes: usize, what: &str| -> Result<*mut u8, Error> {
+            let m = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            if m == libc::MAP_FAILED {
+                return Err(Error::last_os_error(what));
+            }
+            Ok(m as *mut u8)
+        };
+        let index = match side(
+            index_cap * std::mem::size_of::<IndexEntry>(),
+            "block index mmap",
+        ) {
+            Ok(m) => m as *mut IndexEntry,
+            Err(err) => {
+                unsafe {
+                    libc::munmap(t, IB_TABLE_BYTES);
+                    libc::munmap(region, map_size);
+                }
+                return Err(err);
+            }
+        };
+        let arena = match side(arena_size, "block metadata mmap") {
+            Ok(m) => m,
+            Err(err) => {
+                unsafe {
+                    libc::munmap(index.cast(), index_cap * std::mem::size_of::<IndexEntry>());
+                    libc::munmap(t, IB_TABLE_BYTES);
+                    libc::munmap(region, map_size);
+                }
+                return Err(err);
+            }
+        };
         let cache = Self {
             base: p as *mut u8,
             size,
@@ -187,11 +510,19 @@ impl CodeCache {
             used: 0,
             ib_table: t as *mut u8,
             ib_lookup: None,
+            index,
+            index_cap,
+            arena,
+            arena_size,
+            arena_used: 0,
         };
         cache.clear_ib_table();
-        // Publish the buffer bounds for the fault handler's in-cache check. One
-        // CodeCache backs the process (reset rewinds it rather than remapping),
-        // so this is set once.
+        // Publish the buffer bounds for the fault handler's in-cache check and
+        // the preemption tables for the signal catcher. One CodeCache backs the
+        // process (reset rewinds it rather than remapping), so this is set once.
+        META_INDEX_LEN.store(0, Ordering::Relaxed);
+        META_INDEX.store(index, Ordering::Relaxed);
+        META_ARENA.store(arena, Ordering::Relaxed);
         CODE_CACHE_LO.store(p as usize, Ordering::Relaxed);
         CODE_CACHE_HI.store(p as usize + size, Ordering::Relaxed);
         Ok(cache)
@@ -209,6 +540,54 @@ impl CodeCache {
             ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(self.used), bytes.len());
         }
         self.used += bytes.len();
+        Ok(())
+    }
+
+    /// Publish the preemption metadata of the block just emitted at `host_pc`:
+    /// its header and encoded entry list go into the arena, its index entry is
+    /// appended, and the index length is released last, so a catcher that
+    /// sees the entry sees everything it points at. Called before the block
+    /// becomes reachable (before it is mapped, linked, or mirrored into the
+    /// indirect-branch table), so no thread can be interrupted inside a block
+    /// the index does not yet cover.
+    fn record_block(
+        &mut self,
+        host_pc: u64,
+        meta: &BlockMeta,
+        entries: &[Entry],
+    ) -> Result<(), Error> {
+        let mut meta = *meta;
+        let mut encoded = Vec::with_capacity(entries.len());
+        for e in entries {
+            e.encode(&mut encoded);
+        }
+        meta.entries_len = encoded.len() as u32;
+        let header = std::mem::size_of::<BlockMeta>();
+        let start = self
+            .arena_used
+            .next_multiple_of(std::mem::align_of::<BlockMeta>());
+        let end = start + header + encoded.len();
+        let len = META_INDEX_LEN.load(Ordering::Relaxed);
+        if end > self.arena_size || len >= self.index_cap {
+            return Err(Error::CodeCacheExhausted);
+        }
+        unsafe {
+            ptr::write(self.arena.add(start) as *mut BlockMeta, meta);
+            ptr::copy_nonoverlapping(
+                encoded.as_ptr(),
+                self.arena.add(start + header),
+                encoded.len(),
+            );
+            ptr::write(
+                self.index.add(len),
+                IndexEntry {
+                    host_off: (host_pc - self.base as u64) as u32,
+                    meta_off: start as u32,
+                },
+            );
+        }
+        self.arena_used = end;
+        META_INDEX_LEN.store(len + 1, Ordering::Release);
         Ok(())
     }
 
@@ -321,6 +700,12 @@ impl CodeCache {
         // Borrow rcx (target) and rdx (slot index) as scratch.
         gs_store(&mut out, MODRM_RCX, d_rcx); // mov gs:[rcx], rcx
         gs_store(&mut out, MODRM_RDX, d_rdx); // mov gs:[rdx], rdx
+        // Every slot the miss path restores from is written from here on, so
+        // a thread interrupted at or past this boundary can be redirected to
+        // `miss` (see `preempt`); before it, the target is still in rax (at the
+        // routine's first instruction) or in its slot, and every other guest
+        // register is live.
+        let stashed = out.len();
         gs_load(&mut out, MODRM_RCX, d_target); // mov rcx, gs:[target]
         // Fibonacci hash: slot = (target * IB_HASH_MULT) >> (64 - IB_BITS),
         // matching `ib_slot`. The multiply mixes the low PC bits in, so nearby
@@ -335,21 +720,6 @@ impl CodeCache {
         out.extend_from_slice(&[0x48, 0x3b, 0x08]); // cmp rcx, [rax]
         out.extend_from_slice(&[0x0f, 0x85]); // jne miss
         let jne_rel = take_rel32(&mut out);
-
-        // Asynchronous-signal safepoint poll. Every guest loop that stays in the
-        // cache via an indirect branch (a computed-goto or function-pointer
-        // dispatch loop hitting this table) closes here, so without a poll a
-        // pending signal would never reach a block boundary. If the exit flag is
-        // set, divert to the miss path, which already publishes the resolved target
-        // (gs:[target]) as the next guest PC and returns to the dispatcher —
-        // delivering at a clean boundary with the right guest PC. The guest's flags
-        // are saved in gs:[ib_flags] here (restored on both the hit and miss
-        // paths), so this `cmp`'s flag clobber is harmless.
-        out.extend_from_slice(&[0x65, 0x83, 0x3c, 0x25]); // cmp dword ptr gs:[exit_requested], 0
-        emit_u32(&mut out, offset_of!(ThreadState, exit_requested) as u32);
-        out.push(0x00);
-        out.extend_from_slice(&[0x0f, 0x85]); // jne miss
-        let poll_rel = take_rel32(&mut out);
 
         // Hit: load the host PC, restore flags and the borrowed registers, and
         // jump into the successor block with the full guest register file live.
@@ -375,7 +745,6 @@ impl CodeCache {
         // key-compare and the post-host recheck branch here.
         let miss = out.len();
         write_rel32(&mut out, jne_rel, miss);
-        write_rel32(&mut out, poll_rel, miss);
         write_rel32(&mut out, jne2_rel, miss);
         emit_restore_flags(&mut out, d_flags);
         gs_load(&mut out, MODRM_RCX, d_rcx); // mov rcx, gs:[rcx]
@@ -388,6 +757,10 @@ impl CodeCache {
         let addr = self.next_pc();
         self.emit(&out)?;
         self.ib_lookup = Some(addr);
+        IB_LOOKUP_STASHED.store(addr as usize + stashed, Ordering::Relaxed);
+        IB_LOOKUP_MISS.store(addr as usize + miss, Ordering::Relaxed);
+        IB_LOOKUP_HI.store(addr as usize + out.len(), Ordering::Relaxed);
+        IB_LOOKUP_LO.store(addr as usize, Ordering::Release);
         Ok(addr)
     }
 
@@ -395,6 +768,9 @@ impl CodeCache {
         self.used = 0;
         self.ib_lookup = None;
         self.clear_ib_table();
+        self.arena_used = 0;
+        META_INDEX_LEN.store(0, Ordering::Release);
+        IB_LOOKUP_LO.store(0, Ordering::Release);
     }
 }
 
@@ -405,6 +781,15 @@ impl Drop for CodeCache {
         debug_assert_eq!(ret, 0, "code cache munmap failed");
         let ret = unsafe { libc::munmap(self.ib_table.cast(), IB_TABLE_BYTES) };
         debug_assert_eq!(ret, 0, "ib table munmap failed");
+        let ret = unsafe {
+            libc::munmap(
+                self.index.cast(),
+                self.index_cap * std::mem::size_of::<IndexEntry>(),
+            )
+        };
+        debug_assert_eq!(ret, 0, "block index munmap failed");
+        let ret = unsafe { libc::munmap(self.arena.cast(), self.arena_size) };
+        debug_assert_eq!(ret, 0, "block metadata munmap failed");
     }
 }
 
@@ -640,7 +1025,12 @@ pub fn translate(
         // instruction always decodes from whatever bytes are readable instead.
         if next_pc != guest_pc && next_pc.wrapping_add(MAX_INSTR_LEN) > window_end {
             guest_end = next_pc;
-            break mkinstr(Instruction::with_branch(Code::Jmp_rel32_64, next_pc))?;
+            // The synthesized jump sits at the split point: a thread preempted
+            // at its branch resumes at the next guest PC, which is also its
+            // target, so either reading of "the terminator's PC" is the same.
+            let mut jmp = mkinstr(Instruction::with_branch(Code::Jmp_rel32_64, next_pc))?;
+            jmp.set_ip(next_pc);
+            break jmp;
         }
         if !decoder.can_decode() {
             return Err(Error::Translate(format!(
@@ -700,8 +1090,17 @@ pub fn translate(
         fp: block_uses_fp(&instrs, &term),
         fs: block_uses_fs(&instrs, &term),
     };
+    // The block's preemption metadata: a recovery recipe for every span of the
+    // host code emitted below (see `recipe`), recorded once the whole block is
+    // in place.
+    let mut entries = Vec::new();
+    let mut meta = BlockMeta {
+        guest_pc,
+        term_ip: term.ip(),
+        ..BlockMeta::default()
+    };
     if needs.fp || needs.fs {
-        let prologue = build_prologue(needs, block_flags_live_in(&instrs, &term));
+        let prologue = build_prologue(needs, block_flags_live_in(&instrs, &term), &mut entries);
         cache.emit(&prologue)?;
     }
     let body_pc = cache.next_pc();
@@ -714,9 +1113,11 @@ pub fn translate(
     // unsupported conditional forms) keeps the original "compute next guest PC,
     // exit to dispatcher" terminator and contributes no links.
     let edges = if let Some(link) = classify_terminator(&term) {
-        emit_body(cache, &instrs, body_pc, guest_pc)?;
+        let codes = vec![recipe::BODY; instrs.len()];
+        emit_body(cache, &instrs, body_pc, guest_pc, &codes, &mut entries)?;
         let term_pc = cache.next_pc() as usize;
-        let (bytes, rel_edges) = build_linked_terminator(&link, exit_tramp, guest_pc, term_pc);
+        let (bytes, rel_edges) =
+            build_linked_terminator(&link, exit_tramp, term_pc, &mut entries, &mut meta);
         cache.emit(&bytes)?;
         rel_edges
             .into_iter()
@@ -727,10 +1128,20 @@ pub fn translate(
             })
             .collect()
     } else {
-        emit_terminator(&mut instrs, &term, syscall_tramp, trap_tramp)?;
-        emit_body(cache, &instrs, body_pc, guest_pc)?;
+        let mut codes = vec![recipe::BODY; instrs.len()];
+        emit_terminator(
+            &mut instrs,
+            &term,
+            syscall_tramp,
+            trap_tramp,
+            &mut codes,
+            &mut meta,
+        )?;
+        emit_body(cache, &instrs, body_pc, guest_pc, &codes, &mut entries)?;
         Vec::new()
     };
+    meta.host_len = (cache.next_pc() - host_pc) as u32;
+    cache.record_block(host_pc, &meta, &entries)?;
 
     Ok(Translation {
         host_pc,
@@ -761,7 +1172,15 @@ fn rewrite_rip_relative_leas(instrs: &mut [Instruction]) -> Result<(), Error> {
         if instr.code() == Code::Lea_r64_m && instr.is_ip_rel_memory_operand() {
             let dest = instr.op0_register();
             let target = instr.ip_rel_memory_address();
-            *instr = mkinstr(Instruction::with2(Code::Mov_r64_imm64, dest, target))?;
+            let mut movabs = mkinstr(Instruction::with2(Code::Mov_r64_imm64, dest, target))?;
+            // Keep the guest's own position and length on the replacement: the
+            // preemption map advances the guest PC by each body instruction's
+            // guest length, which a synthesized instruction does not carry.
+            // (`set_ip` derives the stored next-IP from the current length, so
+            // the length goes first.)
+            movabs.set_len(instr.len());
+            movabs.set_ip(instr.ip());
+            *instr = movabs;
         }
     }
     Ok(())
@@ -876,21 +1295,92 @@ fn block_flags_live_in(body: &[Instruction], term: &Instruction) -> bool {
 /// operands fixed up by `BlockEncoder`) and append it to the cache. A block
 /// whose first instruction is the terminator has an empty body and emits
 /// nothing here.
+///
+/// `codes` carries one recovery recipe per instruction in `instrs`:
+/// [`recipe::BODY`] for a guest instruction, a terminator recipe for each
+/// instruction of an appended exit sequence. One preemption [`Entry`] is
+/// recorded per *encoded* instruction — a far-RIP-relative rewrite turns one
+/// guest instruction into four host ones, each its own boundary — using the
+/// offsets the encoder reports, since a fixed-up encoding need not keep the
+/// guest's length.
 fn emit_body(
     cache: &mut CodeCache,
     instrs: &[Instruction],
     host_pc: u64,
     guest_pc: u64,
+    codes: &[u8],
+    entries: &mut Vec<Entry>,
 ) -> Result<(), Error> {
     if instrs.is_empty() {
         return Ok(());
     }
+    debug_assert_eq!(codes.len(), instrs.len());
     let rewritten = rewrite_far_rip_operands(instrs, host_pc)?;
-    let instrs = rewritten.as_deref().unwrap_or(instrs);
-    let block = InstructionBlock::new(instrs, host_pc);
-    let result = BlockEncoder::encode(64, block, BlockEncoderOptions::NONE)
-        .map_err(|e| Error::Translate(format!("encode block at {:#x}: {}", guest_pc, e)))?;
+    let plain_parts;
+    let (encoded, parts): (&[Instruction], &[Part]) = match &rewritten {
+        Some((list, parts)) => (list, parts),
+        None => {
+            plain_parts = (0..instrs.len()).map(Part::plain).collect::<Vec<_>>();
+            (instrs, &plain_parts)
+        }
+    };
+    let block = InstructionBlock::new(encoded, host_pc);
+    let result = BlockEncoder::encode(
+        64,
+        block,
+        BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+    )
+    .map_err(|e| Error::Translate(format!("encode block at {:#x}: {}", guest_pc, e)))?;
+    let total = result.code_buffer.len() as u32;
+    let offsets = &result.new_instruction_offsets;
+    for (j, part) in parts.iter().enumerate() {
+        let start = offsets[j];
+        let end = offsets.get(j + 1).copied().unwrap_or(total);
+        if start == u32::MAX || end == u32::MAX {
+            return Err(Error::Translate(format!(
+                "encode block at {:#x}: instruction relocated",
+                guest_pc
+            )));
+        }
+        let code = codes[part.src];
+        let guest_len = if code == recipe::BODY && part.op {
+            instrs[part.src].len() as u8
+        } else {
+            0
+        };
+        entries.push(Entry {
+            host_len: u8::try_from(end - start).expect("encoded instruction exceeds 255 bytes"),
+            guest_len,
+            code,
+            fix: part.fix,
+        });
+    }
     cache.emit(&result.code_buffer)
+}
+
+/// A far-RIP-rewritten instruction list and one [`Part`] per instruction in it.
+type Rewritten = (Vec<Instruction>, Vec<Part>);
+
+/// How one encoded instruction relates to the source list `emit_body` was
+/// given: which source instruction it came from, whether it is the source
+/// instruction itself (so the guest PC advances past it) rather than a
+/// register save or reload inserted around it, and the `Entry::fix` register
+/// parked across its boundary.
+#[derive(Clone, Copy)]
+struct Part {
+    src: usize,
+    op: bool,
+    fix: u8,
+}
+
+impl Part {
+    fn plain(src: usize) -> Self {
+        Self {
+            src,
+            op: true,
+            fix: 0,
+        }
+    }
 }
 
 /// Slack subtracted from the `rel32` range when deciding whether a RIP-relative
@@ -922,10 +1412,15 @@ fn rip_reachable(target: u64, host_pc: u64) -> bool {
 ///
 /// Returns `None` when every operand is in range, which is every block outside
 /// such far regions, so the common path encodes the original list untouched.
+/// Otherwise the rewritten list comes with one [`Part`] per output
+/// instruction. The borrowed register is unreachable only from the
+/// materializing `movabs` onward — the save before it is a copy — so the parts
+/// for the rewritten access and the reload name it as parked, and the access
+/// itself is the part the guest PC advances past.
 fn rewrite_far_rip_operands(
     instrs: &[Instruction],
     host_pc: u64,
-) -> Result<Option<Vec<Instruction>>, Error> {
+) -> Result<Option<Rewritten>, Error> {
     let far = |i: &Instruction| {
         i.is_ip_rel_memory_operand() && !rip_reachable(i.ip_rel_memory_address(), host_pc)
     };
@@ -935,35 +1430,70 @@ fn rewrite_far_rip_operands(
     let slot = offset_of!(ThreadState, riprel_scratch) as i64;
     let mut info_factory = InstructionInfoFactory::new();
     let mut out = Vec::with_capacity(instrs.len() + 3);
-    for instr in instrs {
+    let mut parts = Vec::with_capacity(instrs.len() + 3);
+    for (src, instr) in instrs.iter().enumerate() {
         if !far(instr) {
             out.push(*instr);
+            parts.push(Part::plain(src));
             continue;
         }
         let scratch = pick_scratch(&mut info_factory, instr)?;
+        let fix = 1 + state_reg_index(scratch);
         let target = instr.ip_rel_memory_address();
         out.push(mkinstr(Instruction::with2(
             Code::Mov_rm64_r64,
             gs_qword(slot),
             scratch,
         ))?);
+        parts.push(Part {
+            src,
+            op: false,
+            fix: 0,
+        });
         out.push(mkinstr(Instruction::with2(
             Code::Mov_r64_imm64,
             scratch,
             target,
         ))?);
+        parts.push(Part {
+            src,
+            op: false,
+            fix: 0,
+        });
         let mut patched = *instr;
         patched.set_memory_base(scratch);
         patched.set_memory_displacement64(0);
         patched.set_memory_displ_size(0);
         out.push(patched);
+        parts.push(Part { src, op: true, fix });
         out.push(mkinstr(Instruction::with2(
             Code::Mov_r64_rm64,
             scratch,
             gs_qword(slot),
         ))?);
+        parts.push(Part {
+            src,
+            op: false,
+            fix,
+        });
     }
-    Ok(Some(out))
+    Ok(Some((out, parts)))
+}
+
+/// The `ThreadState::regs` index of a general-purpose register (rax, rbx,
+/// rcx, rdx, rsi, rdi, rbp, rsp, r8..r15).
+fn state_reg_index(reg: Register) -> u8 {
+    match reg {
+        Register::RAX => 0,
+        Register::RBX => 1,
+        Register::RCX => 2,
+        Register::RDX => 3,
+        Register::RSI => 4,
+        Register::RDI => 5,
+        Register::RBP => 6,
+        Register::RSP => 7,
+        r => 8 + (r.number() - Register::R8.number()) as u8,
+    }
 }
 
 /// Pick a register the far-RIP rewrite can borrow around `instr`: any GPR the
@@ -1087,58 +1617,6 @@ fn short_cond_opcode(code: Code) -> Option<(bool, u8)> {
     })
 }
 
-/// Whether an edge to `target` from a block starting at `block_start` closes a
-/// loop: its successor lies at or before the block's own start, so it is a
-/// backward edge. Only such edges carry the asynchronous-signal safepoint poll;
-/// forward (straight-line) edges stay poll-free so non-looping code is
-/// unaffected. Every guest loop closes via a direct back-branch (handled here)
-/// or an indirect branch (handled in the shared inline lookup routine).
-fn is_back_edge(target: u64, block_start: u64) -> bool {
-    target <= block_start
-}
-
-/// Emit the asynchronous-signal safepoint poll for a loop-closing edge. Returns
-/// the offset of a reserved `rel32` the caller patches to the edge's cold-exit
-/// stub: when `exit_requested` is set the poll branches there (the stub publishes
-/// the successor guest PC and exits to the dispatcher, where the pending signal is
-/// delivered); when clear it falls through to the caller's fast-path branch. On
-/// both paths the borrowed register is restored, so the full guest register file
-/// stays live across the edge.
-///
-/// The poll must not perturb the guest's arithmetic flags: a valid loop can carry
-/// a flag across its back-edge — an `adc`/`sbb` reduction closed by `dec`/`jnz`
-/// relies on `dec` preserving CF for the next iteration's `adc` — so a
-/// flag-clobbering `cmp` would make such a loop misexecute the moment it is
-/// linked. It therefore tests the flag with `jrcxz`, which neither reads nor
-/// writes the arithmetic flags, borrowing rcx through the `ib_rcx` scratch slot.
-/// That slot is otherwise owned only by the inline indirect-branch lookup routine,
-/// which a linked terminator never runs, and a thread executes these strictly
-/// sequentially, so the borrow cannot collide. The 32-bit load zero-extends the
-/// `u32` flag into rcx, so `jrcxz` sees zero exactly when no signal is pending.
-fn emit_exit_poll(out: &mut Vec<u8>) -> usize {
-    let d_exit = offset_of!(ThreadState, exit_requested) as i32;
-    let d_rcx = offset_of!(ThreadState, ib_rcx) as i32;
-    // mov gs:[ib_rcx], rcx — stash guest rcx (no flags touched).
-    gs_store(out, MODRM_RCX, d_rcx);
-    // mov ecx, gs:[exit_requested] — rcx = flag, zero-extended (no flags touched).
-    out.extend_from_slice(&[0x65, 0x8b, 0x0c, 0x25]);
-    emit_u32(out, d_exit as u32);
-    // jrcxz .cont — take the fast path if the flag is clear; preserves flags.
-    out.push(0xe3);
-    let jrcxz_at = out.len();
-    out.push(0x00); // rel8, patched to .cont below
-    // Flag set: restore guest rcx, then jump to the edge's cold-exit stub.
-    gs_load(out, MODRM_RCX, d_rcx);
-    out.push(0xe9);
-    let stub_rel = take_rel32(out);
-    // .cont: flag clear — restore guest rcx and continue on the fast path.
-    let cont = out.len();
-    let disp = cont as i64 - (jrcxz_at as i64 + 1);
-    out[jrcxz_at] = i8::try_from(disp).expect("jrcxz poll displacement out of range") as u8;
-    gs_load(out, MODRM_RCX, d_rcx);
-    stub_rel
-}
-
 /// Build the raw machine code for a linkable terminator: a fast-path direct
 /// branch followed by one cold exit stub per successor. Returns the encoded
 /// bytes and, for each edge, the byte offsets of its fast-path `rel32`
@@ -1147,11 +1625,12 @@ fn emit_exit_poll(out: &mut Vec<u8>) -> usize {
 /// rewrites them to the successor blocks as those are translated, and back to
 /// the stubs when a successor is invalidated.
 ///
-/// A back-edge ([`is_back_edge`]) is preceded by a safepoint poll
-/// ([`emit_exit_poll`]) that diverts to the edge's own cold-exit stub when an
-/// asynchronous signal is pending, so a fully linked loop returns to the run loop
-/// within one iteration. The stub already publishes the correct successor guest
-/// PC, so delivery lands at a clean boundary.
+/// Every span gets a preemption entry: the fast-path branches (and their
+/// alignment padding) resume at the terminator, or at the successor once the
+/// branch's architectural effect has already happened (a `loop` has
+/// decremented rcx, a call has pushed its return address); the stubs are
+/// [`recipe::FLOW`], already bound for the dispatcher. `meta` receives the
+/// successor PCs those recipes name.
 ///
 /// `term_pc` is the host address at which these bytes will be emitted. It is
 /// needed because every patchable `rel32` field is NOP-padded to a 4-byte
@@ -1161,27 +1640,24 @@ fn emit_exit_poll(out: &mut Vec<u8>) -> usize {
 fn build_linked_terminator(
     link: &LinkTerm,
     exit_tramp: u64,
-    block_start: u64,
     term_pc: usize,
+    entries: &mut Vec<Entry>,
+    meta: &mut BlockMeta,
 ) -> (Vec<u8>, Vec<(usize, usize, u64)>) {
     let mut out = Vec::new();
     let mut edges = Vec::new();
     match *link {
         LinkTerm::Uncond { target } => {
-            // An unconditional back-branch is the whole loop: poll before taking
-            // it. The poll preserves the guest's flags and registers (see
-            // emit_exit_poll), so a loop carrying flags across this edge is safe.
-            let poll = is_back_edge(target, block_start).then(|| emit_exit_poll(&mut out));
             // jmp rel32 -> stub (later: -> target's host code)
+            let at = out.len();
             pad_rel32_alignment(&mut out, term_pc, 1);
             out.push(0xE9);
             let rel = take_rel32(&mut out);
+            mark(entries, &out, at, recipe::PRECISE_T);
             let stub = out.len();
             emit_stub(&mut out, target, exit_tramp);
+            mark(entries, &out, stub, recipe::FLOW);
             write_rel32(&mut out, rel, stub);
-            if let Some(poll_rel) = poll {
-                write_rel32(&mut out, poll_rel, stub);
-            }
             edges.push((rel, stub, target));
         }
         LinkTerm::Cond {
@@ -1189,54 +1665,30 @@ fn build_linked_terminator(
             taken,
             fallthrough,
         } => {
-            // The fall-through is `next_ip`, always forward, so only the taken edge
-            // can close a loop. When it does, route the taken path through a
-            // flag-preserving poll once the guest's `jcc` has read the live flags;
-            // the poll keeps them intact for the loop head on the fast path. Every
-            // patchable `rel32` (the ones pushed to `edges`) is NOP-padded to a
-            // 4-byte boundary so the dispatcher can back-patch it atomically.
-            if is_back_edge(taken, block_start) {
-                // jcc rel32 -> taken_check ; jmp rel32 -> fall stub.
-                out.extend_from_slice(&[0x0F, opcode]);
-                let jcc_rel = take_rel32(&mut out); // internal, not patched
-                pad_rel32_alignment(&mut out, term_pc, 1);
-                out.push(0xE9);
-                let jmp_rel = take_rel32(&mut out);
-                // taken_check: poll, then the linkable fast-path branch to taken.
-                let taken_check = out.len();
-                write_rel32(&mut out, jcc_rel, taken_check);
-                let poll_rel = emit_exit_poll(&mut out);
-                pad_rel32_alignment(&mut out, term_pc, 1);
-                out.push(0xE9);
-                let taken_jmp_rel = take_rel32(&mut out);
-                let taken_stub = out.len();
-                emit_stub(&mut out, taken, exit_tramp);
-                let fall_stub = out.len();
-                emit_stub(&mut out, fallthrough, exit_tramp);
-                write_rel32(&mut out, jmp_rel, fall_stub);
-                write_rel32(&mut out, taken_jmp_rel, taken_stub);
-                write_rel32(&mut out, poll_rel, taken_stub);
-                edges.push((taken_jmp_rel, taken_stub, taken));
-                edges.push((jmp_rel, fall_stub, fallthrough));
-            } else {
-                // jcc rel32 -> taken stub ; jmp rel32 -> fall-through stub.
-                // The native jcc reads the block's live guest flags directly. Each
-                // branch is padded independently so both rel32 fields land aligned.
-                pad_rel32_alignment(&mut out, term_pc, 2);
-                out.extend_from_slice(&[0x0F, opcode]);
-                let jcc_rel = take_rel32(&mut out);
-                pad_rel32_alignment(&mut out, term_pc, 1);
-                out.push(0xE9);
-                let jmp_rel = take_rel32(&mut out);
-                let taken_stub = out.len();
-                emit_stub(&mut out, taken, exit_tramp);
-                let fall_stub = out.len();
-                emit_stub(&mut out, fallthrough, exit_tramp);
-                write_rel32(&mut out, jcc_rel, taken_stub);
-                write_rel32(&mut out, jmp_rel, fall_stub);
-                edges.push((jcc_rel, taken_stub, taken));
-                edges.push((jmp_rel, fall_stub, fallthrough));
-            }
+            // jcc rel32 -> taken stub ; jmp rel32 -> fall-through stub.
+            // The native jcc reads the block's live guest flags directly. Each
+            // branch is padded independently so both rel32 fields land aligned.
+            // A thread preempted at the jmp has run the jcc untaken; resuming at
+            // the jcc re-runs it on the same flags with the same outcome.
+            meta.taken = taken;
+            meta.fall = fallthrough;
+            let at = out.len();
+            pad_rel32_alignment(&mut out, term_pc, 2);
+            out.extend_from_slice(&[0x0F, opcode]);
+            let jcc_rel = take_rel32(&mut out);
+            pad_rel32_alignment(&mut out, term_pc, 1);
+            out.push(0xE9);
+            let jmp_rel = take_rel32(&mut out);
+            mark(entries, &out, at, recipe::PRECISE_T);
+            let taken_stub = out.len();
+            emit_stub(&mut out, taken, exit_tramp);
+            let fall_stub = out.len();
+            emit_stub(&mut out, fallthrough, exit_tramp);
+            mark(entries, &out, taken_stub, recipe::FLOW);
+            write_rel32(&mut out, jcc_rel, taken_stub);
+            write_rel32(&mut out, jmp_rel, fall_stub);
+            edges.push((jcc_rel, taken_stub, taken));
+            edges.push((jmp_rel, fall_stub, fallthrough));
         }
         LinkTerm::ShortCond {
             prefix67,
@@ -1249,39 +1701,45 @@ fn build_linked_terminator(
             // into that short `jmp`, which reaches the fall-through path. The
             // native instruction supplies the exact architectural behavior
             // (`loop`'s rcx decrement, `loope`/`loopne`'s ZF read) and clobbers no
-            // flags, so the two edges link like any other direct branch.
+            // flags, so the two edges link like any other direct branch. Past the
+            // native instruction its effect is done, so each path resumes at its
+            // own successor rather than re-running it.
+            meta.taken = taken;
+            meta.fall = fallthrough;
+            let at = out.len();
             if prefix67 {
                 out.push(0x67);
             }
             // rel8 = +2: taken skips the 2-byte `EB` short jmp that follows.
             out.extend_from_slice(&[opcode, 0x02]);
+            mark(entries, &out, at, recipe::PRECISE_T);
+            let at = out.len();
             out.push(0xEB);
             let eb_at = out.len();
             out.push(0x00); // disp8 to fall-through path, patched below
-            // Taken path. `loop`/`jrcxz` are loop primitives, so the taken edge
-            // usually closes a loop: route it through the flag- and rcx-preserving
-            // safepoint poll (the native instruction has already read/decremented
-            // rcx and read ZF, so polling after is safe).
-            let poll = is_back_edge(taken, block_start).then(|| emit_exit_poll(&mut out));
+            mark(entries, &out, at, recipe::PRECISE_FALL);
+            // Taken path.
+            let at = out.len();
             pad_rel32_alignment(&mut out, term_pc, 1);
             out.push(0xE9);
             let taken_rel = take_rel32(&mut out);
+            mark(entries, &out, at, recipe::PRECISE_TAKEN);
             // Fall-through path — the `EB` above lands here.
             let fall_path = out.len();
             let disp = fall_path as i64 - (eb_at as i64 + 1);
             out[eb_at] = i8::try_from(disp).expect("shortcond jmp displacement out of range") as u8;
+            let at = out.len();
             pad_rel32_alignment(&mut out, term_pc, 1);
             out.push(0xE9);
             let fall_rel = take_rel32(&mut out);
+            mark(entries, &out, at, recipe::PRECISE_FALL);
             let taken_stub = out.len();
             emit_stub(&mut out, taken, exit_tramp);
             let fall_stub = out.len();
             emit_stub(&mut out, fallthrough, exit_tramp);
+            mark(entries, &out, taken_stub, recipe::FLOW);
             write_rel32(&mut out, taken_rel, taken_stub);
             write_rel32(&mut out, fall_rel, fall_stub);
-            if let Some(poll_rel) = poll {
-                write_rel32(&mut out, poll_rel, taken_stub);
-            }
             edges.push((taken_rel, taken_stub, taken));
             edges.push((fall_rel, fall_stub, fallthrough));
         }
@@ -1295,29 +1753,29 @@ fn build_linked_terminator(
             // route the address through rax: borrow the rax slot, materialize
             // the full address, `push rax`, and restore rax — leaving every
             // guest register live for the linked successor. No flags are
-            // touched (mov/movabs/push only).
+            // touched (mov/movabs/push only). Once the push has happened the
+            // call is complete, so the reload and the branch resume at the
+            // callee.
+            meta.taken = target;
+            let at = out.len();
             mov_gs_rax(&mut out, RAX_SLOT); // mov gs:[rax_slot], rax
+            mark(entries, &out, at, recipe::PRECISE_T);
+            let at = out.len();
             movabs_rax(&mut out, ret); // movabs rax, ret
             out.push(0x50); // push rax
+            mark(entries, &out, at, recipe::RAXSLOT_T);
+            let at = out.len();
             gs_load(&mut out, MODRM_RAX, RAX_SLOT); // mov rax, gs:[rax_slot]
-            // A direct call whose target is at or before this block can close a
-            // loop with no back-branch and no `ret`: direct or mutual recursion
-            // through fixed call targets, which otherwise stays entirely inside
-            // linked call edges until the stack overflows. Poll after the return
-            // address is pushed (so the call's effect is complete) but before the
-            // branch, so a pending signal is delivered at the callee entry. Every
-            // call cycle contains an edge into its lowest-address member, so this
-            // catches the cycle even when the individual calls run forward.
-            let poll = is_back_edge(target, block_start).then(|| emit_exit_poll(&mut out));
+            mark(entries, &out, at, recipe::RAXSLOT_TAKEN);
+            let at = out.len();
             pad_rel32_alignment(&mut out, term_pc, 1);
             out.push(0xE9);
             let rel = take_rel32(&mut out);
+            mark(entries, &out, at, recipe::PRECISE_TAKEN);
             let stub = out.len();
             emit_stub(&mut out, target, exit_tramp);
+            mark(entries, &out, stub, recipe::FLOW);
             write_rel32(&mut out, rel, stub);
-            if let Some(poll_rel) = poll {
-                write_rel32(&mut out, poll_rel, stub);
-            }
             edges.push((rel, stub, target));
         }
     }
@@ -1398,85 +1856,129 @@ fn emit_restore_flags(out: &mut Vec<u8>, d_flags: i32) {
 /// rax is parked once across it; otherwise the cheap path leaves flags dead and
 /// saves rax only inside whichever install actually runs, so an already-
 /// installed fast path is just `cmp`/`jne` per guard.
-fn build_prologue(needs: BlockNeeds, flags_live_in: bool) -> Vec<u8> {
+///
+/// Every instruction gets a [`recipe::PRO`] entry naming which of rax, rdx,
+/// and the status flags are in their slots at the boundary before it, so a
+/// thread preempted mid-prologue recovers the block's entry state. The
+/// installs themselves need no recipe: an `xrstor64` already run leaves the
+/// registers equal to the still-canonical `fpstate`, and a `wrfsbase` already
+/// run is detected from the FS base itself (see `preempt`).
+fn build_prologue(needs: BlockNeeds, flags_live_in: bool, entries: &mut Vec<Entry>) -> Vec<u8> {
     let d_fp = offset_of!(ThreadState, fp_in_regs) as i32;
     let d_fps = offset_of!(ThreadState, fpstate) as i32;
     let d_flags = offset_of!(ThreadState, fp_flags) as i32;
     let d_scr = offset_of!(ThreadState, fp_scratch) as i32;
     let d_fs = offset_of!(ThreadState, fs_is_guest) as i32;
     let d_guest_fs = offset_of!(ThreadState, guest_fs_base) as i32;
-    let mut out = Vec::new();
+    const P: u8 = recipe::PRO;
+    const R: u8 = recipe::PRO | recipe::PRO_RAX;
+    const RF: u8 = recipe::PRO | recipe::PRO_RAX | recipe::PRO_FLAGS;
+    let mut p = Prologue {
+        out: Vec::new(),
+        entries,
+    };
 
     if flags_live_in {
         // Park rax and the guest flags up front; the guards' cmp may then
-        // clobber flags, and the installs may clobber rax, freely.
-        gs_store(&mut out, MODRM_RAX, RAX_SLOT); // mov gs:[rax], rax
-        out.push(0x9f); // lahf
-        out.extend_from_slice(&[0x0f, 0x90, 0xc0]); // seto al
-        gs_store(&mut out, MODRM_RAX, d_flags); // mov gs:[fp_flags], rax
+        // clobber flags, and the installs may clobber rax, freely. The flags
+        // slot is valid from its store on; until then the live flags are still
+        // the guest's (lahf/seto read them without writing).
+        p.ins(P, |o| gs_store(o, MODRM_RAX, RAX_SLOT)); // mov gs:[rax], rax
+        p.ins(R, |o| o.push(0x9f)); // lahf
+        p.ins(R, |o| o.extend_from_slice(&[0x0f, 0x90, 0xc0])); // seto al
+        p.ins(R, |o| gs_store(o, MODRM_RAX, d_flags)); // mov gs:[fp_flags], rax
         if needs.fp {
-            emit_guarded(&mut out, d_fp, |o| emit_fp_restore(o, d_fps, d_scr, d_fp));
+            p.guarded(d_fp, RF, |p| p.fp_restore(RF, d_fps, d_scr, d_fp));
         }
         if needs.fs {
-            emit_guarded(&mut out, d_fs, |o| emit_fs_install(o, d_guest_fs, d_fs));
+            p.guarded(d_fs, RF, |p| p.fs_install(RF, d_guest_fs, d_fs));
         }
-        emit_restore_flags(&mut out, d_flags); // rax<-flags; add al,0x7f; sahf
-        gs_load(&mut out, MODRM_RAX, RAX_SLOT); // mov rax, gs:[rax]
+        // rax<-flags; add al,0x7f; sahf — restore the guest status flags.
+        p.ins(RF, |o| gs_load(o, MODRM_RAX, d_flags));
+        p.ins(RF, |o| o.extend_from_slice(&[0x04, 0x7f]));
+        p.ins(RF, |o| o.push(0x9e));
+        p.ins(R, |o| gs_load(o, MODRM_RAX, RAX_SLOT)); // mov rax, gs:[rax]
     } else {
         // Flags are dead, so each guard's cmp clobbers them harmlessly and rax
         // is saved only in the install path that actually runs.
         if needs.fp {
-            emit_guarded(&mut out, d_fp, |o| {
-                gs_store(o, MODRM_RAX, RAX_SLOT); // mov gs:[rax], rax
-                emit_fp_restore(o, d_fps, d_scr, d_fp);
-                gs_load(o, MODRM_RAX, RAX_SLOT); // mov rax, gs:[rax]
+            p.guarded(d_fp, P, |p| {
+                p.ins(P, |o| gs_store(o, MODRM_RAX, RAX_SLOT)); // mov gs:[rax], rax
+                p.fp_restore(R, d_fps, d_scr, d_fp);
+                p.ins(R, |o| gs_load(o, MODRM_RAX, RAX_SLOT)); // mov rax, gs:[rax]
             });
         }
         if needs.fs {
-            emit_guarded(&mut out, d_fs, |o| {
-                gs_store(o, MODRM_RAX, RAX_SLOT); // mov gs:[rax], rax
-                emit_fs_install(o, d_guest_fs, d_fs);
-                gs_load(o, MODRM_RAX, RAX_SLOT); // mov rax, gs:[rax]
+            p.guarded(d_fs, P, |p| {
+                p.ins(P, |o| gs_store(o, MODRM_RAX, RAX_SLOT)); // mov gs:[rax], rax
+                p.fs_install(R, d_guest_fs, d_fs);
+                p.ins(R, |o| gs_load(o, MODRM_RAX, RAX_SLOT)); // mov rax, gs:[rax]
             });
         }
     }
-    out
+    p.out
 }
 
-/// Emit `cmp byte gs:[flag], 0; jne skip; <body>; skip:` — the install runs only
-/// when the flag is clear. The `jne` is a short `rel8`; an install is well under
-/// 128 bytes.
-fn emit_guarded(out: &mut Vec<u8>, flag_disp: i32, body: impl FnOnce(&mut Vec<u8>)) {
-    cmp_gs_byte_zero(out, flag_disp);
-    out.push(0x75); // jne skip
-    let jne = out.len();
-    out.push(0);
-    body(out);
-    let skip = out.len();
-    out[jne] = jcc_rel8(jne, skip);
+/// The prologue under construction: its bytes and the preemption entries that
+/// describe them, one per emitted instruction.
+struct Prologue<'a> {
+    out: Vec<u8>,
+    entries: &'a mut Vec<Entry>,
 }
 
-/// Emit the FP restore proper: park rdx, restore the full extended state from
-/// `gs:[fpstate]` via `xrstor64` (mask `0xe7` in edx:eax), reload rdx, and set
-/// `fp_in_regs`. Assumes rax is already saved (it is loaded with the mask's low
-/// half) and that the caller reloads rax after.
-fn emit_fp_restore(out: &mut Vec<u8>, d_fps: i32, d_scr: i32, d_in: i32) {
-    gs_store(out, MODRM_RDX, d_scr); // mov gs:[fp_scratch], rdx
-    out.extend_from_slice(&[0xb8, 0xe7, 0x00, 0x00, 0x00]); // mov eax, 0xe7
-    out.extend_from_slice(&[0x31, 0xd2]); // xor edx, edx
-    out.extend_from_slice(&[0x65, 0x48, 0x0f, 0xae, 0x2c, 0x25]); // xrstor64 gs:[
-    emit_u32(out, d_fps as u32); //   fpstate]
-    gs_load(out, MODRM_RDX, d_scr); // mov rdx, gs:[fp_scratch]
-    mov_gs_byte_one(out, d_in); // mov byte gs:[fp_in_regs], 1
-}
+impl Prologue<'_> {
+    /// Emit one instruction whose boundary-before state is `code`.
+    fn ins(&mut self, code: u8, emit: impl FnOnce(&mut Vec<u8>)) {
+        let at = self.out.len();
+        emit(&mut self.out);
+        mark(self.entries, &self.out, at, code);
+    }
 
-/// Emit the FS-base install: load the guest base from `gs:[guest_fs_base]` into
-/// rax, `wrfsbase` it, and set `fs_is_guest`. Assumes rax is already saved and
-/// reloaded by the caller.
-fn emit_fs_install(out: &mut Vec<u8>, d_guest_fs: i32, d_fs: i32) {
-    gs_load(out, MODRM_RAX, d_guest_fs); // mov rax, gs:[guest_fs_base]
-    out.extend_from_slice(&[0xf3, 0x48, 0x0f, 0xae, 0xd0]); // wrfsbase rax
-    mov_gs_byte_one(out, d_fs); // mov byte gs:[fs_is_guest], 1
+    /// Emit `cmp byte gs:[flag], 0; jne skip; <body>; skip:` — the install runs
+    /// only when the flag is clear. The `jne` is a short `rel8`; an install is
+    /// well under 128 bytes. `code` describes the boundaries around the guard
+    /// itself (the `cmp` has clobbered the flags by the `jne`, so a prologue
+    /// that parked them passes the flags-in-slot code here).
+    fn guarded(&mut self, flag_disp: i32, code: u8, body: impl FnOnce(&mut Self)) {
+        self.ins(code, |o| cmp_gs_byte_zero(o, flag_disp));
+        let jne = self.out.len() + 1;
+        self.ins(code, |o| o.extend_from_slice(&[0x75, 0])); // jne skip
+        body(self);
+        let skip = self.out.len();
+        self.out[jne] = jcc_rel8(jne, skip);
+    }
+
+    /// Emit the FP restore proper: park rdx, restore the full extended state
+    /// from `gs:[fpstate]` via `xrstor64` (mask `0xe7` in edx:eax), reload rdx,
+    /// and set `fp_in_regs`. Assumes rax is already saved (it is loaded with
+    /// the mask's low half) and that the caller reloads rax after; `base` is
+    /// the caller's boundary code, to which rdx-in-slot is added across the
+    /// two instructions that run with rdx clobbered.
+    fn fp_restore(&mut self, base: u8, d_fps: i32, d_scr: i32, d_in: i32) {
+        let rdx = base | recipe::PRO_RDX;
+        self.ins(base, |o| gs_store(o, MODRM_RDX, d_scr)); // mov gs:[fp_scratch], rdx
+        self.ins(base, |o| {
+            o.extend_from_slice(&[0xb8, 0xe7, 0x00, 0x00, 0x00])
+        }); // mov eax, 0xe7
+        self.ins(base, |o| o.extend_from_slice(&[0x31, 0xd2])); // xor edx, edx
+        self.ins(rdx, |o| {
+            o.extend_from_slice(&[0x65, 0x48, 0x0f, 0xae, 0x2c, 0x25]); // xrstor64 gs:[
+            emit_u32(o, d_fps as u32); //   fpstate]
+        });
+        self.ins(rdx, |o| gs_load(o, MODRM_RDX, d_scr)); // mov rdx, gs:[fp_scratch]
+        self.ins(base, |o| mov_gs_byte_one(o, d_in)); // mov byte gs:[fp_in_regs], 1
+    }
+
+    /// Emit the FS-base install: load the guest base from `gs:[guest_fs_base]`
+    /// into rax, `wrfsbase` it, and set `fs_is_guest`. Assumes rax is already
+    /// saved and reloaded by the caller.
+    fn fs_install(&mut self, base: u8, d_guest_fs: i32, d_fs: i32) {
+        self.ins(base, |o| gs_load(o, MODRM_RAX, d_guest_fs)); // mov rax, gs:[guest_fs_base]
+        self.ins(base, |o| {
+            o.extend_from_slice(&[0xf3, 0x48, 0x0f, 0xae, 0xd0])
+        }); // wrfsbase rax
+        self.ins(base, |o| mov_gs_byte_one(o, d_fs)); // mov byte gs:[fs_is_guest], 1
+    }
 }
 
 /// `cmp byte ptr gs:[disp32], 0` — `65 80 3c 25 <disp32> 00`.
@@ -1571,13 +2073,25 @@ fn jcc_opcode(code: Code) -> Option<u8> {
 /// tail (`mov gs:[128], rax; movabs rax, syscall_tramp; jmp rax`); the indirect
 /// branch, indirect call, and return hand off to the shared inline lookup
 /// routine via [`emit_jmp_ib_lookup`], which resolves the target in `rax`.
+///
+/// One recovery recipe per appended instruction is pushed onto `codes` (see
+/// [`recipe`]): the first instruction of every sequence is still the precise
+/// guest state at the terminator; past the rax save, rax lives in its slot;
+/// and once a sequence has pushed or popped on the guest stack the guest PC
+/// has moved to the successor — the pushed indirect-call target in the rbx
+/// slot, the popped return address in rax. The syscall and `int3` sequences
+/// are bound for the dispatcher on their own ([`recipe::FLOW`]). `meta`
+/// receives the constants those recipes need.
 fn emit_terminator(
     instrs: &mut Vec<Instruction>,
     t: &Instruction,
     syscall_tramp: u64,
     trap_tramp: u64,
+    codes: &mut Vec<u8>,
+    meta: &mut BlockMeta,
 ) -> Result<(), Error> {
     let next_ip = t.next_ip();
+    let start = instrs.len();
     // `syscall` is special: the instruction itself does *not* run. We save
     // the guest state (rax holds the syscall number, the args are in their
     // usual registers — exit_trampoline captures them all) and exit through
@@ -1648,7 +2162,9 @@ fn emit_terminator(
         // Reload next_ip for the exit tail, which stores it as the resumed
         // guest rip in `gs:[128]`.
         emit_load_rax_imm(instrs, next_ip)?;
-        return emit_exit_tail(instrs, syscall_tramp);
+        emit_exit_tail(instrs, syscall_tramp)?;
+        codes.resize(instrs.len(), recipe::FLOW);
+        return Ok(());
     }
     // `int3` (and `int1`): a software breakpoint. The instruction does not run
     // in the cache; it exits through `exit_trap`, which sets `exit_kind = TRAP`
@@ -1658,8 +2174,14 @@ fn emit_terminator(
     if matches!(t.code(), Code::Int3 | Code::Int1) {
         emit_save_rax(instrs)?;
         emit_load_rax_imm(instrs, next_ip)?;
-        return emit_exit_tail(instrs, trap_tramp);
+        emit_exit_tail(instrs, trap_tramp)?;
+        codes.resize(instrs.len(), recipe::FLOW);
+        return Ok(());
     }
+    // Index (from `start`) of the first appended instruction past which the
+    // guest PC has moved on from the terminator, with the recipe that applies
+    // from there; `None` when the PC stays at the terminator throughout.
+    let mut moved: Option<(usize, u8)> = None;
     match t.flow_control() {
         FlowControl::UnconditionalBranch => {
             let target = t.near_branch_target();
@@ -1675,6 +2197,9 @@ fn emit_terminator(
             emit_save_rax(instrs)?;
             emit_load_rax_imm(instrs, next_ip)?;
             emit_push_rax(instrs)?;
+            // The push completes the call: the guest is at the callee.
+            meta.taken = target;
+            moved = Some((instrs.len() - start, recipe::RAXSLOT_TAKEN));
             emit_load_rax_imm(instrs, target)?;
         }
         FlowControl::IndirectBranch => {
@@ -1700,6 +2225,9 @@ fn emit_terminator(
             ))?);
             emit_load_rax_imm(instrs, next_ip)?;
             emit_push_rax(instrs)?;
+            // The push completes the call: the guest is at the target parked
+            // in the rbx slot.
+            moved = Some((instrs.len() - start, recipe::RAXSLOT_RIP_RBXSLOT));
             emit_load_rax_from_gs(instrs, RBX_SLOT)?;
         }
         FlowControl::Return => {
@@ -1716,16 +2244,21 @@ fn emit_terminator(
             }
             emit_save_rax(instrs)?;
             emit_pop_rax(instrs)?;
+            // The pop completes the return: the guest is at the address now in
+            // rax, and — for `ret imm16`, until the `lea` below has run — its
+            // stack pointer is the host's plus the release.
+            moved = Some((instrs.len() - start, recipe::RAXSLOT_RIP_RAX));
             // `ret imm16` releases imm16 more bytes of stack after popping the
             // return address — callee-popped arguments (V8 builtins use this
             // form). Drop them with `lea`, which, like `ret`, leaves the
             // arithmetic flags untouched.
             if t.code() == Code::Retnq_imm16 {
-                let imm = t.immediate16() as i64;
+                let imm = t.immediate16();
+                meta.rsp_adj = imm;
                 instrs.push(mkinstr(Instruction::with2(
                     Code::Lea_r64_m,
                     Register::RSP,
-                    MemoryOperand::with_base_displ(Register::RSP, imm),
+                    MemoryOperand::with_base_displ(Register::RSP, imm as i64),
                 ))?);
             }
         }
@@ -1742,7 +2275,28 @@ fn emit_terminator(
     // left the runtime-computed guest target in rax. Hand off to the shared
     // inline lookup routine, which jumps straight to the cached translation on
     // a hit and otherwise falls back to the dispatcher.
-    emit_jmp_ib_lookup(instrs)
+    emit_jmp_ib_lookup(instrs)?;
+    for i in 0..instrs.len() - start {
+        let code = match moved {
+            _ if i == 0 => recipe::PRECISE_T,
+            Some((at, code)) if i >= at => {
+                // Only the `lea` of a `ret imm16` sits between the pop and the
+                // final jump with the stack release still outstanding.
+                if code == recipe::RAXSLOT_RIP_RAX
+                    && meta.rsp_adj != 0
+                    && i + 1 < instrs.len() - start
+                {
+                    recipe::RAXSLOT_RIP_RAX_RSPADJ
+                } else {
+                    code
+                }
+            }
+            _ => recipe::RAXSLOT_T,
+        };
+        codes.push(code);
+    }
+    debug_assert_eq!(codes.len(), instrs.len());
+    Ok(())
 }
 
 /// Emit `jmp gs:[ib_lookup]`, transferring to the shared inline
@@ -1929,10 +2483,12 @@ mod tests {
     /// starting alignment.
     fn assert_edges_aligned(link: &LinkTerm) {
         for term_pc in 0..16usize {
-            // block_start 0: every target here is a forward edge (no safepoint
-            // poll), exercising the bare linked-terminator alignment.
-            let (bytes, edges) = build_linked_terminator(link, 0xdead_beef, 0, term_pc);
+            let mut entries = Vec::new();
+            let mut meta = BlockMeta::default();
+            let (bytes, edges) =
+                build_linked_terminator(link, 0xdead_beef, term_pc, &mut entries, &mut meta);
             assert!(!edges.is_empty(), "a linked terminator must expose an edge");
+            assert_entries_cover(&entries, bytes.len());
             for (off, stub, _target) in edges {
                 assert!(
                     off + 4 <= bytes.len(),
@@ -1958,9 +2514,184 @@ mod tests {
         }
     }
 
+    /// The preemption entries of a terminator must tile its bytes exactly:
+    /// every host offset inside it resolves to one recipe.
+    fn assert_entries_cover(entries: &[Entry], len: usize) {
+        let total: usize = entries.iter().map(|e| e.host_len as usize).sum();
+        assert_eq!(
+            total, len,
+            "entries cover {total} of {len} terminator bytes"
+        );
+        assert!(entries.iter().all(|e| e.host_len > 0));
+        // Round-trips through the compact encoding.
+        let mut bytes = Vec::new();
+        for e in entries {
+            e.encode(&mut bytes);
+        }
+        let mut rest = &bytes[..];
+        for e in entries {
+            let (d, r) = Entry::decode(rest).expect("decode");
+            assert_eq!(&d, e);
+            rest = r;
+        }
+        assert!(rest.is_empty());
+    }
+
     #[test]
     fn uncond_edge_is_aligned() {
         assert_edges_aligned(&LinkTerm::Uncond { target: 0x1000 });
+    }
+
+    /// A `loop`-family terminator's entries resume at the right successor once
+    /// the native instruction has run: the short `jmp` it skips (fall-through)
+    /// and the taken branch past it, never back at the terminator, where the
+    /// decrement would be repeated.
+    #[test]
+    fn shortcond_entries_follow_the_native_instruction() {
+        let link = LinkTerm::ShortCond {
+            prefix67: false,
+            opcode: 0xE2, // loop
+            taken: 0x1000,
+            fallthrough: 0x2000,
+        };
+        let mut entries = Vec::new();
+        let mut meta = BlockMeta::default();
+        let (bytes, _) = build_linked_terminator(&link, 0xdead_beef, 0, &mut entries, &mut meta);
+        assert_entries_cover(&entries, bytes.len());
+        assert_eq!(meta.taken, 0x1000);
+        assert_eq!(meta.fall, 0x2000);
+        assert_eq!(entries[0].code, recipe::PRECISE_T); // the `loop` itself
+        assert_eq!(entries[0].host_len, 2);
+        assert_eq!(entries[1].code, recipe::PRECISE_FALL); // `jmp short` fall path
+        assert_eq!(entries[2].code, recipe::PRECISE_TAKEN); // padded `jmp rel32` taken
+        // The walker lands each offset on its span.
+        let mut enc = Vec::new();
+        for e in &entries {
+            e.encode(&mut enc);
+        }
+        let (e, pc, at) = walk_entries(&enc, 2, 0x500).unwrap();
+        assert_eq!((e.code, pc, at), (recipe::PRECISE_FALL, 0x500, true));
+        let (e, _, _) = walk_entries(&enc, bytes.len() - 1, 0x500).unwrap();
+        assert_eq!(e.code, recipe::FLOW);
+        assert!(walk_entries(&enc, bytes.len(), 0x500).is_none());
+    }
+
+    /// A direct call's entries: precise at the rax save, rax-in-slot up to the
+    /// push, and at the callee once the return address is on the stack.
+    #[test]
+    fn direct_call_entries_cross_the_push() {
+        let link = LinkTerm::DirectCall {
+            target: 0x1000,
+            ret: 0x1005,
+        };
+        let mut entries = Vec::new();
+        let mut meta = BlockMeta::default();
+        let (bytes, _) = build_linked_terminator(&link, 0xdead_beef, 0, &mut entries, &mut meta);
+        assert_entries_cover(&entries, bytes.len());
+        assert_eq!(meta.taken, 0x1000);
+        let codes: Vec<u8> = entries.iter().map(|e| e.code).collect();
+        assert_eq!(
+            codes,
+            [
+                recipe::PRECISE_T,
+                recipe::RAXSLOT_T,
+                recipe::RAXSLOT_TAKEN,
+                recipe::PRECISE_TAKEN,
+                recipe::FLOW
+            ]
+        );
+        assert_eq!(entries[0].host_len, 9); // mov gs:[rax], rax
+        assert_eq!(entries[1].host_len, 11); // movabs + push
+        assert_eq!(entries[2].host_len, 9); // mov rax, gs:[rax]
+    }
+
+    /// Body entries advance the guest PC by each instruction's guest length
+    /// even where the host encoding differs (an `lea rip` rewritten to a
+    /// 10-byte `movabs`), and a far-RIP-relative rewrite parks its scratch
+    /// register only across the access and the reload.
+    #[test]
+    fn body_entries_track_guest_pc_and_scratch() {
+        let mut cache = CodeCache::new(1 << 16).unwrap();
+        let host_pc = cache.next_pc();
+        // lea rax, [rip+0x10]; add qword [rip+0x1e00], 0x1e (far from the cache); nop
+        let mut bytes = vec![0x48, 0x8d, 0x05, 0x10, 0x00, 0x00, 0x00];
+        bytes.extend_from_slice(&[0x48, 0x83, 0x05, 0x00, 0x1e, 0x00, 0x00, 0x1e]);
+        bytes.push(0x90);
+        let guest_pc = 0x35f5_0000_0200u64;
+        let mut dec = Decoder::with_ip(64, &bytes, guest_pc, DecoderOptions::NONE);
+        let mut instrs: Vec<Instruction> = Vec::new();
+        while dec.can_decode() {
+            instrs.push(dec.decode());
+        }
+        assert_eq!(instrs.len(), 3);
+        rewrite_rip_relative_leas(&mut instrs).unwrap();
+        let codes = vec![recipe::BODY; 3];
+        let mut entries = Vec::new();
+        emit_body(&mut cache, &instrs, host_pc, guest_pc, &codes, &mut entries).unwrap();
+        // lea→movabs (1 entry), the far add (4 entries), nop (1 entry).
+        assert_eq!(entries.len(), 6);
+        assert_eq!((entries[0].host_len, entries[0].guest_len), (10, 7));
+        assert_eq!(entries[1].fix, 0);
+        assert_eq!(entries[2].fix, 0);
+        assert_ne!(entries[3].fix, 0);
+        assert_eq!(entries[3].guest_len, 8);
+        assert_eq!(entries[3].fix, entries[4].fix);
+        assert_eq!(entries[4].guest_len, 0);
+        assert_eq!(
+            (entries[5].host_len, entries[5].guest_len, entries[5].fix),
+            (1, 1, 0)
+        );
+        let mut enc = Vec::new();
+        for e in &entries {
+            e.encode(&mut enc);
+        }
+        // The nop's boundary is 7 + 8 guest bytes in, whatever the host layout.
+        let nop_off: usize = entries[..5].iter().map(|e| e.host_len as usize).sum();
+        let (e, pc, at) = walk_entries(&enc, nop_off, guest_pc).unwrap();
+        assert_eq!((e.code, pc, at), (recipe::BODY, guest_pc + 15, true));
+        // Before the reload, the access has run: the PC has advanced.
+        let reload_off: usize = entries[..4].iter().map(|e| e.host_len as usize).sum();
+        let (e, pc, _) = walk_entries(&enc, reload_off, guest_pc).unwrap();
+        assert_eq!((e.fix, pc), (entries[4].fix, guest_pc + 15));
+        // Before the access itself, it has not.
+        let access_off: usize = entries[..3].iter().map(|e| e.host_len as usize).sum();
+        let (_, pc, _) = walk_entries(&enc, access_off, guest_pc).unwrap();
+        assert_eq!(pc, guest_pc + 7);
+    }
+
+    /// A prologue's entries tile its bytes and name the parked registers: the
+    /// flags-live form parks rax and the flags across everything after the
+    /// first store, and rdx only across the `xrstor64` and its reload.
+    #[test]
+    fn prologue_entries_name_parked_registers() {
+        let mut entries = Vec::new();
+        let bytes = build_prologue(BlockNeeds { fp: true, fs: true }, true, &mut entries);
+        let total: usize = entries.iter().map(|e| e.host_len as usize).sum();
+        assert_eq!(total, bytes.len());
+        assert!(entries.iter().all(|e| e.code & recipe::PRO != 0));
+        assert_eq!(entries[0].code, recipe::PRO);
+        let rdx: Vec<&Entry> = entries
+            .iter()
+            .filter(|e| e.code & recipe::PRO_RDX != 0)
+            .collect();
+        assert_eq!(rdx.len(), 1); // xrstor64 and the reload, merged
+        assert_eq!(rdx[0].host_len, 10 + 9);
+        assert!(entries[1..].iter().all(|e| e.code & recipe::PRO_RAX != 0));
+
+        let mut entries = Vec::new();
+        let bytes = build_prologue(
+            BlockNeeds {
+                fp: true,
+                fs: false,
+            },
+            false,
+            &mut entries,
+        );
+        let total: usize = entries.iter().map(|e| e.host_len as usize).sum();
+        assert_eq!(total, bytes.len());
+        assert!(entries.iter().all(|e| e.code & recipe::PRO_FLAGS == 0));
+        assert_eq!(entries[0].code, recipe::PRO); // cmp, jne, mov gs:[rax],rax
+        assert_eq!(entries[0].host_len, 9 + 2 + 9);
     }
 
     #[test]
@@ -2065,10 +2796,18 @@ mod riprel_tests {
         );
         let target = instr.ip_rel_memory_address();
         let host_pc = 0x7f0012340000u64;
-        let out = rewrite_far_rip_operands(&[instr], host_pc)
+        let (out, parts) = rewrite_far_rip_operands(&[instr], host_pc)
             .unwrap()
             .unwrap();
         assert_eq!(out.len(), 4);
+        assert_eq!(
+            parts.iter().map(|p| p.op).collect::<Vec<_>>(),
+            [false, false, true, false]
+        );
+        assert_eq!(parts[0].fix, 0);
+        assert_eq!(parts[1].fix, 0);
+        assert_ne!(parts[2].fix, 0);
+        assert_eq!(parts[2].fix, parts[3].fix);
         assert_eq!(out[1].code(), Code::Mov_r64_imm64);
         assert_eq!(out[1].immediate64(), target);
         let scratch = out[1].op0_register();
@@ -2090,7 +2829,7 @@ mod riprel_tests {
     fn scratch_avoids_implicit_registers() {
         // mulq 0x1e00(%rip)
         let instr = decode_at(&[0x48, 0xf7, 0x25, 0x00, 0x1e, 0x00, 0x00], 0x35f50000200);
-        let out = rewrite_far_rip_operands(&[instr], 0x7f0012340000)
+        let (out, _) = rewrite_far_rip_operands(&[instr], 0x7f0012340000)
             .unwrap()
             .unwrap();
         let scratch = out[1].op0_register();

@@ -2,10 +2,10 @@
 //
 // An asynchronous signal must reach the guest handler even while the guest is in
 // a tight, syscall-free compute loop fully linked in the code cache. Such a loop
-// closes via a conditional back-edge that never returns to the run loop, so
-// before the safepoint poll a pending SIGALRM sat undelivered and this spun
-// forever. A watchdog child hard-kills us if that regresses, so the failure is a
-// bounded non-zero exit rather than a hung suite.
+// closes via a conditional back-edge that never returns to the run loop on its
+// own, so the pending SIGALRM is only delivered if the host catcher preempts the
+// thread out of the cache. A watchdog child hard-kills us if that regresses, so
+// the failure is a bounded non-zero exit rather than a hung suite.
 
 #include <signal.h>
 #include <sys/time.h>
@@ -41,7 +41,7 @@ int main(void) {
 
     // Tight, syscall-free reduction loop the translator fully links; the volatile
     // flag is reloaded each iteration and the loop closes via a conditional
-    // back-edge whose safepoint poll must observe the pending signal.
+    // back-edge, so only preemption can get the pending signal delivered.
     volatile unsigned long x = 0;
     while (!got) {
         x = x * 2654435761u + 1;

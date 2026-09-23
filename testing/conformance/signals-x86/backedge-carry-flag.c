@@ -1,13 +1,14 @@
 // RUN: %cc %s -o %t && %runner %t
 //
-// The safepoint poll on a linked conditional back-edge must not perturb the
-// guest's arithmetic flags. A multi-limb add carries the carry flag (CF) across
-// the loop's back-edge: each iteration's `adc` consumes the previous one's
-// carry, the index is stepped with `lea` (no flag effect), and the counter with
-// `dec` (which preserves CF and sets ZF for the `jnz`). The loop is a single
-// linked block, so the back-edge poll runs every iteration; a flag-clobbering
-// poll breaks the carry chain and corrupts the sum. No signal is needed — the
-// bug surfaces purely from the poll running on linked iterations.
+// Whatever the translator emits on a linked conditional back-edge must not
+// perturb the guest's arithmetic flags. A multi-limb add carries the carry flag
+// (CF) across the loop's back-edge: each iteration's `adc` consumes the
+// previous one's carry, the index is stepped with `lea` (no flag effect), and
+// the counter with `dec` (which preserves CF and sets ZF for the `jnz`). The
+// loop is a single linked block, so any flag-clobbering instruction on the
+// edge (an earlier design polled a signal flag there) breaks the carry chain
+// and corrupts the sum. No signal is needed — the bug surfaces purely from the
+// linked iterations.
 //
 // Adding all-ones + 1 across N limbs must yield all-zero limbs and a carry out.
 

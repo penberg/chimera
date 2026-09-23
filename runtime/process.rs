@@ -22,26 +22,44 @@ use crate::{
     },
 };
 
-/// Host signal Chimera reserves to interrupt a guest thread parked in a
-/// forwarded syscall (so it returns `EINTR` and re-checks the exit flag). The
-/// highest real-time signal is used as the one least likely to collide with a
-/// signal the guest itself installs. A do-nothing handler is installed for it,
-/// without `SA_RESTART`, purely so the kernel interrupts the blocking syscall.
+/// Host signal Chimera reserves to force a sibling guest thread to its
+/// run-loop boundary: one executing translated code is preempted out of the
+/// cache by the handler ([`crate::arch::preempt`]), one parked in a forwarded
+/// syscall returns `EINTR` (the handler is installed without `SA_RESTART`).
+/// The highest real-time signal is used as the one least likely to collide
+/// with a signal the guest itself installs.
 fn interrupt_signal() -> libc::c_int {
     libc::SIGRTMAX()
 }
 
-extern "C" fn interrupt_noop(_sig: libc::c_int) {}
+/// Handler for [`interrupt_signal`]. Preempts the interrupted thread; one
+/// caught in Chimera's own code has its next cache entry declined instead, by
+/// the same flag [`Process::interrupt_others`] arms before sending the signal.
+extern "C" fn interrupt_catch(
+    _sig: libc::c_int,
+    _info: *const libc::siginfo_t,
+    uc: *mut libc::c_void,
+) {
+    if !crate::arch::preempt(uc) {
+        unsafe {
+            std::arch::asm!(
+                "mov dword ptr gs:[{off}], 1",
+                off = const std::mem::offset_of!(ThreadState, exit_requested),
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
 
 static INSTALL_INTERRUPT: Once = Once::new();
 
-/// Install the no-op handler for [`interrupt_signal`] once per process.
+/// Install the handler for [`interrupt_signal`] once per process.
 fn install_interrupt_handler() {
     INSTALL_INTERRUPT.call_once(|| unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = interrupt_noop as *const () as usize;
+        sa.sa_sigaction = interrupt_catch as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_flags = 0; // no SA_RESTART: a parked syscall must surface EINTR
+        sa.sa_flags = libc::SA_SIGINFO; // no SA_RESTART: a parked syscall must surface EINTR
         libc::sigaction(interrupt_signal(), &sa, std::ptr::null_mut());
     });
 }
@@ -85,9 +103,10 @@ pub struct Process {
     /// identity (stable across a fork, where the TID is not), and the only
     /// fields reached through it are the atomic `tid` and `exit_requested`,
     /// so a process-wide stop (`exit_group`, a committed `execve`) can reach
-    /// every sibling — armed safepoint slot for one executing translated
-    /// code, interrupt signal for one parked in a host syscall — and the main
-    /// thread can wait for the others to finish. A pointer is valid for
+    /// every sibling — the interrupt signal preempts one executing translated
+    /// code or parked in a host syscall, the armed flag declines the next
+    /// cache entry of one caught in Chimera's own code — and the main thread
+    /// can wait for the others to finish. A pointer is valid for
     /// exactly the registration window: `Thread::run` registers after its
     /// state is pinned and unregisters, under the same mutex, before the
     /// state can drop, so a reader holding the `threads` lock never
@@ -137,10 +156,9 @@ impl Process {
     /// Register a thread as running a guest, by the address of its
     /// [`ThreadState`] (see [`Process::threads`] for the discipline that
     /// keeps the pointer valid). The state carries everything a sibling's
-    /// stop needs: the `exit_requested` safepoint slot the translated
-    /// back-edge and IB-hit polls read, and the `tid` the interrupt signal
-    /// targets. Balanced by [`Process::unregister_thread`] when the run loop
-    /// ends.
+    /// stop needs: the `exit_requested` entry-abort flag and the `tid` the
+    /// interrupt signal targets. Balanced by [`Process::unregister_thread`]
+    /// when the run loop ends.
     pub fn register_thread(&self, state: &ThreadState) {
         self.threads
             .lock()
@@ -171,7 +189,7 @@ impl Process {
     }
 
     /// Block until every guest thread other than the caller (identified by its
-    /// safepoint slot) has finished, or a
+    /// `ThreadState`) has finished, or a
     /// process-wide `exit_group` is requested; returns the resulting process
     /// status. Used when the main thread exits on its own (`pthread_exit` /
     /// thread-local `exit` / raw `SYS_exit`): POSIX keeps the process alive
@@ -198,12 +216,12 @@ impl Process {
         }
     }
 
-    /// Record a process-wide exit (`exit_group`) requested by the thread whose
-    /// safepoint slot is `self_slot`. The code is published before the flag, with
+    /// Record a process-wide exit (`exit_group`) requested by the thread
+    /// `self_state`. The code is published before the flag, with
     /// release/acquire ordering, so any thread that later sees `is_exiting()`
     /// reads this exact code. Every other thread is then interrupted with
-    /// [`interrupt_signal`] so one parked in a host syscall returns `EINTR` and
-    /// observes the exit at its run-loop boundary, rather than waiting for a
+    /// [`interrupt_signal`] so it observes the exit at its run-loop boundary
+    /// at once, whether it is spinning in translated code or parked in a host
     /// syscall that may never return on its own.
     pub fn request_exit_group(&self, code: i32, self_state: &ThreadState) {
         self.exit_code.store(code, Ordering::Relaxed);
@@ -267,12 +285,14 @@ impl Process {
 
     /// Force every thread except the caller to its run-loop boundary,
     /// where the pending process-wide stop (an `exit_group`, a committed
-    /// `execve`) is observed. Two mechanisms, one per way a sibling can be
-    /// away from its boundary: arming the thread's `exit_requested` safepoint
-    /// slot pops one executing fully linked translated code out of the cache
-    /// (the back-edge and IB-hit polls read it), and [`interrupt_signal`]
-    /// makes one parked in a blocking host syscall return `EINTR`. Also wakes
-    /// a main thread parked in [`Process::wait_for_others`].
+    /// `execve`) is observed. [`interrupt_signal`] does the work: its handler
+    /// preempts a sibling executing translated code straight out of the cache,
+    /// and a sibling parked in a blocking host syscall returns `EINTR`. The
+    /// thread's `exit_requested` flag is armed first, for the one place the
+    /// signal cannot act — a sibling caught in its own run loop between the
+    /// stop checks and the cache entry — so that entry is declined and the
+    /// checks run again. Also wakes a main thread parked in
+    /// [`Process::wait_for_others`].
     fn interrupt_others(&self, self_state: &ThreadState) {
         let self_state = self_state as *const ThreadState;
         let pid = unsafe { libc::getpid() };

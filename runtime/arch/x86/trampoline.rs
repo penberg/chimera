@@ -56,13 +56,17 @@ global_asm!(
     TS_FP_IN_REGS  = const offset_of!(ThreadState, fp_in_regs),
     TS_FS_IS_GUEST = const offset_of!(ThreadState, fs_is_guest),
     TS_CHIMERA_FS  = const offset_of!(ThreadState, chimera_fs_base),
+    TS_EXIT_REQUESTED = const offset_of!(ThreadState, exit_requested),
     EXIT_KIND_SYSCALL = const EXIT_KIND_SYSCALL,
     EXIT_KIND_TRAP = const EXIT_KIND_TRAP,
 );
 
 unsafe extern "C" {
     pub fn dispatch(ctx: *mut ThreadState, host_pc: u64);
+    fn dispatch_host_pc_stashed();
+    fn dispatch_end();
     pub fn exit_block();
+    fn exit_now();
     pub fn exit_syscall();
     pub fn exit_trap();
     fn chimera_fetch_copy(dst: *mut u8, src: *const u8, len: usize) -> usize;
@@ -71,6 +75,30 @@ unsafe extern "C" {
     pub fn guarded_copy(dst: *mut u8, src: *const u8, len: usize) -> i64;
     fn guarded_copy_fault();
     fn guarded_copy_end();
+}
+
+/// The host-rip layout of `dispatch` for the preemption code: the routine's
+/// bounds `[lo, hi)` and the label past the `TS_HOST_PC` stash. A signal
+/// caught at a rip in `[lo, stashed)` still has the host PC in rsi; one caught
+/// in `[stashed, hi)` has it in `TS_HOST_PC`.
+pub struct DispatchSpan {
+    pub lo: usize,
+    pub stashed: usize,
+    pub hi: usize,
+}
+
+pub fn dispatch_span() -> DispatchSpan {
+    DispatchSpan {
+        lo: dispatch as *const () as usize,
+        stashed: dispatch_host_pc_stashed as *const () as usize,
+        hi: dispatch_end as *const () as usize,
+    }
+}
+
+/// Host address of `exit_now`, the block exit an interrupted thread is aimed
+/// at: it stashes rax and runs `exit_block` with the live guest registers.
+pub fn exit_now_addr() -> usize {
+    exit_now as *const () as usize
 }
 
 /// Copy up to `buf.len()` bytes of guest memory at `src` into `buf` without
