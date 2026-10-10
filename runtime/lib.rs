@@ -11,6 +11,7 @@ mod arch;
 mod process;
 mod sys;
 mod syscall;
+mod vcpu;
 
 pub use syscall::{ForkHold, Passthrough, SyscallResult, SystemCall, SystemCalls};
 

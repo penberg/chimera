@@ -1,4 +1,4 @@
-//! x86-64 backend: the guest register file and translate-execute loop
+//! x86-64 backend: the guest register file and the translating [`Vcpu`]
 //! (`dispatch`), the assembly trampolines that cross between Chimera and
 //! translated guest code (`trampoline`), the basic-block translator that emits
 //! x86-64 from x86-64 (`translate`), and the translated-block cache that links
@@ -7,6 +7,8 @@
 use std::sync::OnceLock;
 
 use crate::Error;
+#[cfg(doc)]
+use crate::vcpu::Vcpu;
 
 pub mod cache;
 pub mod dispatch;

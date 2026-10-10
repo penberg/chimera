@@ -204,9 +204,12 @@ mod host {
 
     use super::{SyscallResult, SystemCall, SystemCalls, host_syscall};
     use crate::{
-        arch::dispatch::{CLONE_ARGS_SIZE_MAX, RSP, Thread, read_clone3_args},
+        arch::dispatch::RSP,
         sys::{
-            linux::exec::{exec_errno, prepare_exec},
+            linux::{
+                exec::{exec_errno, prepare_exec},
+                thread::{CLONE_ARGS_SIZE_MAX, Thread, read_clone3_args},
+            },
             mmap::copy_from_guest,
         },
     };
