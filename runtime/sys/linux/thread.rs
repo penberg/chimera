@@ -1,10 +1,10 @@
-//! Guest threads: the per-thread state the runtime keeps for each guest
-//! thread, and the loop that runs it.
+//! Guest threads: the kernel's per-thread state and the loop that drives a
+//! thread's [`Vcpu`].
 //!
-//! [`Thread::run`] is the loop: deliver any pending guest signal, translate the
-//! next block if it isn't already cached, enter the cache through
-//! [`dispatch`], handle whatever caused the cache to exit (a block boundary or
-//! a syscall), and repeat until the guest issues `exit_group` or `exit`.
+//! [`Thread::run`] is the loop: deliver any pending guest signal, observe
+//! process-wide stops, run the vcpu, and handle the [`Exit`] it returns — a
+//! system call, a breakpoint, a fetch fault, or a safepoint — until the guest
+//! issues `exit_group` or `exit`.
 
 use std::{
     sync::{Arc, MutexGuard, atomic::Ordering, mpsc},
@@ -13,18 +13,13 @@ use std::{
 
 use crate::{
     Error, SystemCall,
-    arch::{
-        dispatch::{
-            EXIT_KIND_BLOCK, EXIT_KIND_SYSCALL, EXIT_KIND_TRAP, R8, R9, R10, RAX, RDI, RDX, RSI,
-            ThreadState, current_fs_base,
-        },
-        x86::trampoline::{dispatch, exit_block, exit_syscall, exit_trap},
-    },
+    arch::dispatch::{R8, R9, R10, RAX, RDI, RDX, RSI, ThreadState, Translator, current_fs_base},
     process::Process,
     sys::{
         linux::signal::Signals,
         mmap::{AddressSpace, copy_from_guest, copy_to_guest},
     },
+    vcpu::{Exit, Vcpu},
 };
 
 /// `SIGTRAP`, raised on a guest `int3`.
@@ -70,6 +65,8 @@ impl Drop for ThreadGuard {
 /// terminates on its next iteration.
 pub struct Thread {
     pub state: Box<ThreadState>,
+    /// The virtual CPU that executes this thread's guest code.
+    vcpu: Box<dyn Vcpu>,
     /// The shared process state. Every thread of a guest process holds an `Arc`
     /// to the same `Process`, so they translate into and map within one address
     /// space.
@@ -120,6 +117,7 @@ impl Thread {
         let signals = Signals::new(Arc::clone(&process.sig_table));
         let mut thread = Self {
             state: ThreadState::new(),
+            vcpu: Box::new(Translator::new(Arc::clone(&process))),
             process,
             signals,
             running: false,
@@ -151,6 +149,7 @@ impl Thread {
         state.pending_set = signals.pending_set_ptr() as u64;
         Self {
             state,
+            vcpu: Box::new(Translator::new(Arc::clone(&process))),
             process,
             signals,
             running: false,
@@ -477,19 +476,7 @@ impl Thread {
             state: &*self.state,
         };
 
-        let block_exit = exit_block as *const () as usize as u64;
-        let syscall_exit = exit_syscall as *const () as usize as u64;
-        let trap_exit = exit_trap as *const () as usize as u64;
-
-        // Emit (once per cache) the shared inline indirect-branch lookup routine
-        // and record its address so translated indirect branches can reach it.
-        self.state.ib_lookup = self
-            .process
-            .addr_space
-            .lock()
-            .unwrap()
-            .code
-            .ensure_ib_lookup(block_exit)?;
+        self.vcpu.attach(&mut self.state)?;
 
         while self.running {
             self.deliver_pending_signals();
@@ -520,55 +507,31 @@ impl Thread {
                 break;
             }
 
-            let ts_ptr: *mut ThreadState = &mut *self.state;
-
-            let rip = unsafe { (*ts_ptr).rip };
-            // Hold the address-space lock only long enough to resolve (and, on a
-            // miss, translate) the next block; the guard drops at the end of this
-            // statement, before `dispatch()` runs the block.
-            let host_pc = match self.process.addr_space.lock().unwrap().resolve(
-                rip,
-                block_exit,
-                syscall_exit,
-                trap_exit,
-            ) {
-                Ok(host_pc) => host_pc,
-                // The guest jumped to unmapped memory — a wild indirect branch
-                // through a corrupted pointer, say. Natively the fetch faults;
-                // raise the same SIGSEGV: it enters the guest's handler, or
-                // (default action) terminates the process faithfully.
-                Err(Error::BadAccess(_)) => {
-                    let restart = self.restart.take();
-                    let state = &mut *self.state;
-                    self.signals.deliver(state, SIGSEGV, restart);
-                    continue;
-                }
-                Err(e) => panic!("translate failed at {:#x}: {}", rip, e),
-            };
-            unsafe {
-                (*ts_ptr).exit_kind = EXIT_KIND_BLOCK;
-            }
-            self.process.addr_space.lock().unwrap().code_deny_writes();
-            unsafe {
-                dispatch(ts_ptr, host_pc);
-            }
-            self.process.addr_space.lock().unwrap().code_allow_writes();
-            match unsafe { (*ts_ptr).exit_kind } {
-                EXIT_KIND_SYSCALL => {
+            match self.vcpu.run(&mut self.state) {
+                Exit::Syscall => {
                     if let Some(reason) = self.handle_syscall() {
                         return Ok(reason);
                     }
                 }
-                EXIT_KIND_TRAP => {
-                    // A guest `int3` exited here with `rip` already at the
-                    // instruction after the breakpoint. Raise SIGTRAP: it enters
-                    // the guest's handler, or (default action) terminates the
-                    // process with a faithful SIGTRAP status.
+                // A guest `int3`, with `rip` already at the instruction after
+                // the breakpoint. Raise SIGTRAP: it enters the guest's
+                // handler, or (default action) terminates the process with a
+                // faithful SIGTRAP status.
+                Exit::Breakpoint => {
                     let restart = self.restart.take();
                     let state = &mut *self.state;
                     self.signals.deliver(state, SIGTRAP, restart);
                 }
-                _ => {}
+                // The guest jumped to unmapped memory — a wild indirect branch
+                // through a corrupted pointer, say. Natively the fetch faults;
+                // raise the same SIGSEGV: it enters the guest's handler, or
+                // (default action) terminates the process faithfully.
+                Exit::FetchFault => {
+                    let restart = self.restart.take();
+                    let state = &mut *self.state;
+                    self.signals.deliver(state, SIGSEGV, restart);
+                }
+                Exit::Safepoint => {}
             }
         }
         // Absent an `exit_group`, the kernel reports the status of the last

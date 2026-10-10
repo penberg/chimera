@@ -1,25 +1,97 @@
-//! The guest register file the translate-execute loop operates on.
+//! The translator: a [`Vcpu`] that runs the guest by translating it, and the
+//! guest register file it operates on.
 //!
 //! `ThreadState` holds the guest register file. The GS segment base is set to
 //! point at it via `arch_prctl`, so translated code can reach any field with a
-//! plain `gs:[disp]` access — no reserved GPR required. The loop itself is
-//! `Thread::run` in `crate::sys::linux::thread`; the boundary-crossing
-//! assembly lives in [`super::trampoline`].
+//! plain `gs:[disp]` access — no reserved GPR required.
+//!
+//! [`Translator::run`] translates the next block if it isn't already cached,
+//! enters the cache through [`dispatch`], and reports why the cache exited.
+//! The boundary-crossing assembly lives in [`super::trampoline`].
 
 use std::{
     arch::asm,
-    sync::atomic::{AtomicI32, AtomicU32, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicI32, AtomicU32, Ordering},
+    },
 };
 
-use crate::Error;
+use crate::{
+    Error,
+    process::Process,
+    vcpu::{Exit, Vcpu},
+};
+
+use super::trampoline::{dispatch, exit_block, exit_syscall, exit_trap};
 
 /// Linux x86-64 `arch_prctl` subfunction code: set the GS base.
 const ARCH_SET_GS: libc::c_int = 0x1001;
 
-pub const EXIT_KIND_BLOCK: u64 = 0;
+const EXIT_KIND_BLOCK: u64 = 0;
 pub const EXIT_KIND_SYSCALL: u64 = 1;
-/// A guest breakpoint (`int3`) exited the cache: the run loop raises `SIGTRAP`.
+/// A guest breakpoint (`int3`) exited the cache.
 pub const EXIT_KIND_TRAP: u64 = 2;
+
+/// A [`Vcpu`] that runs guest code by translating it into the process's
+/// shared code cache. Each [`Vcpu::run`] runs the cache until it exits, which
+/// it does at a syscall, a breakpoint, or a block whose successor is not yet
+/// linked; the last is a [`Exit::Safepoint`].
+pub struct Translator {
+    process: Arc<Process>,
+}
+
+impl Translator {
+    pub fn new(process: Arc<Process>) -> Self {
+        Self { process }
+    }
+}
+
+impl Vcpu for Translator {
+    fn attach(&mut self, state: &mut ThreadState) -> Result<(), Error> {
+        // Emit (once per cache) the shared inline indirect-branch lookup routine
+        // and record its address so translated indirect branches can reach it.
+        state.ib_lookup = self
+            .process
+            .addr_space
+            .lock()
+            .unwrap()
+            .code
+            .ensure_ib_lookup(exit_block as *const () as usize as u64)?;
+        Ok(())
+    }
+
+    fn run(&mut self, state: &mut ThreadState) -> Exit {
+        let block_exit = exit_block as *const () as usize as u64;
+        let syscall_exit = exit_syscall as *const () as usize as u64;
+        let trap_exit = exit_trap as *const () as usize as u64;
+
+        // Hold the address-space lock only long enough to resolve (and, on a
+        // miss, translate) the next block; the guard drops at the end of this
+        // statement, before `dispatch()` runs the block.
+        let host_pc = match self.process.addr_space.lock().unwrap().resolve(
+            state.rip,
+            block_exit,
+            syscall_exit,
+            trap_exit,
+        ) {
+            Ok(host_pc) => host_pc,
+            Err(Error::BadAccess(_)) => return Exit::FetchFault,
+            Err(e) => panic!("translate failed at {:#x}: {}", state.rip, e),
+        };
+        state.exit_kind = EXIT_KIND_BLOCK;
+        self.process.addr_space.lock().unwrap().code_deny_writes();
+        unsafe {
+            dispatch(state, host_pc);
+        }
+        self.process.addr_space.lock().unwrap().code_allow_writes();
+        match state.exit_kind {
+            EXIT_KIND_SYSCALL => Exit::Syscall,
+            EXIT_KIND_TRAP => Exit::Breakpoint,
+            _ => Exit::Safepoint,
+        }
+    }
+}
 
 /// Size of the XSAVE area in [`ThreadState::fpstate`]. The standard (non-
 /// compacted) XSAVE layout for x87+SSE+AVX+AVX-512 ends at architecturally
