@@ -8,7 +8,13 @@
 //! running it again. The kernel reads and writes guest state only through the
 //! register file, so it is written once for every `Vcpu`.
 
-use crate::{Error, arch::dispatch::ThreadState};
+use std::sync::Arc;
+
+use crate::{
+    Backend, Error,
+    arch::{dispatch::ThreadState, x86::sud::SyscallUserDispatch},
+    process::Process,
+};
 
 /// Why [`Vcpu::run`] returned. The register file describes the guest at the
 /// point of the exit.
@@ -35,4 +41,12 @@ pub trait Vcpu: Send {
 
     /// Run guest code from `state` until the guest needs the kernel.
     fn run(&mut self, state: &mut ThreadState) -> Exit;
+}
+
+/// Create the vcpu that runs the threads of `process` under `backend`.
+pub fn create(backend: Backend, process: Arc<Process>) -> Box<dyn Vcpu> {
+    match backend {
+        Backend::Translator => Box::new(crate::arch::dispatch::Translator::new(process)),
+        Backend::SyscallUserDispatch => Box::new(SyscallUserDispatch::new()),
+    }
 }

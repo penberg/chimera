@@ -12,6 +12,7 @@ use crate::vcpu::Vcpu;
 
 pub mod cache;
 pub mod dispatch;
+pub mod sud;
 pub mod trampoline;
 pub mod translate;
 

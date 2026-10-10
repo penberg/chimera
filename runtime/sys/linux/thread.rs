@@ -13,13 +13,13 @@ use std::{
 
 use crate::{
     Error, SystemCall,
-    arch::dispatch::{R8, R9, R10, RAX, RDI, RDX, RSI, ThreadState, Translator, current_fs_base},
+    arch::dispatch::{R8, R9, R10, RAX, RDI, RDX, RSI, ThreadState, current_fs_base},
     process::Process,
     sys::{
         linux::signal::Signals,
         mmap::{AddressSpace, copy_from_guest, copy_to_guest},
     },
-    vcpu::{Exit, Vcpu},
+    vcpu::{self, Exit, Vcpu},
 };
 
 /// `SIGTRAP`, raised on a guest `int3`.
@@ -64,9 +64,12 @@ impl Drop for ThreadGuard {
 /// clearing `running` and recording an `exit_code`, and the run loop
 /// terminates on its next iteration.
 pub struct Thread {
-    pub state: Box<ThreadState>,
-    /// The virtual CPU that executes this thread's guest code.
+    /// The virtual CPU that executes this thread's guest code. Declared before
+    /// `state` so it drops first: the syscall user dispatch vcpu has given the
+    /// kernel a pointer into the register file, its selector byte, and must
+    /// withdraw it while the register file is still alive.
     vcpu: Box<dyn Vcpu>,
+    pub state: Box<ThreadState>,
     /// The shared process state. Every thread of a guest process holds an `Arc`
     /// to the same `Process`, so they translate into and map within one address
     /// space.
@@ -117,7 +120,7 @@ impl Thread {
         let signals = Signals::new(Arc::clone(&process.sig_table));
         let mut thread = Self {
             state: ThreadState::new(),
-            vcpu: Box::new(Translator::new(Arc::clone(&process))),
+            vcpu: vcpu::create(process.backend, Arc::clone(&process)),
             process,
             signals,
             running: false,
@@ -149,7 +152,7 @@ impl Thread {
         state.pending_set = signals.pending_set_ptr() as u64;
         Self {
             state,
-            vcpu: Box::new(Translator::new(Arc::clone(&process))),
+            vcpu: vcpu::create(process.backend, Arc::clone(&process)),
             process,
             signals,
             running: false,
@@ -184,6 +187,13 @@ impl Thread {
             Ordering::Release,
         );
         self.process.reset_after_fork(&self.state);
+        // The child is a new host thread in a new process, and the kernel
+        // copies a vcpu's per-task setup (syscall user dispatch) no more than
+        // a thread's, so attach again before the child runs guest code.
+        if let Err(err) = self.vcpu.attach(&mut self.state) {
+            eprintln!("chimera: fork child: {err}");
+            std::process::exit(127);
+        }
     }
 
     /// Record this thread's `clear_child_tid` word (from `set_tid_address`). A
