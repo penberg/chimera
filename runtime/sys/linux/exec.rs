@@ -15,7 +15,6 @@ use std::{
 
 use crate::{
     Error, SystemCalls,
-    arch::dispatch::{self, ExitReason},
     process::Process,
     sys::mmap::{AddressSpace, copy_from_guest},
 };
@@ -23,6 +22,7 @@ use crate::{
 use super::{
     elf::{LoadedElf, PAGE_SIZE, ParsedElf, load_elf, map_elf, parse_elf},
     signal::HostMaskGuard,
+    thread::{ExitReason, Thread},
 };
 
 const STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -83,7 +83,7 @@ pub fn execv(
     // code runs, so a self-modifying-code write trap can reach the address
     // space.
     super::fault::set_process(&process);
-    let mut thread = dispatch::Thread::new(process, rip, rsp)?;
+    let mut thread = Thread::new(process, rip, rsp)?;
     let _host_mask = HostMaskGuard::save();
     record_regions(
         &mut thread.addr_space(),
@@ -103,7 +103,7 @@ pub fn execv(
 /// initial thread's first run reason, and a `clone` child promoted to main
 /// by a fork in its thread (see `Thread::reset_after_fork`) — that child's
 /// host thread is all its new process has, so it must drive itself.
-pub fn drive(thread: &mut dispatch::Thread, mut reason: ExitReason) -> Result<i32, Error> {
+pub fn drive(thread: &mut Thread, mut reason: ExitReason) -> Result<i32, Error> {
     loop {
         match reason {
             ExitReason::Exited(code) => return Ok(code),

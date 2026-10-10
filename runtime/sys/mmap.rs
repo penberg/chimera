@@ -397,7 +397,7 @@ impl Drop for AddressSpace {
 /// [`Thread::reset_after_fork`] for the guest's raw-`clone` fork path, which
 /// never runs libc's fork handlers.
 ///
-/// [`Thread::reset_after_fork`]: crate::arch::x86::dispatch::Thread::reset_after_fork
+/// [`Thread::reset_after_fork`]: crate::sys::linux::thread::Thread::reset_after_fork
 static CACHED_PID: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn reset_cached_pid_after_fork() {

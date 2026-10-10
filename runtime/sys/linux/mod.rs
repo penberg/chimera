@@ -12,6 +12,7 @@ mod overlayfs;
 mod personality;
 pub mod signal;
 pub mod syscall;
+pub mod thread;
 mod vfs;
 
 pub use delta::{Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin};
