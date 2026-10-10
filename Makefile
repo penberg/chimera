@@ -6,6 +6,10 @@ RUNNER ?= $(CARGO_TARGET_DIR)/debug/chimera run
 # and are dropped here instead, until the Darwin port catches up.
 EXCLUDE := $(if $(filter Darwin,$(shell uname -s)),--exclude fs,)
 
+# The backends `make conformance` runs the suite under; syscall user dispatch
+# exists only on x86-64 Linux. Run one with `make conformance BACKENDS=sud`.
+BACKENDS := dbt $(if $(filter Linux-x86_64,$(shell uname -s)-$(shell uname -m)),sud,)
+
 build:
 	cargo build --quiet
 
@@ -22,7 +26,10 @@ ci:
 .PHONY: ci
 
 conformance: build
-	python3 testing/lit.py $(EXCLUDE) --runner "$(RUNNER)"
+	@for backend in $(BACKENDS); do \
+	    echo "# backend: $$backend"; \
+	    CHIMERA_BACKEND=$$backend python3 testing/lit.py $(EXCLUDE) --runner "$(RUNNER)" || exit 1; \
+	done
 .PHONY: conformance
 
 conformance-native:
