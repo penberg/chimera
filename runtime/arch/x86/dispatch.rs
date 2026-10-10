@@ -11,8 +11,10 @@ use std::{
     sync::atomic::{AtomicI32, AtomicU32, Ordering},
 };
 
+use crate::Error;
+
 /// Linux x86-64 `arch_prctl` subfunction code: set the GS base.
-pub const ARCH_SET_GS: libc::c_int = 0x1001;
+const ARCH_SET_GS: libc::c_int = 0x1001;
 
 pub const EXIT_KIND_BLOCK: u64 = 0;
 pub const EXIT_KIND_SYSCALL: u64 = 1;
@@ -24,7 +26,7 @@ pub const EXIT_KIND_TRAP: u64 = 2;
 /// fixed offsets totaling ~2688 bytes; 4096 leaves comfortable margin. The
 /// trampoline saves/restores with the `0xe7` component mask, which never
 /// selects AMX, so the area size is bounded regardless of the host's XCR0.
-pub const XSAVE_AREA_SIZE: usize = 4096;
+const XSAVE_AREA_SIZE: usize = 4096;
 
 /// Guest register file plus a few bookkeeping slots. The exact byte layout is
 /// load-bearing: the offsets are consumed by `trampoline.S` (via `offset_of!`
@@ -147,6 +149,48 @@ const _: () = assert!(
 );
 
 impl ThreadState {
+    /// A zeroed register file; [`ThreadState::reset`] gives it an entry point.
+    pub fn new() -> Box<Self> {
+        Box::new(Self {
+            regs: [0; 16],
+            rip: 0,
+            rflags: 0,
+            chimera_rsp: 0,
+            host_pc_target: 0,
+            exit_kind: 0,
+            guest_fs_base: 0,
+            chimera_fs_base: 0,
+            ib_lookup: 0,
+            ib_flags: 0,
+            ib_target: 0,
+            ib_rcx: 0,
+            ib_rdx: 0,
+            ib_host: 0,
+            exit_requested: AtomicU32::new(0),
+            fp_in_regs: 0,
+            fp_flags: 0,
+            fp_scratch: 0,
+            fpstate: [0; XSAVE_AREA_SIZE],
+            fs_is_guest: 0,
+            pending_set: 0,
+            tid: AtomicI32::new(0),
+            riprel_scratch: 0,
+        })
+    }
+
+    /// Point the calling host thread's GS base at this register file, so
+    /// translated code and the host signal catcher reach it as `gs:[disp]`.
+    /// GS is host-thread-local, so this runs on the OS thread that is about
+    /// to execute the guest.
+    pub fn install_gs(&self) -> Result<(), Error> {
+        let state_addr = self as *const ThreadState as usize;
+        let ret = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_GS, state_addr) };
+        if ret != 0 {
+            return Err(Error::last_os_error("arch_prctl(ARCH_SET_GS)"));
+        }
+        Ok(())
+    }
+
     pub fn reset(&mut self, rip: u64, rsp: u64, guest_fs_base: u64) {
         self.regs = [0; 16];
         self.rip = 0;

@@ -7,11 +7,7 @@
 //! a syscall), and repeat until the guest issues `exit_group` or `exit`.
 
 use std::{
-    sync::{
-        Arc, MutexGuard,
-        atomic::{AtomicI32, AtomicU32, Ordering},
-        mpsc,
-    },
+    sync::{Arc, MutexGuard, atomic::Ordering, mpsc},
     thread,
 };
 
@@ -19,8 +15,8 @@ use crate::{
     Error, SystemCall,
     arch::{
         dispatch::{
-            ARCH_SET_GS, EXIT_KIND_BLOCK, EXIT_KIND_SYSCALL, EXIT_KIND_TRAP, R8, R9, R10, RAX, RDI,
-            RDX, RSI, ThreadState, XSAVE_AREA_SIZE, current_fs_base,
+            EXIT_KIND_BLOCK, EXIT_KIND_SYSCALL, EXIT_KIND_TRAP, R8, R9, R10, RAX, RDI, RDX, RSI,
+            ThreadState, current_fs_base,
         },
         x86::trampoline::{dispatch, exit_block, exit_syscall, exit_trap},
     },
@@ -123,31 +119,7 @@ impl Thread {
         let guest_fs_base = current_fs_base();
         let signals = Signals::new(Arc::clone(&process.sig_table));
         let mut thread = Self {
-            state: Box::new(ThreadState {
-                regs: [0; 16],
-                rip: 0,
-                rflags: 0,
-                chimera_rsp: 0,
-                host_pc_target: 0,
-                exit_kind: 0,
-                guest_fs_base: 0,
-                chimera_fs_base: 0,
-                ib_lookup: 0,
-                ib_flags: 0,
-                ib_target: 0,
-                ib_rcx: 0,
-                ib_rdx: 0,
-                ib_host: 0,
-                exit_requested: AtomicU32::new(0),
-                fp_in_regs: 0,
-                fp_flags: 0,
-                fp_scratch: 0,
-                fpstate: [0; XSAVE_AREA_SIZE],
-                fs_is_guest: 0,
-                pending_set: 0,
-                tid: AtomicI32::new(0),
-                riprel_scratch: 0,
-            }),
+            state: ThreadState::new(),
             process,
             signals,
             running: false,
@@ -485,9 +457,7 @@ impl Thread {
     /// forwarded to the host kernel. The handler observes the call first. The
     /// embedder's handler is reached through the shared [`Process`].
     pub fn run(&mut self) -> Result<ExitReason, Error> {
-        // GS is host-thread-local, so bind it on the OS thread that is
-        // actually about to execute the translated guest.
-        self.setup_gs()?;
+        self.state.install_gs()?;
         self.state.capture_chimera_fs();
         self.signals.mirror_host_mask();
         self.running = true;
@@ -680,15 +650,6 @@ impl Thread {
             self.running = false;
         }
         None
-    }
-
-    fn setup_gs(&self) -> Result<(), Error> {
-        let state_addr = &*self.state as *const ThreadState as usize;
-        let ret = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_GS, state_addr) };
-        if ret != 0 {
-            return Err(Error::last_os_error("arch_prctl(ARCH_SET_GS)"));
-        }
-        Ok(())
     }
 }
 
