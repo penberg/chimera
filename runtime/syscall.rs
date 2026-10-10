@@ -255,16 +255,12 @@ mod host {
     /// enforce host-process policy. Embedders can still observe all of these in
     /// `pre_syscall()` and `post_syscall()`.
     ///
-    /// Finally, Chimera enforces a W^X invariant on the guest: the guest never
-    /// executes its own pages natively — the dispatcher reads them and runs
-    /// translated blocks from the code cache — so freshly mapped or re-protected
-    /// guest code must never be executable in the host page tables. Before any
-    /// dispatch, the `prot` argument of `mmap`, `mprotect`, and `pkey_mprotect`
-    /// (always `args[2]`) has `PROT_EXEC` replaced with `PROT_READ`, so a stray
-    /// native jump into guest code faults instead of running untranslated while
-    /// the translator can still read the bytes it will translate (an
-    /// execute-only mapping would otherwise become `PROT_NONE`). For guest-owned
-    /// mappings, the runtime forwards the rewritten call itself, so the guest
+    /// Finally, before any dispatch, the `prot` argument of `mmap`, `mprotect`,
+    /// and `pkey_mprotect` (always `args[2]`) is rewritten for the backend.
+    /// With [`Backend::Translator`](crate::Backend::Translator), which never
+    /// executes guest pages in place, Chimera enforces W^X by replacing
+    /// `PROT_EXEC` with `PROT_READ`. For guest-owned mappings, the runtime
+    /// forwards the rewritten call itself, so under the translator the guest
     /// can never reach the kernel with `PROT_EXEC` set on its own pages.
     ///
     /// A `clone` creating a new thread of this process (the `CLONE_THREAD`
@@ -324,9 +320,7 @@ mod host {
         match nr {
             libc::SYS_mmap => {
                 let prot = call.args[2] as libc::c_int;
-                if prot & libc::PROT_EXEC != 0 {
-                    call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
-                }
+                call.args[2] = thread.process().backend.host_prot(prot) as u64;
                 let flags = call.args[3] as libc::c_int;
                 if flags & (libc::MAP_FIXED | libc::MAP_FIXED_NOREPLACE) != 0
                     && overlaps_code_cache(thread, call.args[0], call.args[1])
@@ -364,9 +358,7 @@ mod host {
                 // the tracked guest address space, but delegate any other range
                 // back to the embedder so it can keep policing the host process.
                 let prot = call.args[2] as libc::c_int;
-                if prot & libc::PROT_EXEC != 0 {
-                    call.args[2] = ((prot & !libc::PROT_EXEC) | libc::PROT_READ) as u64;
-                }
+                call.args[2] = thread.process().backend.host_prot(prot) as u64;
                 if thread
                     .addr_space()
                     .contains_region(call.args[0] as usize, call.args[1] as usize)

@@ -39,7 +39,13 @@ use std::{
     },
 };
 
-use crate::{SyscallResult, arch::dispatch::ThreadState};
+use crate::{
+    SyscallResult,
+    arch::{
+        dispatch::{EXIT_KIND_BLOCK, ThreadState},
+        x86::sud,
+    },
+};
 
 /// Number of signals (`SIGRTMAX`); signals are numbered `1..=NSIG`.
 const NSIG: usize = 64;
@@ -399,10 +405,10 @@ impl PendingSet {
 /// signal to a thread with it unblocked (the guest's masks are mirrored onto
 /// the host) — so catching thread == owning thread, and only that thread's
 /// dispatch loop delivers it.
-extern "C" fn chimera_sigcatch(
+pub extern "C" fn chimera_sigcatch(
     signo: libc::c_int,
     info: *const libc::siginfo_t,
-    _uc: *mut libc::c_void,
+    uc: *mut libc::c_void,
 ) {
     if signo >= 1 && signo as usize <= NSIG {
         // Temporary diagnostic: raw, alloc-free trace of every SIGPWR catch
@@ -437,7 +443,21 @@ extern "C" fn chimera_sigcatch(
                 options(nostack, preserves_flags),
             );
         }
+
+        // Guest code running natively polls nothing, so it is stopped here.
+        sud::preempt(uc, EXIT_KIND_BLOCK);
     }
+}
+
+/// Host signals Chimera itself handles, whose host slot a guest disposition
+/// never takes over, as a bitmask of `1 << (signo - 1)`. The guest's
+/// disposition is still recorded and reported back.
+static RESERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Take `signo`'s host slot away from the guest: its disposition is no longer
+/// installed on the host, and the host mask never blocks it.
+pub fn reserve_host_signal(signo: libc::c_int) {
+    RESERVED.fetch_or(1 << (signo - 1), Ordering::Relaxed);
 }
 
 /// Build a host `sigset_t` holding the signals set in the `mask` bitmask.
@@ -461,7 +481,7 @@ fn host_sigset(mask: u64) -> libc::sigset_t {
 /// must be held pending rather than acted on — so a mask emulated only in
 /// software gets those cases wrong.
 fn mirror_host_blocked(mask: u64) {
-    let set = host_sigset(mask);
+    let set = host_sigset(mask & !RESERVED.load(Ordering::Relaxed));
     unsafe {
         libc::pthread_sigmask(libc::SIG_SETMASK, &set, ptr::null_mut());
     }
@@ -646,7 +666,10 @@ fn install_host(signo: usize, handler: u64) {
     // traps. The guest's disposition for them is still recorded in the table
     // above (so it is reported back and can be honored once guest-fault delivery
     // exists), but it is never installed on the host slot.
-    if signo == SIGSEGV as usize || signo == SIGBUS as usize {
+    if signo == SIGSEGV as usize
+        || signo == SIGBUS as usize
+        || RESERVED.load(Ordering::Relaxed) & (1 << (signo - 1)) != 0
+    {
         return;
     }
     let (host, flags) = match handler {
@@ -662,6 +685,10 @@ fn install_host(signo: usize, handler: u64) {
         sa.sa_sigaction = host;
         sa.sa_flags = flags;
         libc::sigemptyset(&mut sa.sa_mask);
+        if sud::active() {
+            sa.sa_flags |= libc::SA_ONSTACK;
+            libc::sigfillset(&mut sa.sa_mask);
+        }
         libc::sigaction(signo as i32, &sa, ptr::null_mut());
     }
 }

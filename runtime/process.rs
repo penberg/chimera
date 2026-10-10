@@ -14,8 +14,11 @@ use std::sync::{
 };
 
 use crate::{
-    Error, SystemCalls,
-    arch::dispatch::ThreadState,
+    Backend, Error, SystemCalls,
+    arch::{
+        dispatch::{EXIT_KIND_BLOCK, ThreadState},
+        x86::sud,
+    },
     sys::{
         linux::{exec::PreparedExec, signal},
         mmap::AddressSpace,
@@ -31,7 +34,11 @@ fn interrupt_signal() -> libc::c_int {
     libc::SIGRTMAX()
 }
 
-extern "C" fn interrupt_noop(_sig: libc::c_int) {}
+extern "C" fn interrupt(_sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut libc::c_void) {
+    // A thread running guest code natively has no safepoint to reach, so the
+    // signal is its safepoint.
+    sud::preempt(uc, EXIT_KIND_BLOCK);
+}
 
 static INSTALL_INTERRUPT: Once = Once::new();
 
@@ -39,9 +46,9 @@ static INSTALL_INTERRUPT: Once = Once::new();
 fn install_interrupt_handler() {
     INSTALL_INTERRUPT.call_once(|| unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = interrupt_noop as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_flags = 0; // no SA_RESTART: a parked syscall must surface EINTR
+        sa.sa_sigaction = interrupt as *const () as usize;
+        libc::sigfillset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_SIGINFO; // no SA_RESTART: a parked syscall must surface EINTR
         libc::sigaction(interrupt_signal(), &sa, std::ptr::null_mut());
     });
 }
@@ -112,10 +119,16 @@ pub struct Process {
     /// `execve` validated it and consumed by the exec driver on the main host
     /// thread once the group has drained. Written before `execing` is set.
     exec_request: Mutex<Option<PreparedExec>>,
+    /// How every thread of the process executes guest code.
+    pub backend: Backend,
 }
 
 impl Process {
-    pub fn new(handler: Box<dyn SystemCalls>, code_cache_size: usize) -> Result<Self, Error> {
+    pub fn new(
+        handler: Box<dyn SystemCalls>,
+        code_cache_size: usize,
+        backend: Backend,
+    ) -> Result<Self, Error> {
         install_interrupt_handler();
         // Own the host SIGSEGV/SIGBUS slot so self-modifying-code write traps are
         // caught synchronously (see [`crate::sys::linux::fault`]).
@@ -131,6 +144,7 @@ impl Process {
             last_exit_status: AtomicI32::new(0),
             execing: AtomicBool::new(false),
             exec_request: Mutex::new(None),
+            backend,
         })
     }
 

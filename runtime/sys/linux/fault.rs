@@ -52,6 +52,7 @@ use std::{
 use crate::{
     arch::x86::{
         dispatch::ThreadState,
+        sud,
         trampoline::{fetch_copy_span, guarded_copy_fixup, in_guarded_copy},
         translate::code_cache_contains,
     },
@@ -89,6 +90,11 @@ extern "C" fn chimera_fault(
     let fault_addr = unsafe { (*info).si_addr() } as usize;
     let si_code = unsafe { (*info).si_code };
     let rip = fault_rip(ucontext);
+
+    // A fault in natively running guest code is fatal like any other guest
+    // fault, but the paths below make system calls and run Rust, so first
+    // return to runtime conditions.
+    sud::abandon_guest();
 
     // A `kill()`/`tgkill()`-raised SIGSEGV or SIGBUS (`si_code <= 0`) is not a
     // memory fault: `si_addr` is meaningless there (it aliases the sender's

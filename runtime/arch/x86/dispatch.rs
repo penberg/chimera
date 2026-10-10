@@ -28,7 +28,7 @@ use super::trampoline::{dispatch, exit_block, exit_syscall, exit_trap};
 /// Linux x86-64 `arch_prctl` subfunction code: set the GS base.
 const ARCH_SET_GS: libc::c_int = 0x1001;
 
-const EXIT_KIND_BLOCK: u64 = 0;
+pub const EXIT_KIND_BLOCK: u64 = 0;
 pub const EXIT_KIND_SYSCALL: u64 = 1;
 /// A guest breakpoint (`int3`) exited the cache.
 pub const EXIT_KIND_TRAP: u64 = 2;
@@ -210,6 +210,16 @@ pub struct ThreadState {
     /// guest instruction, always within a block body; placed after `fpstate`
     /// so every `gs:[]` offset above is unchanged.
     pub riprel_scratch: u64,
+    /// This thread's syscall user dispatch selector: the byte the kernel reads
+    /// on every system call to decide whether to let it through (`ALLOW`) or
+    /// raise SIGSYS (`BLOCK`). Only the native vcpu arms it
+    /// ([`super::sud`]); it is `ALLOW` whenever Chimera's own code runs.
+    pub sud_selector: u8,
+    /// Whether this thread is executing guest code natively: set by the native
+    /// vcpu's entry stub, cleared when a signal handler takes the thread back
+    /// to Chimera. A runtime signal handler that finds it set has interrupted
+    /// guest code and must leave through the native vcpu's exit path.
+    pub sud_in_guest: u8,
 }
 
 // XSAVE/XRSTOR #GP unless the save area is 64-byte aligned. The struct's
@@ -247,6 +257,8 @@ impl ThreadState {
             pending_set: 0,
             tid: AtomicI32::new(0),
             riprel_scratch: 0,
+            sud_selector: 0,
+            sud_in_guest: 0,
         })
     }
 
@@ -279,6 +291,8 @@ impl ThreadState {
         self.ib_rdx = 0;
         self.ib_host = 0;
         self.riprel_scratch = 0;
+        self.sud_selector = 0;
+        self.sud_in_guest = 0;
         self.exit_requested.store(0, Ordering::Relaxed);
         self.fp_in_regs = 0;
         self.fp_flags = 0;
@@ -342,6 +356,8 @@ impl ThreadState {
             // publishes its own TID before it runs any guest code.
             tid: AtomicI32::new(0),
             riprel_scratch: 0,
+            sud_selector: 0,
+            sud_in_guest: 0,
         });
         child.regs[RAX] = 0;
         child.regs[RSP] = child_stack;
