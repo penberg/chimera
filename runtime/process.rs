@@ -139,13 +139,14 @@ impl Process {
     /// keeps the pointer valid). The state carries everything a sibling's
     /// stop needs: the `exit_requested` safepoint slot the translated
     /// back-edge and IB-hit polls read, and the `tid` the interrupt signal
-    /// targets. Balanced by [`Process::unregister_thread`] when the run loop
-    /// ends.
+    /// targets. Registering a thread already on the list does nothing.
+    /// Balanced by [`Process::unregister_thread`] when the run loop ends.
     pub fn register_thread(&self, state: &ThreadState) {
-        self.threads
-            .lock()
-            .unwrap()
-            .push(state as *const ThreadState);
+        let state = state as *const ThreadState;
+        let mut threads = self.threads.lock().unwrap();
+        if !threads.contains(&state) {
+            threads.push(state);
+        }
     }
 
     /// Remove a thread (identified by its `ThreadState` address) from the
