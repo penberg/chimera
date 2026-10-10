@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-use chimera::{HostFs, MountFlags, Namespace, OverlayFs, Personality, Sandbox, Vfs};
+use chimera::{Backend, HostFs, MountFlags, Namespace, OverlayFs, Personality, Sandbox, Vfs};
 use mimalloc::MiMalloc;
 
 use opts::{Command, Opts, RunCmd};
@@ -50,6 +50,19 @@ fn version() -> ExitCode {
 }
 
 fn run(mut cmd: RunCmd) -> ExitCode {
+    let backend = match cmd.backend {
+        Some(backend) => backend,
+        None => match env::var_os("CHIMERA_BACKEND").filter(|v| !v.is_empty()) {
+            Some(value) => match opts::parse_backend(&value.to_string_lossy()) {
+                Ok(backend) => backend,
+                Err(err) => {
+                    eprintln!("chimera: CHIMERA_BACKEND: {err}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            None => Backend::default(),
+        },
+    };
     // Only a shell Chimera starts on its own gets a badged prompt; a program
     // the user named runs exactly as typed.
     let implicit_shell = cmd.argv.is_empty();
@@ -202,6 +215,7 @@ fn run(mut cmd: RunCmd) -> ExitCode {
     if let Some(mib) = cmd.code_cache_size {
         sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
     }
+    sandbox.backend(backend);
 
     let personality = Personality::new(Namespace::with_root(root, MountFlags::NONE));
     sandbox.system_calls(personality);
