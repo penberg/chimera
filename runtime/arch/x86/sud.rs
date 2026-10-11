@@ -24,7 +24,7 @@ use std::{
     mem::{self, offset_of},
     ptr,
     sync::{
-        Once,
+        Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -60,9 +60,27 @@ const FP_SW_BYTES: usize = 464;
 /// Size of the alternate stack the SIGSYS handler runs on.
 const ALT_STACK_SIZE: usize = 64 * 1024;
 
-/// Set once any thread arms syscall user dispatch. Chimera's other signal
-/// handlers then block every signal while they run (see the module comment).
+/// Set while any thread has syscall user dispatch armed. Chimera's other
+/// signal handlers then block every signal while they run (see the module
+/// comment).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// The signals whose host slots the backend takes over while it is active.
+const HANDLED: [libc::c_int; 2] = [libc::SIGSYS, libc::SIGTRAP];
+
+/// The attached vcpus, and the host dispositions their handlers replaced.
+/// The first attach installs the handlers and the last detach restores what
+/// was there, so a program that runs a sandbox gets its own handlers back
+/// afterwards rather than handlers that reach a thread state that is gone.
+struct Installed {
+    attached: usize,
+    saved: [libc::sigaction; HANDLED.len()],
+}
+
+// `sigaction` holds only function addresses and flags.
+unsafe impl Send for Installed {}
+
+static INSTALLED: Mutex<Option<Installed>> = Mutex::new(None);
 
 /// Whether this process runs guest code natively.
 pub fn active() -> bool {
@@ -138,7 +156,6 @@ impl SyscallUserDispatch {
 
 impl Vcpu for SyscallUserDispatch {
     fn attach(&mut self, state: &mut ThreadState) -> Result<(), Error> {
-        install_handlers();
         if self.alt_stack.is_null() {
             let stack = unsafe {
                 libc::mmap(
@@ -176,7 +193,19 @@ impl Vcpu for SyscallUserDispatch {
         if ret != 0 {
             return Err(Error::last_os_error("prctl(PR_SET_SYSCALL_USER_DISPATCH)"));
         }
-        self.armed_tid = unsafe { libc::gettid() };
+        // The selector is still `ALLOW`, so no SIGSYS can arrive before the
+        // handlers are in place.
+        let tid = unsafe { libc::gettid() };
+        if self.armed_tid == 0 {
+            install_handlers();
+        } else if self.armed_tid != tid {
+            // A fork child attaching again: the parent's other threads, and
+            // their vcpus, do not exist here.
+            if let Some(installed) = INSTALLED.lock().unwrap().as_mut() {
+                installed.attached = 1;
+            }
+        }
+        self.armed_tid = tid;
         Ok(())
     }
 
@@ -192,49 +221,80 @@ impl Vcpu for SyscallUserDispatch {
 
 impl Drop for SyscallUserDispatch {
     fn drop(&mut self) {
-        // Dispatch and the alternate stack belong to the host thread that
-        // attached; on any other thread there is nothing to undo.
-        if self.armed_tid == 0 || self.armed_tid != unsafe { libc::gettid() } {
+        if self.armed_tid == 0 {
             return;
         }
-        unsafe {
-            libc::prctl(
-                PR_SET_SYSCALL_USER_DISPATCH,
-                PR_SYS_DISPATCH_OFF,
-                0 as libc::c_ulong,
-                0 as libc::c_ulong,
-                0 as libc::c_ulong,
-            );
-            libc::sigaltstack(&self.prev_alt_stack, ptr::null_mut());
-            libc::munmap(self.alt_stack, ALT_STACK_SIZE);
+        // Dispatch and the alternate stack belong to the host thread that
+        // attached; on any other thread there is nothing to disarm.
+        if self.armed_tid == unsafe { libc::gettid() } {
+            unsafe {
+                libc::prctl(
+                    PR_SET_SYSCALL_USER_DISPATCH,
+                    PR_SYS_DISPATCH_OFF,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                );
+                libc::sigaltstack(&self.prev_alt_stack, ptr::null_mut());
+                libc::munmap(self.alt_stack, ALT_STACK_SIZE);
+            }
         }
+        uninstall_handlers();
     }
 }
 
-/// Install the SIGSYS and SIGTRAP handlers, once per process, and take their
-/// host slots away from the guest's dispositions. The interrupt signal is
-/// reserved too: guest code running natively polls nothing, so that signal
-/// is the only way to stop a thread that never makes a system call, and a
-/// guest mask that blocks it would leave an `execve` waiting for that thread
-/// forever.
+/// Install the SIGSYS and SIGTRAP handlers when the first vcpu attaches,
+/// and take their host slots away from the guest's dispositions. The
+/// interrupt signal is reserved too: guest code running natively polls
+/// nothing, so that signal is the only way to stop a thread that never makes
+/// a system call, and a guest mask that blocks it would leave an `execve`
+/// waiting for that thread forever.
 fn install_handlers() {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| unsafe {
-        ACTIVE.store(true, Ordering::Relaxed);
-        signal::reserve_host_signal(libc::SIGSYS);
-        signal::reserve_host_signal(libc::SIGTRAP);
-        signal::reserve_host_signal(process::interrupt_signal());
-        for (signo, handler) in [
-            (libc::SIGSYS, sud_sigsys as *const () as usize),
-            (libc::SIGTRAP, sud_sigtrap as *const () as usize),
-        ] {
+    let mut installed = INSTALLED.lock().unwrap();
+    if let Some(installed) = installed.as_mut() {
+        installed.attached += 1;
+        return;
+    }
+    let mut saved: [libc::sigaction; HANDLED.len()] = unsafe { mem::zeroed() };
+    ACTIVE.store(true, Ordering::Relaxed);
+    signal::reserve_host_signal(process::interrupt_signal());
+    for (i, (signo, handler)) in HANDLED
+        .into_iter()
+        .zip([
+            sud_sigsys as *const () as usize,
+            sud_sigtrap as *const () as usize,
+        ])
+        .enumerate()
+    {
+        signal::reserve_host_signal(signo);
+        unsafe {
             let mut sa: libc::sigaction = mem::zeroed();
             sa.sa_sigaction = handler;
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
             libc::sigfillset(&mut sa.sa_mask);
-            libc::sigaction(signo, &sa, ptr::null_mut());
+            libc::sigaction(signo, &sa, &mut saved[i]);
         }
-    });
+    }
+    *installed = Some(Installed { attached: 1, saved });
+}
+
+/// Undo [`install_handlers`] when the last vcpu detaches.
+fn uninstall_handlers() {
+    let mut installed = INSTALLED.lock().unwrap();
+    let Some(state) = installed.as_mut() else {
+        return;
+    };
+    state.attached -= 1;
+    if state.attached > 0 {
+        return;
+    }
+    for (signo, sa) in HANDLED.into_iter().zip(state.saved) {
+        unsafe { libc::sigaction(signo, &sa, ptr::null_mut()) };
+        signal::release_host_signal(signo);
+    }
+    signal::release_host_signal(process::interrupt_signal());
+    ACTIVE.store(false, Ordering::Relaxed);
+    *installed = None;
 }
 
 extern "C" fn sud_sigsys(signo: libc::c_int, info: *mut libc::siginfo_t, uc: *mut libc::c_void) {

@@ -23,3 +23,8 @@ iced-x86 = { version = "1.21", default-features = false, features = ["std", "dec
 argh = "0.1.19"
 mimalloc = "0.1.52"
 regex = "1"
+
+[[test]]
+name = "sud-host-handlers"
+path = "tests/sud-host-handlers.rs"
+harness = false

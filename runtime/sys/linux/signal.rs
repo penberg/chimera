@@ -460,6 +460,11 @@ pub fn reserve_host_signal(signo: libc::c_int) {
     RESERVED.fetch_or(1 << (signo - 1), Ordering::Relaxed);
 }
 
+/// Undo [`reserve_host_signal`].
+pub fn release_host_signal(signo: libc::c_int) {
+    RESERVED.fetch_and(!(1 << (signo - 1)), Ordering::Relaxed);
+}
+
 /// Build a host `sigset_t` holding the signals set in the `mask` bitmask.
 fn host_sigset(mask: u64) -> libc::sigset_t {
     unsafe {
