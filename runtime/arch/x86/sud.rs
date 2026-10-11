@@ -36,7 +36,7 @@ use std::{
 };
 
 use crate::{
-    Error,
+    Error, process,
     sys::linux::signal,
     vcpu::{Exit, Vcpu},
 };
@@ -218,13 +218,18 @@ impl Drop for SyscallUserDispatch {
 }
 
 /// Install the SIGSYS and SIGTRAP handlers, once per process, and take their
-/// host slots away from the guest's dispositions.
+/// host slots away from the guest's dispositions. The interrupt signal is
+/// reserved too: guest code running natively polls nothing, so that signal
+/// is the only way to stop a thread that never makes a system call, and a
+/// guest mask that blocks it would leave an `execve` waiting for that thread
+/// forever.
 fn install_handlers() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| unsafe {
         ACTIVE.store(true, Ordering::Relaxed);
         signal::reserve_host_signal(libc::SIGSYS);
         signal::reserve_host_signal(libc::SIGTRAP);
+        signal::reserve_host_signal(process::interrupt_signal());
         for (signo, handler) in [
             (libc::SIGSYS, sud_sigsys as *const () as usize),
             (libc::SIGTRAP, sud_sigtrap as *const () as usize),

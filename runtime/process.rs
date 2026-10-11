@@ -31,7 +31,7 @@ use crate::{
 /// nothing. The highest real-time signal is used as the one least likely to
 /// collide with a signal the guest itself installs. Its handler is installed
 /// without `SA_RESTART`, so the kernel interrupts the blocking syscall.
-fn interrupt_signal() -> libc::c_int {
+pub fn interrupt_signal() -> libc::c_int {
     libc::SIGRTMAX()
 }
 
