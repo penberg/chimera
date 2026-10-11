@@ -77,7 +77,9 @@ pub enum Backend {
     /// user dispatch (`PR_SET_SYSCALL_USER_DISPATCH`, Linux 5.11+). Only
     /// system calls are confined, and only from a guest that cooperates: guest
     /// code that overwrites its thread's selector byte makes system calls the
-    /// kernel lets through.
+    /// kernel lets through. The guest's mask never blocks SIGSYS or
+    /// `SIGRTMAX` on the host, and the guest never receives `SIGRTMAX`, which
+    /// Chimera uses to stop its threads.
     SyscallUserDispatch,
 }
 
