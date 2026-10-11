@@ -40,6 +40,15 @@ struct Mount {
     flags: MountFlags,
 }
 
+/// How [`Namespace::resolve_scoped`] treats a lookup that tries to leave its
+/// root: `openat2(2)`'s `RESOLVE_IN_ROOT` clamps it, `RESOLVE_BENEATH`
+/// refuses it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    InRoot,
+    Beneath,
+}
+
 /// A mount tree. There is always a root mount at `/`; further mounts shadow it
 /// along their subtrees, picked by longest matching mount point.
 pub struct Namespace {
@@ -138,8 +147,40 @@ impl Namespace {
             }
         }
 
+        self.walk(Path::new("/"), Scope::InRoot, path, follow_final)
+    }
+
+    /// Resolve `path` with `root` — an absolute, canonical guest path, such
+    /// as a directory descriptor's — standing in for `/`, the way
+    /// `openat2(2)` scopes a lookup to its dirfd. [`Scope::InRoot`] treats
+    /// an absolute path, an absolute symlink target, and `..` at `root` as
+    /// the kernel would at the process root; [`Scope::Beneath`] refuses each
+    /// with `EXDEV` instead. bwrap opens its bind sources this way, as
+    /// `openat2(oldroot_fd, "/", RESOLVE_IN_ROOT)`.
+    pub fn resolve_scoped(
+        &self,
+        root: &Path,
+        scope: Scope,
+        path: &Path,
+        follow_final: bool,
+    ) -> Result<Resolved, Errno> {
+        if scope == Scope::Beneath && path.is_absolute() {
+            return Err(Errno::EXDEV);
+        }
+        self.walk(root, scope, path, follow_final)
+    }
+
+    /// The per-component walk behind [`Self::resolve`] and
+    /// [`Self::resolve_scoped`], confined to `root`.
+    fn walk(
+        &self,
+        root: &Path,
+        scope: Scope,
+        path: &Path,
+        follow_final: bool,
+    ) -> Result<Resolved, Errno> {
         let mut pending: VecDeque<Part> = parts(path).into();
-        let mut acc = PathBuf::from("/"); // resolved-so-far absolute path
+        let mut acc = root.to_path_buf(); // resolved-so-far absolute path
         let mut symlinks = 0u32;
         let mut last = None; // stat of the final component, if it exists
 
@@ -147,7 +188,13 @@ impl Namespace {
             let name = match part {
                 Part::Dot => continue,
                 Part::DotDot => {
-                    acc.pop(); // popping at `/` stays at `/` — confined
+                    if acc == root {
+                        if scope == Scope::Beneath {
+                            return Err(Errno::EXDEV);
+                        }
+                    } else {
+                        acc.pop();
+                    }
                     last = None; // the remembered stat named the popped child
                     continue;
                 }
@@ -167,7 +214,10 @@ impl Namespace {
                     }
                     let target = mount.fs.readlink(&rel)?;
                     if target.is_absolute() {
-                        acc = PathBuf::from("/"); // absolute target restarts at the root
+                        if scope == Scope::Beneath {
+                            return Err(Errno::EXDEV);
+                        }
+                        acc = root.to_path_buf(); // absolute target restarts at the root
                     }
                     for p in parts(&target).into_iter().rev() {
                         pending.push_front(p);

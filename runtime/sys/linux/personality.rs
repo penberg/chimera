@@ -31,7 +31,7 @@ use crate::{ForkHold, SyscallResult, SystemCall, SystemCalls, host_syscall};
 
 use crate::sys::fs::{
     delta::XATTR_NAMESPACE,
-    namespace::{Namespace, Resolved, normalize},
+    namespace::{Namespace, Resolved, Scope, normalize},
     vfs::{DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec},
 };
 
@@ -204,13 +204,13 @@ impl SystemCalls for Personality {
             libc::SYS_open => self.open(libc::AT_FDCWD, a[0], a[1] as i32, a[2] as u32),
             // openat2 carries its flags/mode in a `struct open_how { u64 flags;
             // u64 mode; u64 resolve; }`; route it like openat so it cannot dodge
-            // the Vfs and the read-only check. The `resolve` field's extra
-            // restrictions are not yet honored (the namespace already confines).
+            // the Vfs and the read-only check.
             libc::SYS_openat2 => {
-                let how = a[2];
-                let flags = unsafe { ptr::read(how as *const u64) } as i32;
-                let mode = unsafe { ptr::read((how as *const u64).add(1)) } as u32;
-                self.open(a[0] as i32, a[1], flags, mode)
+                let how = a[2] as *const u64;
+                let flags = unsafe { ptr::read(how) } as i32;
+                let mode = unsafe { ptr::read(how.add(1)) } as u32;
+                let resolve = unsafe { ptr::read(how.add(2)) };
+                self.openat2(a[0] as i32, a[1], flags, mode, resolve)
             }
             libc::SYS_creat => self.open(
                 libc::AT_FDCWD,
@@ -790,9 +790,59 @@ impl Personality {
         self.open_abs(&abs, flags, mode)
     }
 
+    /// `openat2(2)`. `RESOLVE_IN_ROOT` and `RESOLVE_BENEATH` scope the lookup
+    /// to `dirfd`, which the namespace walk has to know: the host kernel
+    /// never sees the guest's dirfd, only the mount-relative path the walk
+    /// produces. The remaining restrictions (`RESOLVE_NO_XDEV`,
+    /// `RESOLVE_NO_MAGICLINKS`, `RESOLVE_NO_SYMLINKS`, `RESOLVE_CACHED`) are
+    /// accepted and not enforced.
+    fn openat2(
+        &self,
+        dirfd: i32,
+        pathptr: u64,
+        flags: i32,
+        mode: u32,
+        resolve: u64,
+    ) -> Result<i64, Errno> {
+        const KNOWN: u64 = libc::RESOLVE_NO_XDEV
+            | libc::RESOLVE_NO_MAGICLINKS
+            | libc::RESOLVE_NO_SYMLINKS
+            | libc::RESOLVE_BENEATH
+            | libc::RESOLVE_IN_ROOT
+            | libc::RESOLVE_CACHED;
+        if resolve & !KNOWN != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let scope = match (
+            resolve & libc::RESOLVE_IN_ROOT != 0,
+            resolve & libc::RESOLVE_BENEATH != 0,
+        ) {
+            (false, false) => return self.open(dirfd, pathptr, flags, mode),
+            (true, false) => Scope::InRoot,
+            (false, true) => Scope::Beneath,
+            (true, true) => return Err(Errno::EINVAL),
+        };
+        let root = if dirfd == libc::AT_FDCWD {
+            self.cwd.lock().unwrap().clone()
+        } else {
+            self.desc(dirfd)?.path.clone()
+        };
+        let raw = unsafe { read_cstr(pathptr) };
+        let follow = flags & libc::O_NOFOLLOW == 0;
+        let r = self
+            .ns
+            .resolve_scoped(&root, scope, Path::new(OsStr::from_bytes(&raw)), follow)?;
+        self.open_resolved(r, flags, mode)
+    }
+
     fn open_abs(&self, abs: &Path, flags: i32, mode: u32) -> Result<i64, Errno> {
         let follow = flags & libc::O_NOFOLLOW == 0;
         let r = self.ns.resolve(abs, follow)?;
+        self.open_resolved(r, flags, mode)
+    }
+
+    fn open_resolved(&self, r: Resolved, flags: i32, mode: u32) -> Result<i64, Errno> {
+        let follow = flags & libc::O_NOFOLLOW == 0;
         // Any write intent against a read-only mount is EROFS — but a plain
         // read keeps working, so stdio/sockets are unaffected. Special files
         // are exempt, as they are on a kernel `mount -o ro`: writing a
