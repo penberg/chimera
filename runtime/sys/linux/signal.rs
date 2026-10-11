@@ -454,15 +454,29 @@ pub extern "C" fn chimera_sigcatch(
 /// disposition is still recorded and reported back.
 static RESERVED: AtomicU64 = AtomicU64::new(0);
 
-/// Take `signo`'s host slot away from the guest: its disposition is no longer
-/// installed on the host, and the host mask never blocks it.
-pub fn reserve_host_signal(signo: libc::c_int) {
+/// The reserved signals the host mask never blocks, whatever the guest's
+/// mask says. The guest's mask is still recorded and reported back. Any
+/// other reserved signal the guest blocks stays pending in the kernel, where
+/// the guest's `signalfd`, `rt_sigpending`, and `rt_sigtimedwait` see it.
+static UNBLOCKED: AtomicU64 = AtomicU64::new(0);
+
+/// Take `signo`'s host disposition away from the guest: the guest's
+/// disposition is no longer installed on the host.
+pub fn reserve_host_handler(signo: libc::c_int) {
     RESERVED.fetch_or(1 << (signo - 1), Ordering::Relaxed);
 }
 
-/// Undo [`reserve_host_signal`].
+/// [`reserve_host_handler`], and also keep `signo` out of the host mask, for
+/// a signal Chimera must receive even while the guest blocks it.
+pub fn reserve_host_signal(signo: libc::c_int) {
+    reserve_host_handler(signo);
+    UNBLOCKED.fetch_or(1 << (signo - 1), Ordering::Relaxed);
+}
+
+/// Undo [`reserve_host_handler`] or [`reserve_host_signal`].
 pub fn release_host_signal(signo: libc::c_int) {
     RESERVED.fetch_and(!(1 << (signo - 1)), Ordering::Relaxed);
+    UNBLOCKED.fetch_and(!(1 << (signo - 1)), Ordering::Relaxed);
 }
 
 /// Build a host `sigset_t` holding the signals set in the `mask` bitmask.
@@ -486,7 +500,7 @@ fn host_sigset(mask: u64) -> libc::sigset_t {
 /// must be held pending rather than acted on — so a mask emulated only in
 /// software gets those cases wrong.
 fn mirror_host_blocked(mask: u64) {
-    let set = host_sigset(mask & !RESERVED.load(Ordering::Relaxed));
+    let set = host_sigset(mask & !UNBLOCKED.load(Ordering::Relaxed));
     unsafe {
         libc::pthread_sigmask(libc::SIG_SETMASK, &set, ptr::null_mut());
     }

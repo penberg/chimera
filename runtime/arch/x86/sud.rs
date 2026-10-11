@@ -244,11 +244,17 @@ impl Drop for SyscallUserDispatch {
 }
 
 /// Install the SIGSYS and SIGTRAP handlers when the first vcpu attaches,
-/// and take their host slots away from the guest's dispositions. The
-/// interrupt signal is reserved too: guest code running natively polls
-/// nothing, so that signal is the only way to stop a thread that never makes
-/// a system call, and a guest mask that blocks it would leave an `execve`
-/// waiting for that thread forever.
+/// and take their host slots away from the guest's dispositions.
+///
+/// SIGSYS and the interrupt signal are also kept out of the host mask. The
+/// kernel forces the SIGSYS of every trapped system call, and a forced signal
+/// that is blocked kills the process. Guest code running natively polls
+/// nothing, so the interrupt signal is the only way to stop a thread that
+/// never makes a system call, and a guest mask that blocks it would leave an
+/// `execve` waiting for that thread forever. SIGTRAP can follow the guest's
+/// mask: the only SIGTRAP forced on the guest is an `int3`'s, which kills a
+/// guest that blocks it natively too, and any other blocked SIGTRAP stays
+/// pending in the kernel for the guest's `signalfd`.
 fn install_handlers() {
     let mut installed = INSTALLED.lock().unwrap();
     if let Some(installed) = installed.as_mut() {
@@ -257,6 +263,7 @@ fn install_handlers() {
     }
     let mut saved: [libc::sigaction; HANDLED.len()] = unsafe { mem::zeroed() };
     ACTIVE.store(true, Ordering::Relaxed);
+    signal::reserve_host_signal(libc::SIGSYS);
     signal::reserve_host_signal(process::interrupt_signal());
     for (i, (signo, handler)) in HANDLED
         .into_iter()
@@ -266,7 +273,7 @@ fn install_handlers() {
         ])
         .enumerate()
     {
-        signal::reserve_host_signal(signo);
+        signal::reserve_host_handler(signo);
         unsafe {
             let mut sa: libc::sigaction = mem::zeroed();
             sa.sa_sigaction = handler;
