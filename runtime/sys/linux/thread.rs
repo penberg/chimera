@@ -277,9 +277,14 @@ impl Thread {
                         copy_to_guest(child_tid, &(tid as i32).to_ne_bytes());
                     }
                 }
+                // Join the thread list before the parent's `clone` returns. A
+                // parent that then ends its own thread (`pthread_exit` from
+                // main) waits for every thread on the list; a child not yet on
+                // it would be left behind as the process exits.
+                let mut child = Thread::from_state(process, child_state, clear_child_tid);
+                child.register();
                 // A failed send means the parent already gave up; nothing to do.
                 let _ = tx.send(tid);
-                let mut child = Thread::from_state(process, child_state, clear_child_tid);
                 // The child runs until its guest issues `exit`/`exit_group`,
                 // which returns the run loop and ends this host thread — the
                 // rest of the process keeps running.
@@ -443,6 +448,16 @@ impl Thread {
         }
     }
 
+    /// Publish the calling host thread's TID as this thread's and add the
+    /// thread to the process's thread list, if it is not already there.
+    fn register(&self) {
+        self.state.tid.store(
+            unsafe { libc::syscall(libc::SYS_gettid) } as i32,
+            Ordering::Release,
+        );
+        self.process.register_thread(&self.state);
+    }
+
     /// Set the thread's entry registers for a freshly mapped image, without
     /// touching its address space. Used to re-enter after an `execve` once the
     /// caller has torn down the old image and mapped the new one.
@@ -456,25 +471,22 @@ impl Thread {
     /// forwarded to the host kernel. The handler observes the call first. The
     /// embedder's handler is reached through the shared [`Process`].
     pub fn run(&mut self) -> Result<ExitReason, Error> {
-        self.state.install_gs()?;
-        self.state.capture_chimera_fs();
-        self.signals.mirror_host_mask();
-        self.running = true;
-
         // Join the thread list so a sibling's process-wide stop can reach
         // this thread: the interrupt signal if it parks in a host syscall, the
         // registered `exit_requested` safepoint slot if it is executing fully
-        // linked translated code. The guard removes it on every exit path
-        // (including the `execve` early return).
-        self.state.tid.store(
-            unsafe { libc::syscall(libc::SYS_gettid) } as i32,
-            Ordering::Release,
-        );
-        self.process.register_thread(&self.state);
+        // linked translated code. A `clone` child is already on it (see
+        // `spawn_clone`). The guard removes it on every exit path (including
+        // the `execve` early return and a failed setup below).
+        self.register();
         let _thread_guard = ThreadGuard {
             process: Arc::clone(&self.process),
             state: &*self.state,
         };
+
+        self.state.install_gs()?;
+        self.state.capture_chimera_fs();
+        self.signals.mirror_host_mask();
+        self.running = true;
 
         self.vcpu.attach(&mut self.state)?;
 
