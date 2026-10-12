@@ -10,10 +10,6 @@
 //! Identity the guest observes still rides through as the host's real
 //! `st_ino`/`st_dev` inside [`Stat`].
 
-// Scaffolding: no Personality drives this yet, so the public surface is unused
-// outside the tests below. Drop this once it is wired in.
-#![allow(dead_code)]
-
 use std::{
     ffi::{CStr, CString, OsStr, OsString},
     os::{
@@ -23,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::vfs::{
+use crate::sys::fs::vfs::{
     DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec, Vfs,
     WriteResult,
 };
@@ -771,15 +767,6 @@ fn statfs_to_statfs(st: &RawStatFs) -> StatFs {
 fn raw_fstatfs(fd: libc::c_int) -> Result<RawStatFs, Errno> {
     let mut st: RawStatFs = unsafe { std::mem::zeroed() };
     let r = unsafe { libc::syscall(libc::SYS_fstatfs, fd, &mut st) };
-    if r < 0 {
-        return Err(last_errno());
-    }
-    Ok(st)
-}
-
-fn raw_statfs(path: &CStr) -> Result<RawStatFs, Errno> {
-    let mut st: RawStatFs = unsafe { std::mem::zeroed() };
-    let r = unsafe { libc::syscall(libc::SYS_statfs, path.as_ptr(), &mut st) };
     if r < 0 {
         return Err(last_errno());
     }

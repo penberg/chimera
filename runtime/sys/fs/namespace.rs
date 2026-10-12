@@ -282,9 +282,9 @@ fn normalizes_exactly(path: &Path) -> bool {
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::super::hostfs::HostFs;
     use super::super::vfs::{Mode, OpenFlags};
     use super::*;
+    use crate::sys::hostfs::HostFs;
 
     struct Scratch {
         path: PathBuf,

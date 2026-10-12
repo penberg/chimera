@@ -24,10 +24,6 @@
 //! real `st_ino`/`st_dev`, so the traits stay path-addressed without an
 //! inode-keyed `lookup`/`forget` protocol.
 
-// Scaffolding: the Personality that drives these traits does not exist yet, so
-// nothing here is constructed or called. Drop this once it is wired in.
-#![allow(dead_code)]
-
 use std::{
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
@@ -154,7 +150,7 @@ pub trait Vfs: Send + Sync {
     /// symlinks and `..` scoped to its root. A filesystem that returns `false`
     /// relies on the namespace walker to resolve and confine on its behalf.
     ///
-    /// [`HostFs`]: super::hostfs::HostFs
+    /// [`HostFs`]: crate::sys::hostfs::HostFs
     fn confines(&self) -> bool {
         false
     }
@@ -241,7 +237,7 @@ pub trait File: Send + Sync {
     /// it directly; a synthetic file returns `None`, leaving the Personality to
     /// emulate the mapping. Used only for `mmap`, never for ordinary I/O.
     ///
-    /// [`HostFile`]: super::hostfs::HostFile
+    /// [`HostFile`]: crate::sys::hostfs::HostFile
     fn host_fd(&self) -> Option<std::os::fd::RawFd> {
         None
     }
@@ -349,6 +345,19 @@ impl OpenFlags {
     pub fn nofollow(self) -> bool {
         self.0 & libc::O_NOFOLLOW != 0
     }
+
+    /// Linux's `O_TMPFILE`: an anonymous file in the named directory. No
+    /// other host has the flag.
+    pub fn tmpfile(self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.0 & libc::O_TMPFILE == libc::O_TMPFILE
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
 }
 
 /// The permission/type bits passed to a creating syscall, raw as the guest gave
@@ -356,19 +365,31 @@ impl OpenFlags {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Mode(pub u32);
 
-/// The `renameat2` flag set. `EMPTY` is a plain `rename`.
+/// The extended-rename flag set, raw as the guest's kernel spells it:
+/// `renameat2`'s `RENAME_NOREPLACE`/`RENAME_EXCHANGE` on Linux,
+/// `renameatx_np`'s `RENAME_EXCL`/`RENAME_SWAP` on Darwin. `EMPTY` is a
+/// plain `rename`; `NOREPLACE` and `EXCHANGE` name the two bits a filesystem
+/// branches on in the host's own encoding.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct RenameFlags(pub u32);
 
 impl RenameFlags {
     pub const EMPTY: RenameFlags = RenameFlags(0);
+    #[cfg(target_os = "linux")]
+    pub const NOREPLACE: RenameFlags = RenameFlags(libc::RENAME_NOREPLACE);
+    #[cfg(target_os = "linux")]
+    pub const EXCHANGE: RenameFlags = RenameFlags(libc::RENAME_EXCHANGE);
+    #[cfg(target_os = "macos")]
+    pub const NOREPLACE: RenameFlags = RenameFlags(libc::RENAME_EXCL);
+    #[cfg(target_os = "macos")]
+    pub const EXCHANGE: RenameFlags = RenameFlags(libc::RENAME_SWAP);
 
     pub fn noreplace(self) -> bool {
-        self.0 & libc::RENAME_NOREPLACE != 0
+        self.0 & Self::NOREPLACE.0 != 0
     }
 
     pub fn exchange(self) -> bool {
-        self.0 & libc::RENAME_EXCHANGE != 0
+        self.0 & Self::EXCHANGE.0 != 0
     }
 }
 
