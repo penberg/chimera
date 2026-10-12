@@ -31,7 +31,7 @@ process at the shell, and a Rust library for embedding the same runtime in your
 own program. Embedders supply a system-call handler that decides what every guest
 syscall does — forward it to the host kernel, log it, or virtualize it.
 
-Chimera currently supports **Linux/x86** target with work-in-progress port to **Darwin/arm64**.
+Chimera currently supports **Linux/x86-64** hosts; **Darwin/arm64** support is new and still maturing.
 
 ## Getting started
 
