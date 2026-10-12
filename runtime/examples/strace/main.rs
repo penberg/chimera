@@ -11,10 +11,11 @@
 //! `post_syscall(&SystemCall)`. The `SystemCall` value carries the number,
 //! argument registers, and the final result when one exists.
 //!
-//! A guest speaks its host kernel's system-call interface, and no two hosts
-//! share one: numbers, argument conventions, and struct layouts all differ.
-//! Each host therefore has its own tracer — `strace_linux.rs` today — and
-//! this file only picks the one for the host it is built on.
+//! A guest speaks its host kernel's system-call interface, and the two hosts
+//! Chimera runs on do not share one: numbers, argument conventions, and
+//! struct layouts all differ. Each host therefore has its own tracer,
+//! `strace_linux.rs` and `strace_darwin.rs`; this file only picks the one
+//! for the host it is built on.
 
 use mimalloc::MiMalloc;
 
@@ -29,4 +30,15 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[path = "strace_linux.rs"]
 mod os;
 
+#[cfg(target_os = "macos")]
+#[path = "strace_darwin.rs"]
+mod os;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use os::main;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn main() -> std::process::ExitCode {
+    eprintln!("strace example supports Linux and macOS hosts only");
+    std::process::ExitCode::from(2)
+}

@@ -14,8 +14,12 @@ pub struct Opts {
 #[argh(subcommand)]
 pub enum Command {
     Run(RunCmd),
+    // A mount serves a filesystem's merged view over FUSE, which only the
+    // Linux kernel offers; the filesystem itself exists on Linux only so far.
+    #[cfg(target_os = "linux")]
     Mount(MountCmd),
     Version(VersionCmd),
+    #[cfg(target_os = "linux")]
     Fs(FsCmd),
 }
 
@@ -23,6 +27,7 @@ pub enum Command {
 /// changes applied — at a directory, through FUSE. Writes land in the
 /// filesystem's change-set, exactly as a run resuming it would leave them.
 /// Runs until unmounted (`fusermount -u`, `umount`, or Ctrl-C).
+#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "mount")]
 pub struct MountCmd {
@@ -47,6 +52,7 @@ pub struct MountCmd {
 }
 
 /// Manage filesystems: the change-sets kept runs leave behind.
+#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "fs")]
 pub struct FsCmd {
@@ -55,6 +61,7 @@ pub struct FsCmd {
 }
 
 /// `fs` subcommands.
+#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand)]
 pub enum FsAction {
@@ -67,12 +74,14 @@ pub enum FsAction {
 }
 
 /// List kept filesystems.
+#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "list")]
 pub struct FsListCmd {}
 
 /// Show what a filesystem changed, relative to the live host: A added,
 /// M modified, D deleted.
+#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "diff")]
 pub struct FsDiffCmd {
@@ -84,6 +93,7 @@ pub struct FsDiffCmd {
 /// Copy a filesystem's changes onto the host — the adopt step. A file whose
 /// host copy changed since the filesystem copied it up is refused, not
 /// clobbered.
+#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "apply")]
 pub struct FsApplyCmd {
@@ -94,6 +104,7 @@ pub struct FsApplyCmd {
 
 /// Fork a filesystem: a new filesystem seeded with a copy of the source's
 /// changes, leaving the source untouched. Prints the new filesystem's id.
+#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "branch")]
 pub struct FsBranchCmd {
@@ -103,6 +114,7 @@ pub struct FsBranchCmd {
 }
 
 /// Remove filesystems.
+#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "rm")]
 pub struct FsRmCmd {
@@ -112,6 +124,7 @@ pub struct FsRmCmd {
 }
 
 /// Remove every filesystem no live session is using, after confirmation.
+#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "prune")]
 pub struct FsPruneCmd {

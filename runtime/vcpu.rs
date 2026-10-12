@@ -1,25 +1,30 @@
 //! The boundary between Chimera's kernel and the mechanism that executes guest
 //! instructions.
 //!
-//! The kernel — Linux process semantics: system calls, signals, threads,
+//! The kernel — the host's process semantics: system calls, signals, threads,
 //! `execve` — owns each guest thread's register file and drives it the way a
 //! kernel drives a CPU: it calls [`Vcpu::run`], which executes guest code until
 //! the guest needs the kernel, and handles the [`Exit`] it returns before
 //! running it again. The kernel reads and writes guest state only through the
-//! register file, so it is written once for every `Vcpu`.
+//! register file, so it is written once for every `Vcpu`. There is one kernel
+//! per host (`sys::linux::thread`, `sys::darwin::thread`) and one translating
+//! `Vcpu` per backend (`arch::x86::dispatch`, `arch::arm64::dispatch`).
 
 use crate::{Error, arch::dispatch::ThreadState};
 
 /// Why [`Vcpu::run`] returned. The register file describes the guest at the
 /// point of the exit.
 pub enum Exit {
-    /// The guest executed `syscall`. `rip` is past the instruction, and the
-    /// number and arguments are in the guest registers.
+    /// The guest executed its system-call instruction (`syscall`, `svc`). The
+    /// program counter is past the instruction, and the number and arguments
+    /// are in the guest registers.
     Syscall,
-    /// The guest executed `int3`. `rip` is past the instruction.
+    /// The guest executed a breakpoint (`int3`, `brk`). On x86-64 the program
+    /// counter is past the instruction; on arm64 it is at it, which is where
+    /// the hardware leaves it.
     Breakpoint,
-    /// The guest branched to an address that cannot be fetched. `rip` is that
-    /// address.
+    /// The guest branched to an address that cannot be fetched. The program
+    /// counter is that address.
     FetchFault,
     /// The guest stopped at an instruction boundary with nothing to report.
     /// The kernel uses it to deliver pending signals and observe process-wide

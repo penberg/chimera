@@ -3,23 +3,31 @@
 
 use std::{
     collections::HashSet,
-    io, ptr,
+    io,
     sync::{
         OnceLock,
         atomic::{AtomicI32, Ordering},
     },
 };
+// The break arena the guest's `brk` is virtualized over exists only where
+// there is a `brk`.
+#[cfg(target_os = "linux")]
+use std::ptr;
 
-use crate::{
-    Error,
-    arch::x86::{cache::BlockCache, trampoline::guarded_copy},
-};
+use crate::{Error, arch::cache::BlockCache};
+
+/// The guarded load loop the Linux fault-safe read uses. It lives in the x86
+/// trampoline, which is the only host that has one; Darwin reads guest memory
+/// through `mach_vm_read_overwrite` instead (see `guest_read`).
+#[cfg(target_os = "linux")]
+use crate::arch::x86::trampoline::guarded_copy;
 
 /// Size of the guest's break arena. `PROT_NONE` + `MAP_NORESERVE`, so the
 /// reservation costs address space only until the guest grows into it. A guest
 /// whose `brk` outgrows the arena sees the call fail with the break unchanged —
 /// the same face the kernel shows when `RLIMIT_DATA` is exhausted — and every
 /// mainstream allocator falls back to `mmap`.
+#[cfg(target_os = "linux")]
 const BREAK_ARENA_LEN: usize = 1 << 30;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,14 +100,19 @@ impl AddressSpace {
         Ok(host_pc)
     }
 
+    // The three code-cache wrappers below are reached only from the Linux
+    // syscall policy and the x86 backend's W^X toggle.
+    #[cfg(target_os = "linux")]
     pub fn code_contains_range(&self, start: usize, len: usize) -> bool {
         self.code.code_contains_range(start, len)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn code_allow_writes(&self) {
         self.code.code_allow_writes()
     }
 
+    #[cfg(target_os = "linux")]
     pub fn code_deny_writes(&self) {
         self.code.code_deny_writes()
     }
@@ -162,12 +175,58 @@ impl AddressSpace {
     /// here, so data and stacks are never armed; static read-only code is armed
     /// too, but the `mprotect` to read-only is a no-op and the guest never writes
     /// it.
+    ///
+    /// Only pages inside a region the guest mapped are armed. A guest can also
+    /// execute code the runtime never mapped for it — on Darwin it shares
+    /// Chimera's already-loaded libSystem, and the translator reads (and would
+    /// otherwise arm) the very shared-cache pages Chimera itself calls into.
+    /// Re-protecting those to read-only strips their execute permission out
+    /// from under the runtime, whose next call into that function faults on
+    /// the instruction fetch — a fault no SMC servicing can resolve, since
+    /// restoring write does not restore execute. Such code is not the guest's
+    /// to modify anyway, so skipping it costs no coverage.
     fn arm_span(&mut self, start: u64, end: u64) {
         let page_size = host_page_size();
         for page in pages(start as usize, (end - start) as usize) {
+            if !self.in_guest_region(page) {
+                continue;
+            }
             if self.armed.insert(page) {
                 self.granted.remove(&page);
                 unsafe { libc::mprotect(page as *mut libc::c_void, page_size, libc::PROT_READ) };
+            }
+        }
+    }
+
+    /// Describe `addr` for a crash report: the recorded region containing it
+    /// (start, len, runtime-owned), and whether its page is armed or granted.
+    /// Allocation-free; runs in the fault handler.
+    #[cfg(target_os = "macos")]
+    pub fn describe_addr(&self, addr: usize) -> (Option<(usize, usize, bool)>, bool, bool) {
+        let page = addr & !(host_page_size() - 1);
+        let region = match self.regions.binary_search_by_key(&addr, |r| r.start) {
+            Ok(i) => Some(&self.regions[i]),
+            Err(0) => None,
+            Err(i) => Some(&self.regions[i - 1]),
+        }
+        .filter(|r| addr < r.start.saturating_add(r.len))
+        .map(|r| (r.start, r.len, r.runtime_owned));
+        (
+            region,
+            self.armed.contains(&page),
+            self.granted.contains(&page),
+        )
+    }
+
+    /// Whether `addr` falls in a mapping the runtime made for the guest.
+    /// `regions` is kept sorted and coalesced, so this is a binary search.
+    fn in_guest_region(&self, addr: usize) -> bool {
+        match self.regions.binary_search_by_key(&addr, |r| r.start) {
+            Ok(_) => true,
+            Err(0) => false,
+            Err(i) => {
+                let region = &self.regions[i - 1];
+                addr < region.start.saturating_add(region.len)
             }
         }
     }
@@ -247,6 +306,8 @@ impl AddressSpace {
         self.regions = kept;
     }
 
+    /// Linux-only caller (`mremap` handling); compiled for tests everywhere.
+    #[cfg(any(target_os = "linux", test))]
     pub fn remap_region(
         &mut self,
         old_start: usize,
@@ -268,6 +329,7 @@ impl AddressSpace {
         self.add_region(new_start, new_len);
     }
 
+    #[cfg(target_os = "linux")]
     pub fn contains_region(&self, start: usize, len: usize) -> bool {
         let len = round_mapping_len(len);
         if len == 0 {
@@ -286,9 +348,10 @@ impl AddressSpace {
         // Give every armed page its write permission back before forgetting
         // it: pages in regions that survive the teardown (a guest's own
         // mappings deliberately do) would otherwise stay read-only with no
-        // bookkeeping left to service the trap, and the next write faults
-        // with no one able to fix it. For a page about to be unmapped this is
-        // a harmless failed mprotect.
+        // bookkeeping left to service the trap, and the next write — the
+        // runtime's own, via the shared libSystem, included — faults with no
+        // one able to fix it. For a page about to be unmapped this is a
+        // harmless failed mprotect.
         let page_size = host_page_size();
         for &page in &self.armed {
             unsafe {
@@ -304,6 +367,7 @@ impl AddressSpace {
         self.clear_regions();
     }
 
+    // The program break is a Linux concept; nothing else has a `brk`.
     /// Reserve the guest's break arena and place the initial program break at
     /// its base.
     ///
@@ -317,6 +381,7 @@ impl AddressSpace {
     /// teardown would punch a hole below the break that the host allocator
     /// later grows across. Keeping the guest break in a runtime-owned arena
     /// leaves the real break with a single owner for the process's lifetime.
+    #[cfg(target_os = "linux")]
     pub fn init_program_break(&mut self) -> Result<(), Error> {
         let addr = unsafe {
             libc::mmap(
@@ -347,6 +412,7 @@ impl AddressSpace {
     /// (which is also how `brk(0)` reads it back). Grown pages join the guest
     /// regions; a shrink discards its pages, so regrowth reads zeroes just as
     /// it does from the kernel.
+    #[cfg(target_os = "linux")]
     pub fn handle_brk(&mut self, requested: usize) -> usize {
         let (Some(current), Some(arena)) = (self.program_break, self.break_arena.clone()) else {
             return 0;
@@ -394,18 +460,24 @@ impl AddressSpace {
     }
 
     /// Unmap the mappings the runtime made for the guest and forget every
-    /// region. A mapping the *guest* asked for is deliberately left alone: a
-    /// loader the runtime shares with the guest may hold references into
-    /// images the guest mapped through the same `mmap` interception as
-    /// everything else, and unmapping those out from under it faults its next
-    /// lookup. The cost is that a guest's own anonymous mappings outlive an
-    /// `execve` that should have replaced them, which leaks address space but
-    /// changes nothing the new image can observe.
+    /// region. A mapping the *guest* asked for is deliberately left alone: on
+    /// Darwin the runtime and the guest share one dyld, so a guest `dlopen`
+    /// runs the loader's own code and its image mappings arrive through the
+    /// same `mmap` interception as everything else. Unmapping those would
+    /// leave the shared dyld referencing images whose pages are gone, and its
+    /// next `dlsym` — walking the image list — faults reading a Mach header.
+    /// The cost is that a guest's own anonymous mappings outlive an `execve`
+    /// that should have replaced them, which leaks address space but changes
+    /// nothing the new image can observe.
     fn clear_regions(&mut self) {
         self.program_break = None;
         for region in self.regions.drain(..) {
             if !region.runtime_owned {
                 continue;
+            }
+            #[cfg(target_os = "macos")]
+            if crate::trace::trace() {
+                eprintln!("chimera: exec unmaps {:#x}+{:#x}", region.start, region.len);
             }
             let ret = unsafe { libc::munmap(region.start as *mut libc::c_void, region.len) };
             debug_assert_eq!(ret, 0, "guest region munmap failed");
@@ -475,6 +547,7 @@ pub fn init() -> Result<(), Error> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn own_pid() -> libc::pid_t {
     let pid = CACHED_PID.load(Ordering::Relaxed);
     if pid != 0 {
@@ -508,7 +581,57 @@ pub fn copy_from_guest(addr: u64, buf: &mut [u8]) -> bool {
     if addr == 0 {
         return false;
     }
+    guest_read(addr, buf)
+}
+
+/// Linux fault-safe guest read: a guarded load loop whose faults the
+/// `SIGSEGV`/`SIGBUS` handler recognises and reports as a short copy.
+#[cfg(target_os = "linux")]
+fn guest_read(addr: u64, buf: &mut [u8]) -> bool {
     unsafe { guarded_copy(buf.as_mut_ptr(), addr as *const u8, buf.len()) != 0 }
+}
+
+/// Darwin fault-safe guest read: `mach_vm_read_overwrite` against this task's
+/// own port. An unmapped or unreadable source returns a nonzero
+/// `kern_return_t` rather than faulting the runtime, the way `process_vm_readv`
+/// returns short.
+#[cfg(target_os = "macos")]
+fn guest_read(addr: u64, buf: &mut [u8]) -> bool {
+    // `mach_vm_read_overwrite` is a MIG routine, so it can fail for reasons
+    // that say nothing about `addr`. Measured here: `MACH_SEND_INVALID_REPLY`
+    // (0x10000009) on a read of a mapping the guest could dereference a
+    // moment later — the *message* failed, not the copy, because the thread's
+    // MIG reply port was no longer valid for this caller. Chimera and the
+    // guest share one libSystem, and on the main thread they share one TSD
+    // array, so the reply port cached in it is not exclusively the runtime's.
+    // Reporting `EFAULT` for such a failure turns a transient into a hard
+    // error: `prepare_exec` reads the `execve` path this way, and rustc
+    // reports "unable to run `rust-objcopy`: Bad address" and fails the
+    // build. A retry gets a freshly allocated reply port.
+    //
+    // Only the send family is retried. A genuine `KERN_INVALID_ADDRESS` is
+    // the answer the caller asked for, and repeating it would both cost time
+    // and blunt the fault-safety this function exists to provide.
+    const MACH_SEND_FAMILY: u32 = 0x1000_0000;
+    for _ in 0..4 {
+        let mut out: u64 = 0;
+        let kr = unsafe {
+            mach_vm_read_overwrite(
+                mach_task_self_,
+                addr,
+                buf.len() as u64,
+                buf.as_mut_ptr() as u64,
+                &mut out,
+            )
+        };
+        if kr == 0 {
+            return out == buf.len() as u64;
+        }
+        if (kr as u32) & MACH_SEND_FAMILY == 0 {
+            return false;
+        }
+    }
+    false
 }
 
 /// Copy `buf` into guest memory at `addr` without trusting the pointer — the
@@ -526,6 +649,12 @@ pub fn copy_to_guest(addr: u64, buf: &[u8]) -> bool {
     if addr == 0 {
         return false;
     }
+    guest_write(addr, buf)
+}
+
+/// Linux fault-safe guest write: a self-targeted `process_vm_writev`.
+#[cfg(target_os = "linux")]
+fn guest_write(addr: u64, buf: &[u8]) -> bool {
     let local = libc::iovec {
         iov_base: buf.as_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
@@ -536,6 +665,31 @@ pub fn copy_to_guest(addr: u64, buf: &[u8]) -> bool {
     };
     let copied = unsafe { libc::process_vm_writev(own_pid(), &local, 1, &remote, 1, 0) };
     copied == buf.len() as isize
+}
+
+/// Darwin fault-safe guest write: `mach_vm_write` against this task's own port.
+/// An unmapped or read-only target returns a nonzero `kern_return_t` rather
+/// than faulting the runtime, the way `process_vm_writev` returns short.
+#[cfg(target_os = "macos")]
+fn guest_write(addr: u64, buf: &[u8]) -> bool {
+    let kr = unsafe { mach_vm_write(mach_task_self_, addr, buf.as_ptr() as u64, buf.len() as u32) };
+    kr == 0
+}
+
+// Mach VM primitives for fault-safe self-copies (declared here rather than via
+// the `libc` crate, which does not surface the `mach_vm_*` family).
+// `mach_task_self_` is the task port for the current process.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    fn mach_vm_read_overwrite(
+        target: u32,
+        address: u64,
+        size: u64,
+        data: u64,
+        out_size: *mut u64,
+    ) -> i32;
+    fn mach_vm_write(target: u32, address: u64, data: u64, count: u32) -> i32;
 }
 
 /// Page-aligned base addresses of every page the range `[start, start+len)`

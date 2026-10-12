@@ -18,7 +18,9 @@ argh = "0.1.19"
 libc = "0.2"
 mimalloc = "0.1.52"
 
-# Used only by the vendored fuser module (cli/fuser).
+# The `mount` subcommand and its vendored fuser module (cli/fuser) exist only
+# where the filesystem does.
+[target.'cfg(target_os = "linux")'.dependencies]
 log = "0.4"
 smallvec = "1.6"
 zerocopy = { version = "0.8", features = ["derive"] }

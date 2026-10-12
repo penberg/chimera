@@ -1,22 +1,25 @@
-//! The `run` path: the guest's file syscalls go through a userspace VFS
-//! whose upper layer is the session's change-set, so the run leaves the host
-//! untouched.
+//! The `run` path. On Linux the guest's file syscalls go through a userspace
+//! VFS whose upper layer is the session's change-set, so the run leaves the
+//! host untouched. On Darwin the runtime's filesystem layer does not exist
+//! yet, so the guest runs against the host directly.
 
 use std::{
-    env,
-    ffi::OsString,
-    io,
-    os::unix::ffi::OsStrExt,
+    env, io,
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::Arc,
 };
+#[cfg(target_os = "linux")]
+use std::{ffi::OsString, os::unix::ffi::OsStrExt, sync::Arc};
 
-use chimera::{HostFs, MountFlags, Namespace, OverlayFs, Personality, Sandbox, Vfs};
+use chimera::Sandbox;
+#[cfg(target_os = "linux")]
+use chimera::{HostFs, MountFlags, Namespace, OverlayFs, Personality, Vfs};
 
 use crate::opts::RunCmd;
+#[cfg(target_os = "linux")]
 use crate::{fs, prompt};
 
+#[cfg(target_os = "linux")]
 pub fn run(mut cmd: RunCmd) -> ExitCode {
     // Only a shell Chimera starts on its own gets a badged prompt; a program
     // the user named runs exactly as typed.
@@ -187,6 +190,7 @@ pub fn run(mut cmd: RunCmd) -> ExitCode {
 }
 
 /// The command line a filesystem's provenance records.
+#[cfg(target_os = "linux")]
 fn describe(cmd: &RunCmd) -> String {
     cmd.argv.join(" ")
 }
@@ -195,6 +199,7 @@ fn describe(cmd: &RunCmd) -> String {
 /// `PATH` with each candidate's existence judged in the merged view, so a
 /// filesystem whiteout hides a candidate instead of letting the lower host
 /// file shadow through.
+#[cfg(target_os = "linux")]
 fn resolve_program(root: &dyn Vfs, program: &Path) -> Result<PathBuf, io::Error> {
     if program.is_absolute() || program.components().count() > 1 {
         let exec = absolutize(program)?;
@@ -217,6 +222,75 @@ fn resolve_program(root: &dyn Vfs, program: &Path) -> Result<PathBuf, io::Error>
         }
     }
 
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("program {:?} not found in PATH", program.display()),
+    ))
+}
+
+/// Run the guest against the host directly: the flags that name a filesystem
+/// have nothing to act on here, and a run on this host is what `--unsafe` is
+/// on Linux.
+#[cfg(target_os = "macos")]
+pub fn run(mut cmd: RunCmd) -> ExitCode {
+    if cmd.from.is_some() || cmd.in_.is_some() || cmd.rm {
+        eprintln!("chimera: filesystems are not available on this host");
+        return ExitCode::FAILURE;
+    }
+    // `--unsafe` names what every run here is, and there is no prompt to
+    // leave unchanged; both are accepted so a command line written for Linux
+    // still runs.
+    let _ = (cmd.unsafe_, cmd.no_prompt);
+    if cmd.argv.is_empty() {
+        cmd.argv.push("/bin/zsh".into());
+    }
+    let (program, args) = cmd.argv.split_first().expect("argv names a program");
+    let program = match resolve_host_program(Path::new(program)) {
+        Ok(program) => program,
+        Err(err) => {
+            eprintln!("chimera: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut sandbox = match Sandbox::new(&program) {
+        Ok(sandbox) => sandbox,
+        Err(err) => {
+            eprintln!("chimera: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(mib) = cmd.code_cache_size {
+        sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
+    }
+    match sandbox.args(args).run() {
+        Ok(status) => ExitCode::from(status.code() as u8),
+        Err(err) => {
+            eprintln!("chimera: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Resolve `program` to an absolute host path; a bare name walks `PATH`.
+#[cfg(target_os = "macos")]
+fn resolve_host_program(program: &Path) -> Result<PathBuf, io::Error> {
+    if program.is_absolute() || program.components().count() > 1 {
+        let exec = absolutize(program)?;
+        if !exec.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("program {:?}: no such file or directory", exec.display()),
+            ));
+        }
+        return Ok(exec);
+    }
+    let path = env::var_os("PATH").unwrap_or_default();
+    for dir in env::split_paths(&path) {
+        let candidate = absolutize(&dir.join(program))?;
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
         format!("program {:?} not found in PATH", program.display()),

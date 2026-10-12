@@ -1,7 +1,13 @@
+// The filesystem, its prompt badge, and the FUSE mount exist where the
+// runtime's filesystem layer does: Linux, so far.
+#[cfg(target_os = "linux")]
 mod fs;
+#[cfg(target_os = "linux")]
 mod fuser;
+#[cfg(target_os = "linux")]
 mod mount;
 mod opts;
+#[cfg(target_os = "linux")]
 mod prompt;
 mod run;
 
@@ -50,8 +56,10 @@ fn main() -> ExitCode {
     let opts: Opts = argh::from_env();
     match opts.command {
         Command::Run(cmd) => run::run(cmd),
+        #[cfg(target_os = "linux")]
         Command::Mount(cmd) => mount::command(cmd),
         Command::Version(_) => version(),
+        #[cfg(target_os = "linux")]
         Command::Fs(cmd) => fs::command(cmd.action),
     }
 }

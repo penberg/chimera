@@ -287,8 +287,9 @@ pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &dyn SystemC
                     // kernel's loser is killed by the winner's de_thread
                     // and never observes a return value, and neither does
                     // this one: the pending stop takes the thread at its
-                    // next boundary, before the guest could read rax.
-                    thread.process().request_exec(prepared, &thread.state);
+                    // next boundary, before the guest could read rax. The
+                    // returned loser's drop closes its parsed image.
+                    let _ = thread.process().request_exec(prepared, &thread.state);
                     // Report success so observers see the allowed call; the
                     // guest never reads it — a successful execve does not
                     // return.

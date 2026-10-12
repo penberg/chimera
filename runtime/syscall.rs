@@ -85,6 +85,8 @@ impl SystemCall {
         }
     }
 
+    /// Linux-only callers (fork/mremap policy and the register writeback).
+    #[cfg(target_os = "linux")]
     pub(crate) fn return_value(&self) -> i64 {
         self.return_value
     }

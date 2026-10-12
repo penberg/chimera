@@ -1,4 +1,4 @@
-This is the Chimera repository — a light-weight sandboxing runtime that runs unmodified Linux x86-64 binaries through same-ISA dynamic binary translation. Every system call the guest makes is routed to an embedder-supplied handler (default `Passthrough`), so sandboxing policy lives in the embedder, not the runtime.
+This is the Chimera repository — a light-weight sandboxing runtime that runs unmodified binaries through same-ISA dynamic binary translation: ELF on Linux/x86-64, and Mach-O on Darwin/arm64. Same-ISA means the guest always shares the host's instruction set; there is no cross-ISA emulation anywhere in the design. Every system call the guest makes is routed to an embedder-supplied handler (default `Passthrough`), so sandboxing policy lives in the embedder, not the runtime.
 
 The full design lives in `ARCHITECTURE.md`. Read it before making architectural decisions.
 
