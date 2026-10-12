@@ -164,6 +164,15 @@ impl SyscallUserDispatch {
             armed_tid: 0,
         }
     }
+
+    /// Put back the host thread's previous alternate stack and unmap ours.
+    fn release_alt_stack(&mut self) {
+        unsafe {
+            libc::sigaltstack(&self.prev_alt_stack, ptr::null_mut());
+            libc::munmap(self.alt_stack, ALT_STACK_SIZE);
+        }
+        self.alt_stack = ptr::null_mut();
+    }
 }
 
 impl Vcpu for SyscallUserDispatch {
@@ -182,15 +191,17 @@ impl Vcpu for SyscallUserDispatch {
             if stack == libc::MAP_FAILED {
                 return Err(Error::last_os_error("mmap(sigaltstack)"));
             }
-            self.alt_stack = stack;
             let ss = libc::stack_t {
                 ss_sp: stack,
                 ss_flags: 0,
                 ss_size: ALT_STACK_SIZE,
             };
             if unsafe { libc::sigaltstack(&ss, &mut self.prev_alt_stack) } != 0 {
-                return Err(Error::last_os_error("sigaltstack"));
+                let err = Error::last_os_error("sigaltstack");
+                unsafe { libc::munmap(stack, ALT_STACK_SIZE) };
+                return Err(err);
             }
+            self.alt_stack = stack;
         }
         state.sud_selector = SELECTOR_ALLOW;
         let ret = unsafe {
@@ -203,7 +214,11 @@ impl Vcpu for SyscallUserDispatch {
             )
         };
         if ret != 0 {
-            return Err(Error::last_os_error("prctl(PR_SET_SYSCALL_USER_DISPATCH)"));
+            let err = Error::last_os_error("prctl(PR_SET_SYSCALL_USER_DISPATCH)");
+            if self.armed_tid == 0 {
+                self.release_alt_stack();
+            }
+            return Err(err);
         }
         // The selector is still `ALLOW`, so no SIGSYS can arrive before the
         // handlers are in place.
@@ -247,9 +262,8 @@ impl Drop for SyscallUserDispatch {
                     0 as libc::c_ulong,
                     0 as libc::c_ulong,
                 );
-                libc::sigaltstack(&self.prev_alt_stack, ptr::null_mut());
-                libc::munmap(self.alt_stack, ALT_STACK_SIZE);
             }
+            self.release_alt_stack();
         }
         uninstall_handlers();
     }
