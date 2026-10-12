@@ -7,6 +7,12 @@ can read guest pointers (e.g. the file path passed to `openat`) with a plain
 dereference. Each syscall is logged to standard error in the same `name(args)
 = ret` format `strace(1)` prints.
 
+A guest speaks its host kernel's system-call interface, and no two hosts
+share one — numbers, argument conventions, and struct layouts all differ —
+so the tracer is per host: `strace_linux.rs` decodes the x86-64 Linux calls
+with the rich argument formatters shown below, and `main.rs` picks the
+tracer for the host it is built on.
+
 ## Build and run
 
     cargo run --example strace -- <program> [args...]
