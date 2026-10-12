@@ -32,6 +32,7 @@ const SYS_CLOSE: u64 = 6;
 const SYS_CHDIR: u64 = 12;
 const SYS_FCHDIR: u64 = 13;
 const SYS_DUP2: u64 = 90;
+const SYS_FCNTL: u64 = 92;
 
 // `posix_spawnattr_setflags` flag bits (from `<spawn.h>`).
 const POSIX_SPAWN_SETPGROUP: u16 = 0x0002;
@@ -382,7 +383,24 @@ fn apply_file_actions(actions: &[FileAction], handler: &dyn SystemCalls) -> Resu
             FileAction::Dup2 { src, dst } => {
                 issue(SYS_DUP2, [*src as u64, *dst as u64, 0, 0, 0, 0, 0, 0])?;
             }
-            FileAction::Inherit { .. } => {}
+            // Not about creating a descriptor but about keeping one: the
+            // kernel clears the descriptor's close-on-exec flag, so a
+            // descriptor the caller marked `FD_CLOEXEC` — libuv marks every
+            // stdio stream it adopts — survives the exec it was named as
+            // surviving.
+            FileAction::Inherit { fd } => {
+                let flags = issue(
+                    SYS_FCNTL,
+                    [*fd as u64, libc::F_GETFD as u64, 0, 0, 0, 0, 0, 0],
+                )?;
+                if flags & libc::FD_CLOEXEC as i64 != 0 {
+                    let cleared = (flags & !(libc::FD_CLOEXEC as i64)) as u64;
+                    issue(
+                        SYS_FCNTL,
+                        [*fd as u64, libc::F_SETFD as u64, cleared, 0, 0, 0, 0, 0],
+                    )?;
+                }
+            }
             FileAction::Chdir { path } => {
                 let mut p = path.clone();
                 p.push(0);
