@@ -1,5 +1,6 @@
 CARGO_TARGET_DIR := $(shell $(CURDIR)/scripts/cargo-target-dir)
-RUNNER ?= $(CARGO_TARGET_DIR)/debug/chimera run
+CHIMERA := $(CARGO_TARGET_DIR)/debug/chimera
+RUNNER ?= $(CHIMERA) run
 
 # Nothing about the copy-on-write filesystem is Linux-only; it has simply not
 # been built for anything else yet. So its tests stay unconditioned in the tree
@@ -10,7 +11,7 @@ EXCLUDE := $(if $(filter Darwin,$(shell uname -s)),--exclude fs,)
 # syscall user dispatch where the host can run it (x86-64 Linux 5.11 or
 # later), which the freshly built Chimera finds out by running a program
 # under it. Run one with `make conformance BACKENDS=sud`.
-BACKENDS = dbt $(shell $(RUNNER) --backend sud --unsafe /bin/true >/dev/null 2>&1 && echo sud)
+BACKENDS = dbt $(shell $(CHIMERA) run --backend sud --unsafe /bin/true >/dev/null 2>&1 && echo sud)
 
 build:
 	cargo build --quiet
