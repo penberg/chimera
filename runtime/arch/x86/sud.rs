@@ -277,7 +277,9 @@ impl Drop for SyscallUserDispatch {
 /// that is blocked kills the process. Guest code running natively polls
 /// nothing, so the interrupt signal is the only way to stop a thread that
 /// never makes a system call, and a guest mask that blocks it would leave an
-/// `execve` waiting for that thread forever. SIGTRAP can follow the guest's
+/// `execve` waiting for that thread forever. Its handler is installed again
+/// here: while no vcpu was attached the slot was not reserved, so a guest
+/// run by the translator may have replaced it. SIGTRAP can follow the guest's
 /// mask: the only SIGTRAP forced on the guest is an `int3`'s, which kills a
 /// guest that blocks it natively too, and any other blocked SIGTRAP stays
 /// pending in the kernel for the guest's `signalfd`.
@@ -291,6 +293,7 @@ fn install_handlers() {
     ACTIVE.store(true, Ordering::Relaxed);
     signal::reserve_host_signal(libc::SIGSYS);
     signal::reserve_host_signal(process::interrupt_signal());
+    process::install_interrupt_handler();
     for (i, (signo, handler)) in HANDLED
         .into_iter()
         .zip([
