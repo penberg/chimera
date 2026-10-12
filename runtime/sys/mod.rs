@@ -18,6 +18,12 @@ pub use linux::{fsops, hostfs};
 #[cfg(target_os = "linux")]
 pub use linux::exec;
 
+/// The host syscall policy — the driver the arch dispatcher calls per guest
+/// syscall — re-exported host-neutrally so the crate-root `syscall` module
+/// names `sys::policy::syscall` rather than a per-OS path.
+#[cfg(target_os = "linux")]
+pub use linux::policy;
+
 /// The host raw-syscall bridge and the syscall-result writeback, re-exported
 /// host-neutrally so the crate-root syscall driver, the public API, and the
 /// dispatcher name `sys::host_syscall` / `sys::write_syscall_result` rather

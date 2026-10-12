@@ -8,6 +8,7 @@ pub mod fault;
 pub mod fsops;
 pub mod hostfs;
 mod personality;
+pub mod policy;
 pub mod signal;
 pub mod syscall;
 pub mod thread;
