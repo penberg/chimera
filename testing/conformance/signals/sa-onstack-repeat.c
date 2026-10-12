@@ -1,4 +1,4 @@
-// RUN: %cc %s -o %t && timeout 10 %runner %t
+// RUN: %cc %s -o %t && %runner %t
 //
 // An SA_ONSTACK handler runs on the alternate stack every time it is
 // delivered, not just the first time. Delivering a signal switches stacks and

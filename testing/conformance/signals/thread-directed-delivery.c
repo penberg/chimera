@@ -7,7 +7,8 @@
 // tgkill'd signal -- JavaScriptCore's SIGPWR suspend/resume protocol deadlocked
 // exactly that way, the resume swallowed by a busy sibling while the suspended
 // thread waited in sigsuspend holding the heap lock. The handler records which
-// thread it ran on; it must be the targeted worker, never main.
+// thread it ran on; it must be the targeted worker, never main. The runner's
+// own timeout turns a lost delivery into a deterministic failure.
 
 #include <pthread.h>
 #include <signal.h>
