@@ -322,7 +322,7 @@ impl Thread {
 
     /// `clone(CLONE_VM)`: the arguments are in registers. `args[1]` is the child
     /// stack pointer; `args[2..=4]` are `parent_tid`, `child_tid`, `tls`.
-    pub fn clone_vm(&self, args: &[u64; 6]) -> i64 {
+    pub fn clone_vm(&self, args: &[u64; 8]) -> i64 {
         self.spawn_clone(args[0], args[1], args[2], args[3], args[4])
     }
 
@@ -581,6 +581,8 @@ impl Thread {
     /// loop hands the request back to its caller to re-enter on the new image.
     fn handle_syscall(&mut self) -> Option<ExitReason> {
         let number = self.state.regs[RAX];
+        // The x86-64 syscall ABI passes six register arguments; the last two
+        // slots stay zero (`SystemCall` carries eight for arm64's Mach traps).
         let args = [
             self.state.regs[RDI],
             self.state.regs[RSI],
@@ -588,6 +590,8 @@ impl Thread {
             self.state.regs[R10],
             self.state.regs[R8],
             self.state.regs[R9],
+            0,
+            0,
         ];
         let mut call = SystemCall::new(number, args);
         // Clone the `Arc` so the handler borrow comes from the local handle
@@ -596,7 +600,7 @@ impl Thread {
         let process = self.process.clone();
         crate::syscall::syscall(self, &mut call, process.handler.as_ref());
         let result = call.return_value();
-        self.state.regs[RAX] = result as u64;
+        crate::sys::write_syscall_result(&mut self.state, &call);
 
         // Record a restart candidate for SA_RESTART: a forwarded slow syscall
         // interrupted by a signal returns EINTR, and the dispatcher must be able

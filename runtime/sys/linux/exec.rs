@@ -223,7 +223,7 @@ pub struct PreparedExec {
 /// thread disturbed.
 pub fn prepare_exec(
     number: u64,
-    args: &[u64; 6],
+    args: &[u64; 8],
     handler: &dyn SystemCalls,
 ) -> Result<PreparedExec, Error> {
     let mut req = read_request(number, args, handler)?;
@@ -361,7 +361,7 @@ struct ExecRequest {
 /// `/proc/self/fd` handling stands in for [`Passthrough`].
 fn read_request(
     number: u64,
-    args: &[u64; 6],
+    args: &[u64; 8],
     handler: &dyn SystemCalls,
 ) -> Result<ExecRequest, Error> {
     let (dirfd, rawptr, flags, argv_ptr, envp_ptr) = if number == libc::SYS_execveat as u64 {

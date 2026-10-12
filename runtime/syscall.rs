@@ -2,41 +2,61 @@
 //! handlers, the [`SystemCalls`] trait, the runtime's syscall driver
 //! [`syscall`], and the default [`Passthrough`] handler.
 
-use crate::sys::linux::syscall::host_syscall;
+use crate::sys::host_syscall;
 
 /// A single guest system call, presented to a [`SystemCalls`] handler.
 ///
 /// `number` is the syscall number from the guest's syscall-number register
-/// (`rax` on x86-64). `args` contains the six argument
-/// registers in the guest ABI's syscall order. The handler decides what the
+/// (`rax` on x86-64, `x16` on arm64). `args` contains the argument registers
+/// in the guest ABI's syscall order. The handler decides what the
 /// call should do — forward it to the host kernel via
 /// [`crate::host_syscall`], synthesize an answer with
 /// [`SystemCall::set_result`] or [`SystemCall::set_return`], or both.
 pub struct SystemCall {
     /// The syscall number.
     pub number: u64,
-    /// The six argument registers.
-    pub args: [u64; 6],
+    /// The argument registers. arm64 passes up to eight (x0..x7) — Darwin Mach
+    /// traps such as `mach_msg2_trap` use all of them — while the x86-64 ABI
+    /// fills only the first six and leaves the rest zero.
+    pub args: [u64; 8],
     return_value: i64,
+    /// Whether the outcome is a failure. Recorded as portable intent so the
+    /// host writeback ([`crate::sys::write_syscall_result`]) can commit the
+    /// error to the guest in whichever way its ABI expects — the sign of the
+    /// return register on Linux, the NZCV carry flag on Darwin — rather than
+    /// this struct baking one convention in.
+    is_error: bool,
     has_result: bool,
 }
 
 impl SystemCall {
-    /// Write `result` into this `SystemCall` in the host's syscall-return ABI:
-    /// `Error(errno)` is encoded as `-errno` in the return slot, the way the
-    /// Linux/x86-64 kernel reports a failed syscall.
+    /// Record `result` as this call's outcome. This is the portable path
+    /// handlers should prefer: the success/failure intent is stored here and
+    /// the host writeback ([`crate::sys::write_syscall_result`]) encodes it into
+    /// the guest register file per the host ABI. The return slot keeps the
+    /// Linux `-errno` sign encoding for `Error`, so [`SystemCall::result`] and
+    /// [`SystemCall::return_value`] read back unchanged.
     pub fn set_result(&mut self, result: SyscallResult) {
         match result {
-            SyscallResult::Ok(value) => self.set_return(value),
-            SyscallResult::Error(errno) => self.set_return(-(errno as i64)),
+            SyscallResult::Ok(value) => {
+                self.return_value = value;
+                self.is_error = false;
+            }
+            SyscallResult::Error(errno) => {
+                self.return_value = -(errno as i64);
+                self.is_error = true;
+            }
         }
+        self.has_result = true;
     }
 
-    /// Set the value the guest will see in its return register after this
-    /// syscall. Most handlers should use [`SystemCall::set_result`] instead,
-    /// which encodes the host's convention for you.
+    /// Set the raw value the guest will see in its return register after this
+    /// syscall, in the host's own convention (a `-errno` on Linux). Most
+    /// handlers should use [`SystemCall::set_result`] instead, which records
+    /// the portable success/failure intent for you.
     pub fn set_return(&mut self, value: i64) {
         self.return_value = value;
+        self.is_error = false;
         self.has_result = true;
     }
 
@@ -49,7 +69,16 @@ impl SystemCall {
         if !self.has_result {
             return None;
         }
-        if (-4095..0).contains(&self.return_value) {
+        // An explicit error flag (from `set_result`) denotes failure. On Linux
+        // a raw `-errno` in the kernel's `[-4095, -1]` range (from a
+        // `set_return` escape hatch) does too. That range test is meaningless
+        // on Darwin, where failure travels in the carry flag and a negative
+        // return is a legitimate success value — the `ULF_NO_ERRNO` ulock
+        // calls return `-errno` as data, and treating the joiner-wake's
+        // `-ENOENT` as a failure sends the guest's libsyscall down `cerror`
+        // and aborts `pthread_join`.
+        let raw_errno = cfg!(target_os = "linux") && (-4095..0).contains(&self.return_value);
+        if self.is_error || raw_errno {
             Some(SyscallResult::Error((-self.return_value) as i32))
         } else {
             Some(SyscallResult::Ok(self.return_value))
@@ -60,11 +89,12 @@ impl SystemCall {
         self.return_value
     }
 
-    pub(crate) fn new(number: u64, args: [u64; 6]) -> Self {
+    pub(crate) fn new(number: u64, args: [u64; 8]) -> Self {
         Self {
             number,
             args,
             return_value: 0,
+            is_error: false,
             has_result: false,
         }
     }
@@ -641,7 +671,7 @@ mod host {
             // suspended.
             libc::SYS_vfork => {
                 call.number = libc::SYS_clone as u64;
-                call.args = [libc::SIGCHLD as u64, 0, 0, 0, 0, 0];
+                call.args = [libc::SIGCHLD as u64, 0, 0, 0, 0, 0, 0, 0];
                 forked(thread, call, handler, 0);
             }
             // The variants reached here: genuine `fork` shapes, and malformed

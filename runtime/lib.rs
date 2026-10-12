@@ -15,7 +15,7 @@ mod vcpu;
 
 pub use syscall::{ForkHold, Passthrough, SyscallResult, SystemCall, SystemCalls};
 
-pub use sys::linux::syscall::host_syscall;
+pub use sys::host_syscall;
 
 pub use sys::{
     fs::{

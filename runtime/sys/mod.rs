@@ -17,3 +17,10 @@ pub use linux::{fsops, hostfs};
 
 #[cfg(target_os = "linux")]
 pub use linux::exec;
+
+/// The host raw-syscall bridge and the syscall-result writeback, re-exported
+/// host-neutrally so the crate-root syscall driver, the public API, and the
+/// dispatcher name `sys::host_syscall` / `sys::write_syscall_result` rather
+/// than a per-OS path.
+#[cfg(target_os = "linux")]
+pub use linux::syscall::{host_syscall, write_syscall_result};
