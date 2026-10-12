@@ -21,13 +21,13 @@ pub use sys::{
     fs::{
         namespace::{MountFlags, Namespace},
         overlayfs::OverlayFs,
+        personality::Personality,
         vfs::{
             DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec,
             Vfs, WriteResult,
         },
     },
     hostfs::HostFs,
-    linux::Personality,
 };
 
 /// The tooling side of the filesystem delta format, for inspecting and
