@@ -17,20 +17,31 @@ pub use syscall::{ForkHold, Passthrough, SyscallResult, SystemCall, SystemCalls}
 
 pub use sys::linux::syscall::host_syscall;
 
-pub use sys::linux::{
-    DirEntry, Errno, File, FileType, HostFs, Mode, MountFlags, Namespace, OpenFlags, OverlayFs,
-    Personality, RenameFlags, Stat, StatFs, Timespec, Vfs, WriteResult,
+pub use sys::{
+    fs::{
+        namespace::{MountFlags, Namespace},
+        overlayfs::OverlayFs,
+        vfs::{
+            DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec,
+            Vfs, WriteResult,
+        },
+    },
+    hostfs::HostFs,
+    linux::Personality,
 };
 
 /// The tooling side of the filesystem delta format, for inspecting and
 /// applying a delta from outside a sandbox: the marker predicates, the
-/// origin record a copy-up leaves behind, and the applied-state writers
-/// `fs apply` advances after each successful host operation. The format
-/// itself is owned by this crate; the CLI's `chimera fs` subcommands
-/// consume these rather than reimplementing the on-disk knowledge.
+/// origin record a copy-up leaves behind, the applied-state writers
+/// `fs apply` advances after each successful host operation, and the
+/// extended-attribute copy that replays a change's attributes onto the host
+/// in the host's own xattr spelling. The format itself is owned by this
+/// crate; the CLI's `chimera fs` subcommands consume these rather than
+/// reimplementing the on-disk knowledge.
 pub mod delta {
-    pub use crate::sys::linux::{
-        Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin,
+    pub use crate::sys::fs::delta::{
+        Origin, copy_path_xattrs, is_applied, is_opaque, is_whiteout, mark_applied, origin,
+        record_origin, replayable_xattr,
     };
 }
 

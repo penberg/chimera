@@ -29,12 +29,13 @@ use std::{
 
 use crate::{ForkHold, SyscallResult, SystemCall, SystemCalls, host_syscall};
 
-use super::{
+use crate::sys::fs::{
     delta::XATTR_NAMESPACE,
-    hostfs::BACKING_FLOOR,
     namespace::{Namespace, Resolved, normalize},
     vfs::{DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec},
 };
+
+use super::hostfs::BACKING_FLOOR;
 
 /// Reserve a real kernel descriptor number for a virtual descriptor.
 ///
@@ -1706,7 +1707,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::sys::linux::{HostFs, MountFlags};
+    use crate::{HostFs, MountFlags};
 
     struct Scratch(PathBuf);
 

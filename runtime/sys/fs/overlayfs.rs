@@ -16,7 +16,7 @@
 //! paths whose intermediate components are already resolved, so the
 //! upper-visibility walk below never crosses a symlink.
 //!
-//! [`HostFile`]: super::hostfs::HostFile
+//! [`HostFile`]: crate::sys::hostfs::HostFile
 
 use std::{
     collections::HashSet,
@@ -25,9 +25,10 @@ use std::{
     sync::Arc,
 };
 
+use crate::sys::hostfs::HostFs;
+
 use super::{
     delta::{Delta, is_opaque, is_whiteout, is_whiteout_fd, mark_opaque, may_be_whiteout, origin},
-    hostfs::HostFs,
     vfs::{
         DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec, Vfs,
         WriteResult,
@@ -320,7 +321,7 @@ impl Vfs for OverlayFs {
                         // filesystem takes the bytes. The directory itself is
                         // only scaffolding for it — not a claim on its
                         // identity.
-                        FileType::Directory if flags.raw() & libc::O_TMPFILE == libc::O_TMPFILE => {
+                        FileType::Directory if flags.tmpfile() => {
                             inner.delta.scaffold(path)?;
                             inner.upper.open(path, flags, mode)
                         }
@@ -943,6 +944,9 @@ impl File for OverlayDir {
 
 #[cfg(test)]
 mod tests {
+    /// `S_IFIFO`, which `libc` types as the host's `mode_t`.
+    const S_IFIFO: u32 = 0o010000;
+
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
@@ -1343,7 +1347,7 @@ mod tests {
         };
         std::fs::write(scratch.join("lower/taken"), b"x").unwrap();
 
-        fs.mknod(Path::new("/pipe"), Mode(libc::S_IFIFO | 0o644), 0)
+        fs.mknod(Path::new("/pipe"), Mode(S_IFIFO | 0o644), 0)
             .unwrap();
         assert_eq!(
             fs.stat(Path::new("/pipe"), true).unwrap().file_type,
@@ -1354,7 +1358,7 @@ mod tests {
 
         // A lower-visible name is EEXIST even though the upper cannot see it.
         assert_eq!(
-            fs.mknod(Path::new("/taken"), Mode(libc::S_IFIFO | 0o644), 0),
+            fs.mknod(Path::new("/taken"), Mode(S_IFIFO | 0o644), 0),
             Err(Errno::EEXIST)
         );
     }
@@ -1540,7 +1544,7 @@ mod tests {
             fs.rename(
                 Path::new("/victim"),
                 Path::new("/other"),
-                RenameFlags(libc::RENAME_NOREPLACE),
+                RenameFlags::NOREPLACE,
             ),
             Err(Errno::EEXIST)
         );

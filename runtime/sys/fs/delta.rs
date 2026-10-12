@@ -32,6 +32,8 @@ use std::{
     sync::atomic::{AtomicU8, AtomicU64, Ordering},
 };
 
+use crate::sys::fsops;
+
 use super::vfs::Errno;
 
 /// The xattr namespace holding overlay bookkeeping. Task 6 hides it from the
@@ -203,16 +205,7 @@ impl Delta {
             return Err(last_errno());
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let r = unsafe {
-            libc::fsetxattr(
-                fd.as_raw_fd(),
-                PROBE_XATTR.as_ptr(),
-                c"1".as_ptr() as *const libc::c_void,
-                1,
-                0,
-            )
-        };
-        let result = if r < 0 { Err(last_errno()) } else { Ok(()) };
+        let result = fsops::fsetxattr(fd.as_raw_fd(), PROBE_XATTR, b"1");
         unsafe { libc::unlink(cprobe.as_ptr()) };
         result
     }
@@ -273,16 +266,7 @@ impl Delta {
             },
         ];
         check(unsafe { libc::utimensat(libc::AT_FDCWD, cdst.as_ptr(), times.as_ptr(), 0) })?;
-        let origin = Origin::of(&st).encode();
-        check(unsafe {
-            libc::lsetxattr(
-                cdst.as_ptr(),
-                ORIGIN_XATTR.as_ptr(),
-                origin.as_ptr() as *const libc::c_void,
-                origin.len(),
-                0,
-            )
-        })
+        fsops::lsetxattr(&cdst, ORIGIN_XATTR, Origin::of(&st).encode().as_bytes())
     }
 
     /// Build a fresh marker file under a staging name.
@@ -302,15 +286,7 @@ impl Delta {
             return Err(last_errno());
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        match check(unsafe {
-            libc::fsetxattr(
-                fd.as_raw_fd(),
-                WHITEOUT_XATTR.as_ptr(),
-                c"1".as_ptr() as *const libc::c_void,
-                1,
-                0,
-            )
-        }) {
+        match fsops::fsetxattr(fd.as_raw_fd(), WHITEOUT_XATTR, b"1") {
             Ok(()) => Ok(staging),
             Err(e) => {
                 let _ = std::fs::remove_file(&staging);
@@ -439,7 +415,7 @@ impl Delta {
         let dst_fd = unsafe { OwnedFd::from_raw_fd(dst_fd) };
 
         let publish = (|| {
-            transfer(src_fd.as_raw_fd(), dst_fd.as_raw_fd())?;
+            fsops::transfer(src_fd.as_raw_fd(), dst_fd.as_raw_fd())?;
             // Everything lands on the staging file before the rename
             // publishes it: an upper file is never observable half-made.
             // Ownership and ACLs come before the mode bits — chown can
@@ -452,16 +428,11 @@ impl Delta {
             check(unsafe {
                 libc::fchmod(dst_fd.as_raw_fd(), (st.st_mode & 0o7777) as libc::mode_t)
             })?;
-            let origin = Origin::of(&st).encode();
-            check(unsafe {
-                libc::fsetxattr(
-                    dst_fd.as_raw_fd(),
-                    ORIGIN_XATTR.as_ptr(),
-                    origin.as_ptr() as *const libc::c_void,
-                    origin.len(),
-                    0,
-                )
-            })?;
+            fsops::fsetxattr(
+                dst_fd.as_raw_fd(),
+                ORIGIN_XATTR,
+                Origin::of(&st).encode().as_bytes(),
+            )?;
             let times = [
                 libc::timespec {
                     tv_sec: st.st_atime,
@@ -489,36 +460,12 @@ impl Delta {
     }
 }
 
-/// `rename(2)` that refuses to replace an existing destination — the
-/// compare-and-swap a first-wins publication needs.
 fn rename_noreplace(from: &Path, to: &Path) -> Result<(), Errno> {
-    let cfrom = cpath(from)?;
-    let cto = cpath(to)?;
-    check(unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            cfrom.as_ptr(),
-            libc::AT_FDCWD,
-            cto.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    })
+    fsops::rename_noreplace(&cpath(from)?, &cpath(to)?)
 }
 
-/// `rename(2)` that atomically swaps two existing entries — how a staged
-/// object of any type takes a whiteout marker's place in one step.
 fn rename_exchange(a: &Path, b: &Path) -> Result<(), Errno> {
-    let ca = cpath(a)?;
-    let cb = cpath(b)?;
-    check(unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            ca.as_ptr(),
-            libc::AT_FDCWD,
-            cb.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    })
+    fsops::rename_exchange(&cpath(a)?, &cpath(b)?)
 }
 
 /// Whether an entry with this metadata could be a whiteout at all: a
@@ -544,49 +491,21 @@ pub fn is_opaque(path: &Path) -> Result<bool, Errno> {
 /// Mark the directory at `path` (a host path — an upper entry or a staging
 /// directory about to be published as one) opaque.
 pub fn mark_opaque(path: &Path) -> Result<(), Errno> {
-    let cdir = cpath(path)?;
-    check(unsafe {
-        libc::lsetxattr(
-            cdir.as_ptr(),
-            OPAQUE_XATTR.as_ptr(),
-            c"1".as_ptr() as *const libc::c_void,
-            1,
-            0,
-        )
-    })
+    fsops::lsetxattr(&cpath(path)?, OPAQUE_XATTR, b"1")
 }
 
 /// Record `origin` on the upper entry at `path` — how apply advances a
 /// change's origin to the exact host identity it just produced, so a rerun
 /// recognizes its own work instead of conflicting with it.
 pub fn record_origin(path: &Path, origin: &Origin) -> Result<(), Errno> {
-    let cpath = cpath(path)?;
-    let encoded = origin.encode();
-    check(unsafe {
-        libc::lsetxattr(
-            cpath.as_ptr(),
-            ORIGIN_XATTR.as_ptr(),
-            encoded.as_ptr() as *const libc::c_void,
-            encoded.len(),
-            0,
-        )
-    })
+    fsops::lsetxattr(&cpath(path)?, ORIGIN_XATTR, origin.encode().as_bytes())
 }
 
 /// Mark the whiteout at `path` as applied: its host removal has happened (or
 /// was found already done), and any host entry at the name afterward is the
 /// host's own, never to be deleted again by a rerun.
 pub fn mark_applied(path: &Path) -> Result<(), Errno> {
-    let cpath = cpath(path)?;
-    check(unsafe {
-        libc::lsetxattr(
-            cpath.as_ptr(),
-            APPLIED_XATTR.as_ptr(),
-            c"1".as_ptr() as *const libc::c_void,
-            1,
-            0,
-        )
-    })
+    fsops::lsetxattr(&cpath(path)?, APPLIED_XATTR, b"1")
 }
 
 /// `true` when the whiteout at `path` has already been applied to the host.
@@ -599,25 +518,18 @@ pub fn is_applied(path: &Path) -> Result<bool, Errno> {
 /// never by marking a live file in place, so an fd carrying the xattr proves
 /// the name was already deleted when the open resolved it.
 pub fn is_whiteout_fd(fd: std::os::fd::RawFd) -> Result<bool, Errno> {
-    let n = unsafe { libc::fgetxattr(fd, WHITEOUT_XATTR.as_ptr(), std::ptr::null_mut(), 0) };
-    if n >= 0 {
-        return Ok(true);
-    }
-    match last_errno() {
-        Errno(libc::ENODATA) | Errno(libc::ENOTSUP) => Ok(false),
-        e => Err(e),
+    match fsops::fgetxattr(fd, WHITEOUT_XATTR, &mut []) {
+        Ok(_) => Ok(true),
+        Err(Errno(fsops::ENOATTR) | Errno(libc::ENOTSUP)) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
 fn has_marker(path: &Path, name: &CStr) -> Result<bool, Errno> {
-    let cpath = cpath(path)?;
-    let n = unsafe { libc::lgetxattr(cpath.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
-    if n >= 0 {
-        return Ok(true);
-    }
-    match last_errno() {
-        Errno(libc::ENODATA) | Errno(libc::ENOTSUP) | Errno(libc::ENOENT) => Ok(false),
-        e => Err(e),
+    match fsops::lgetxattr(&cpath(path)?, name, &mut []) {
+        Ok(_) => Ok(true),
+        Err(Errno(fsops::ENOATTR) | Errno(libc::ENOTSUP) | Errno(libc::ENOENT)) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -636,7 +548,7 @@ pub struct Origin {
 impl Origin {
     pub fn of(st: &libc::stat) -> Origin {
         Origin {
-            dev: st.st_dev,
+            dev: fsops::dev_of(st),
             ino: st.st_ino,
             size: st.st_size as u64,
             mtime_sec: st.st_mtime,
@@ -677,156 +589,84 @@ impl Origin {
 /// the guest created in the upper (nothing lower to compare against) — a
 /// malformed record reads as `None` too, failing toward "guest-created".
 pub fn origin(path: &Path) -> Result<Option<Origin>, Errno> {
-    let cpath = cpath(path)?;
     let mut buf = [0u8; 128];
-    let n = unsafe {
-        libc::lgetxattr(
-            cpath.as_ptr(),
-            ORIGIN_XATTR.as_ptr(),
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len(),
-        )
-    };
-    if n < 0 {
-        return match last_errno() {
-            Errno(libc::ENODATA) | Errno(libc::ENOTSUP) => Ok(None),
-            e => Err(e),
-        };
+    match fsops::lgetxattr(&cpath(path)?, ORIGIN_XATTR, &mut buf) {
+        Ok(n) => Ok(Origin::decode(&buf[..n])),
+        Err(Errno(fsops::ENOATTR) | Errno(libc::ENOTSUP)) => Ok(None),
+        Err(e) => Err(e),
     }
-    Ok(Origin::decode(&buf[..n as usize]))
 }
 
-/// The lower attributes a copy-up carries: the guest-visible user namespace
-/// and the POSIX ACLs. The reserved `user.chimera.*` names never come along
-/// — a lower file carrying one, forged or stray, must not become delta
-/// bookkeeping — and kernel-managed namespaces (`security.*`) belong to the
-/// upper file's own filesystem.
-fn carried_xattr(name: &[u8]) -> bool {
-    (name.starts_with(b"user.") && !name.starts_with(XATTR_NAMESPACE))
-        || name == b"system.posix_acl_access"
-        || name == b"system.posix_acl_default"
-}
-
-/// Copy the carried xattrs from one open file to another.
+/// Copy the carried xattrs (see [`fsops::carried_xattr`]) from one open file
+/// to another.
 fn copy_fd_xattrs(src: libc::c_int, dst: libc::c_int) -> Result<(), Errno> {
     let mut names = vec![0u8; 1024];
     let len = loop {
-        let n =
-            unsafe { libc::flistxattr(src, names.as_mut_ptr() as *mut libc::c_char, names.len()) };
-        if n >= 0 {
-            break n as usize;
-        }
-        match last_errno() {
-            Errno(libc::ERANGE) => names.resize(names.len() * 2, 0),
+        match fsops::flistxattr(src, &mut names) {
+            Ok(n) => break n,
+            Err(Errno(libc::ERANGE)) => names.resize(names.len() * 2, 0),
             // A lower filesystem without xattrs holds none to carry.
-            Errno(libc::ENOTSUP) => return Ok(()),
-            e => return Err(e),
+            Err(Errno(libc::ENOTSUP)) => return Ok(()),
+            Err(e) => return Err(e),
         }
     };
     for name in names[..len].split(|&b| b == 0).filter(|n| !n.is_empty()) {
-        if !carried_xattr(name) {
+        if !fsops::carried_xattr(name) {
             continue;
         }
         let cname = CString::new(name).map_err(|_| Errno::EINVAL)?;
         let mut value = vec![0u8; 256];
         let vlen = loop {
-            let n = unsafe {
-                libc::fgetxattr(
-                    src,
-                    cname.as_ptr(),
-                    value.as_mut_ptr() as *mut libc::c_void,
-                    value.len(),
-                )
-            };
-            if n >= 0 {
-                break n as usize;
-            }
-            match last_errno() {
-                Errno(libc::ERANGE) => value.resize(value.len() * 2, 0),
-                e => return Err(e),
+            match fsops::fgetxattr(src, &cname, &mut value) {
+                Ok(n) => break n,
+                Err(Errno(libc::ERANGE)) => value.resize(value.len() * 2, 0),
+                Err(e) => return Err(e),
             }
         };
-        check(unsafe {
-            libc::fsetxattr(
-                dst,
-                cname.as_ptr(),
-                value.as_ptr() as *const libc::c_void,
-                vlen,
-                0,
-            )
-        })?;
+        fsops::fsetxattr(dst, &cname, &value[..vlen])?;
     }
     Ok(())
 }
 
-/// Copy `src`'s contents to `dst` (both at offset 0, `dst` freshly created):
-/// `FICLONE` shares extents in one ioctl where the filesystem supports
-/// reflinks; `copy_file_range` copies in-kernel otherwise; a read/write loop
-/// is the portable floor. The fallbacks trigger only when no bytes have
-/// moved, so each strategy starts from a clean destination.
-fn transfer(src: libc::c_int, dst: libc::c_int) -> Result<(), Errno> {
-    if unsafe { libc::ioctl(dst, libc::FICLONE, src) } == 0 {
-        return Ok(());
-    }
-
-    let mut copied = false;
-    loop {
-        let n = unsafe {
-            libc::copy_file_range(
-                src,
-                std::ptr::null_mut(),
-                dst,
-                std::ptr::null_mut(),
-                1 << 30,
-                0,
-            )
-        };
-        if n == 0 {
-            return Ok(());
+/// Copy the carried xattrs from the entry at `from` to the entry at `to`, by
+/// path and without following a final symlink. `keep` narrows the set
+/// further: the delta tooling replays only the guest-visible attributes onto
+/// the host but duplicates the bookkeeping too when it branches a delta.
+pub fn copy_path_xattrs(from: &Path, to: &Path, keep: fn(&[u8]) -> bool) -> Result<(), Errno> {
+    let cfrom = cpath(from)?;
+    let cto = cpath(to)?;
+    let mut names = vec![0u8; 1024];
+    let len = loop {
+        match fsops::llistxattr(&cfrom, &mut names) {
+            Ok(n) => break n,
+            Err(Errno(libc::ERANGE)) => names.resize(names.len() * 2, 0),
+            // A delta filesystem without xattrs holds none to replay.
+            Err(Errno(libc::ENOTSUP)) => return Ok(()),
+            Err(e) => return Err(e),
         }
-        if n > 0 {
-            copied = true;
+    };
+    for name in names[..len].split(|&b| b == 0).filter(|n| !n.is_empty()) {
+        if !keep(name) {
             continue;
         }
-        let e = last_errno();
-        if copied {
-            return Err(e);
-        }
-        match e {
-            // The "not supported here" class: fall through to read/write.
-            Errno(libc::EXDEV)
-            | Errno(libc::EINVAL)
-            | Errno(libc::ENOSYS)
-            | Errno(libc::EOPNOTSUPP)
-            | Errno(libc::EBADF) => break,
-            e => return Err(e),
-        }
-    }
-
-    let mut buf = vec![0u8; 128 * 1024];
-    loop {
-        let n = unsafe { libc::read(src, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n == 0 {
-            return Ok(());
-        }
-        if n < 0 {
-            return Err(last_errno());
-        }
-        let mut off = 0usize;
-        while off < n as usize {
-            let w = unsafe {
-                libc::write(
-                    dst,
-                    buf[off..].as_ptr() as *const libc::c_void,
-                    n as usize - off,
-                )
-            };
-            if w <= 0 {
-                return Err(last_errno());
+        let cname = CString::new(name).map_err(|_| Errno::EINVAL)?;
+        let mut value = vec![0u8; 256];
+        let vlen = loop {
+            match fsops::lgetxattr(&cfrom, &cname, &mut value) {
+                Ok(n) => break n,
+                Err(Errno(libc::ERANGE)) => value.resize(value.len() * 2, 0),
+                Err(e) => return Err(e),
             }
-            off += w as usize;
-        }
+        };
+        fsops::lsetxattr(&cto, &cname, &value[..vlen])?;
     }
+    Ok(())
+}
+
+/// Whether a name is one the delta tooling replays onto the host: the
+/// carried set, which excludes the `user.chimera.*` bookkeeping.
+pub fn replayable_xattr(name: &[u8]) -> bool {
+    fsops::carried_xattr(name)
 }
 
 /// `CString` from a path's bytes; an embedded NUL is `EINVAL`.
@@ -1065,32 +905,14 @@ mod tests {
             (c"user.app", b"v1".as_slice()),
             (c"user.chimera.whiteout", b"1"),
         ] {
-            assert_eq!(
-                unsafe {
-                    libc::setxattr(
-                        csrc.as_ptr(),
-                        name.as_ptr(),
-                        value.as_ptr() as *const libc::c_void,
-                        value.len(),
-                        0,
-                    )
-                },
-                0
-            );
+            fsops::lsetxattr(&csrc, name, value).unwrap();
         }
 
         d.copy_up(&src, Path::new("/f")).unwrap();
         let upper = d.data_path(Path::new("/f"));
         let cupper = CString::new(upper.as_os_str().as_bytes()).unwrap();
         let mut buf = [0u8; 16];
-        let n = unsafe {
-            libc::getxattr(
-                cupper.as_ptr(),
-                c"user.app".as_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        };
+        let n = fsops::lgetxattr(&cupper, c"user.app", &mut buf).unwrap();
         assert_eq!(n, 2);
         assert_eq!(&buf[..2], b"v1");
         assert!(!is_whiteout(&upper).unwrap());

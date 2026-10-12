@@ -8,7 +8,8 @@ use std::{
 };
 
 use chimera::delta::{
-    Origin, is_applied, is_opaque, is_whiteout, mark_applied, origin, record_origin,
+    Origin, copy_path_xattrs, is_applied, is_opaque, is_whiteout, mark_applied, origin,
+    record_origin, replayable_xattr,
 };
 
 use std::os::unix::ffi::OsStrExt;
@@ -329,79 +330,6 @@ fn cpath(path: &std::path::Path) -> io::Result<std::ffi::CString> {
         .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
 }
 
-/// The xattrs apply replays onto the host: the guest-visible user namespace
-/// and the POSIX ACL attributes. Chimera's reserved `user.chimera.*`
-/// bookkeeping is delta state and never reaches the host.
-fn replayable_xattr(name: &[u8]) -> bool {
-    (name.starts_with(b"user.") && !name.starts_with(b"user.chimera."))
-        || name == b"system.posix_acl_access"
-        || name == b"system.posix_acl_default"
-}
-
-fn copy_xattrs(
-    upper: &std::ffi::CStr,
-    host: &std::ffi::CStr,
-    keep: fn(&[u8]) -> bool,
-) -> io::Result<()> {
-    let mut names = vec![0u8; 1024];
-    let len = loop {
-        let n = unsafe {
-            libc::llistxattr(
-                upper.as_ptr(),
-                names.as_mut_ptr() as *mut libc::c_char,
-                names.len(),
-            )
-        };
-        if n >= 0 {
-            break n as usize;
-        }
-        match io::Error::last_os_error() {
-            e if e.raw_os_error() == Some(libc::ERANGE) => names.resize(names.len() * 2, 0),
-            // A delta filesystem without xattrs holds none to replay.
-            e if e.raw_os_error() == Some(libc::ENOTSUP) => return Ok(()),
-            e => return Err(e),
-        }
-    };
-    for name in names[..len].split(|&b| b == 0).filter(|n| !n.is_empty()) {
-        if !keep(name) {
-            continue;
-        }
-        let cname =
-            std::ffi::CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-        let mut value = vec![0u8; 256];
-        let vlen = loop {
-            let n = unsafe {
-                libc::lgetxattr(
-                    upper.as_ptr(),
-                    cname.as_ptr(),
-                    value.as_mut_ptr() as *mut libc::c_void,
-                    value.len(),
-                )
-            };
-            if n >= 0 {
-                break n as usize;
-            }
-            match io::Error::last_os_error() {
-                e if e.raw_os_error() == Some(libc::ERANGE) => value.resize(value.len() * 2, 0),
-                e => return Err(e),
-            }
-        };
-        if unsafe {
-            libc::lsetxattr(
-                host.as_ptr(),
-                cname.as_ptr(),
-                value.as_ptr() as *const libc::c_void,
-                vlen,
-                0,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
 /// Reproduce the guest-visible metadata of the upper entry on the object at
 /// `host`: ownership first (`chown` may clear set-id bits), then the
 /// permission bits, then the xattrs `keep` selects — apply replays only the
@@ -419,7 +347,6 @@ fn replay_metadata(
 ) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let cupper = cpath(upper)?;
     let chost = cpath(host)?;
     if unsafe { libc::lchown(chost.as_ptr(), md.uid(), md.gid()) } != 0 {
         return Err(io::Error::last_os_error());
@@ -429,7 +356,7 @@ fn replay_metadata(
         if unsafe { libc::chmod(chost.as_ptr(), (md.mode() & 0o7777) as libc::mode_t) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        copy_xattrs(&cupper, &chost, keep)?;
+        copy_path_xattrs(upper, host, keep).map_err(errno_to_io)?;
     }
     let times = [
         libc::timespec {
