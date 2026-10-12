@@ -328,14 +328,14 @@ fn record_regions(
 ) -> Result<(), Error> {
     addr_space.init_program_break()?;
     for &(start, len) in &main.regions {
-        addr_space.add_region(start as usize, len as usize);
+        addr_space.add_runtime_region(start as usize, len as usize);
     }
     if let Some(interp) = interp {
         for &(start, len) in &interp.regions {
-            addr_space.add_region(start as usize, len as usize);
+            addr_space.add_runtime_region(start as usize, len as usize);
         }
     }
-    addr_space.add_region(stack_start, stack_len);
+    addr_space.add_runtime_region(stack_start, stack_len);
     Ok(())
 }
 

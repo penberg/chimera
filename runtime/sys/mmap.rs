@@ -26,6 +26,11 @@ const BREAK_ARENA_LEN: usize = 1 << 30;
 struct Region {
     start: usize,
     len: usize,
+    /// Whether the runtime created this mapping for the guest (its image and
+    /// its initial stack) rather than merely observing the guest ask for it.
+    /// Only these are unmapped when an `execve` replaces the image — see
+    /// [`AddressSpace::reset`].
+    runtime_owned: bool,
 }
 
 /// A guest address space: the translated-block cache and the host mappings
@@ -183,13 +188,29 @@ impl AddressSpace {
         self.granted.retain(|&p| (p as u64) < lo || (p as u64) > hi);
     }
 
+    /// Record a mapping the guest made, for SMC arming and bookkeeping.
     pub fn add_region(&mut self, start: usize, len: usize) {
+        self.insert_region(start, len, false);
+    }
+
+    /// Record a mapping the runtime made *for* the guest — its image and its
+    /// initial stack — which an `execve` must tear down to install the next
+    /// image.
+    pub fn add_runtime_region(&mut self, start: usize, len: usize) {
+        self.insert_region(start, len, true);
+    }
+
+    fn insert_region(&mut self, start: usize, len: usize, runtime_owned: bool) {
         let len = round_mapping_len(len);
         if len == 0 {
             return;
         }
         self.remove_region(start, len);
-        self.regions.push(Region { start, len });
+        self.regions.push(Region {
+            start,
+            len,
+            runtime_owned,
+        });
         self.coalesce_regions();
     }
 
@@ -212,12 +233,14 @@ impl AddressSpace {
                 kept.push(Region {
                     start: region.start,
                     len: start - region.start,
+                    runtime_owned: region.runtime_owned,
                 });
             }
             if end < region_end {
                 kept.push(Region {
                     start: end,
                     len: region_end - end,
+                    runtime_owned: region.runtime_owned,
                 });
             }
         }
@@ -259,10 +282,26 @@ impl AddressSpace {
     }
 
     pub fn reset(&mut self) {
-        self.clear_regions();
         self.code.reset();
+        // Give every armed page its write permission back before forgetting
+        // it: pages in regions that survive the teardown (a guest's own
+        // mappings deliberately do) would otherwise stay read-only with no
+        // bookkeeping left to service the trap, and the next write faults
+        // with no one able to fix it. For a page about to be unmapped this is
+        // a harmless failed mprotect.
+        let page_size = host_page_size();
+        for &page in &self.armed {
+            unsafe {
+                libc::mprotect(
+                    page as *mut libc::c_void,
+                    page_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                );
+            }
+        }
         self.armed.clear();
         self.granted.clear();
+        self.clear_regions();
     }
 
     /// Reserve the guest's break arena and place the initial program break at
@@ -296,6 +335,7 @@ impl AddressSpace {
         self.break_arena = Some(Region {
             start,
             len: BREAK_ARENA_LEN,
+            runtime_owned: true,
         });
         self.program_break = Some(start);
         Ok(())
@@ -353,9 +393,20 @@ impl AddressSpace {
         requested
     }
 
+    /// Unmap the mappings the runtime made for the guest and forget every
+    /// region. A mapping the *guest* asked for is deliberately left alone: a
+    /// loader the runtime shares with the guest may hold references into
+    /// images the guest mapped through the same `mmap` interception as
+    /// everything else, and unmapping those out from under it faults its next
+    /// lookup. The cost is that a guest's own anonymous mappings outlive an
+    /// `execve` that should have replaced them, which leaks address space but
+    /// changes nothing the new image can observe.
     fn clear_regions(&mut self) {
         self.program_break = None;
         for region in self.regions.drain(..) {
+            if !region.runtime_owned {
+                continue;
+            }
             let ret = unsafe { libc::munmap(region.start as *mut libc::c_void, region.len) };
             debug_assert_eq!(ret, 0, "guest region munmap failed");
         }
@@ -372,7 +423,12 @@ impl AddressSpace {
             if let Some(last) = merged.last_mut() {
                 let last_end = last.start.saturating_add(last.len);
                 let region_end = region.start.saturating_add(region.len);
-                if region.start <= last_end {
+                // Only merge like with like: ownership is what decides
+                // whether an `execve` unmaps a range, so absorbing a guest
+                // mapping into an abutting runtime-owned one hands it to the
+                // teardown in [`AddressSpace::clear_regions`] — which is the
+                // very thing that function refuses to do on purpose.
+                if region.start <= last_end && region.runtime_owned == last.runtime_owned {
                     last.len = region_end.max(last_end) - last.start;
                     continue;
                 }
@@ -620,6 +676,7 @@ mod tests {
             vec![Region {
                 start: base,
                 len: host_page_size() * 2,
+                runtime_owned: false,
             }]
         );
     }
@@ -637,10 +694,12 @@ mod tests {
                 Region {
                     start: base,
                     len: host_page_size(),
+                    runtime_owned: false,
                 },
                 Region {
                     start: base + (host_page_size() * 2),
                     len: host_page_size(),
+                    runtime_owned: false,
                 },
             ]
         );
@@ -668,6 +727,7 @@ mod tests {
             vec![Region {
                 start: new,
                 len: host_page_size(),
+                runtime_owned: false,
             }]
         );
 
