@@ -48,7 +48,55 @@ fn raise_open_file_limit() {
     }
 }
 
+/// A guest's `posix_spawn` on Darwin is served as a fork of this
+/// multithreaded process that links the new image in place, never a fresh
+/// image. The Objective-C runtime refuses `+initialize` in such a child for
+/// any class another thread was initialising at the fork — it aborts the child
+/// — unless `OBJC_DISABLE_INITIALIZE_FORK_SAFETY` is set, and libobjc reads
+/// that from the environment once, when the process starts. So it has to be
+/// in place before `chimera` is: re-execute this process with it set. The
+/// guest inherits the variable, which is also what its own fork children need.
+#[cfg(target_os = "macos")]
+fn ensure_fork_safety_override() {
+    use std::{
+        ffi::CString,
+        os::unix::ffi::{OsStrExt, OsStringExt},
+    };
+
+    const VAR: &str = "OBJC_DISABLE_INITIALIZE_FORK_SAFETY";
+    if std::env::var_os(VAR).is_some() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Ok(exe) = CString::new(exe.as_os_str().as_bytes()) else {
+        return;
+    };
+    let argv: Vec<CString> = std::env::args_os()
+        .filter_map(|a| CString::new(a.as_bytes()).ok())
+        .collect();
+    let mut envp: Vec<CString> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            let mut e = k.into_vec();
+            e.push(b'=');
+            e.extend(v.as_bytes());
+            CString::new(e).ok()
+        })
+        .collect();
+    envp.push(CString::new(format!("{VAR}=YES")).expect("no interior NUL"));
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|e| e.as_ptr()).collect();
+    envp_ptrs.push(std::ptr::null());
+    // A failed exec leaves this process to run as it is; the spawn children
+    // then take their chances with the check.
+    unsafe { libc::execve(exe.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr()) };
+}
+
 fn main() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    ensure_fork_safety_override();
     raise_open_file_limit();
     let opts: Opts = argh::from_env();
     match opts.command {
