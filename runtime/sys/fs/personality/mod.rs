@@ -600,7 +600,18 @@ impl Personality {
             libc::SEEK_SET => 0,
             libc::SEEK_CUR => st.offset as i64,
             libc::SEEK_END => desc.file.fstat()?.size as i64,
-            _ => return Err(Errno::EINVAL),
+            // SEEK_DATA/SEEK_HOLE ask about the file's extents, which only
+            // the kernel knows: ask it through the reservation, an alias of
+            // the backing open file, and adopt the absolute offset it names.
+            _ => {
+                let next = unsafe { libc::lseek(fd, off, whence) };
+                if next < 0 {
+                    return Err(Errno::from_io(&std::io::Error::last_os_error()));
+                }
+                st.offset = next as u64;
+                st.dirents = None;
+                return Ok(next);
+            }
         };
         let next = base.checked_add(off).ok_or(Errno::EINVAL)?;
         if next < 0 {
