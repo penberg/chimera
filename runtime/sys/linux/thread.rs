@@ -7,8 +7,9 @@
 //! issues `exit_group` or `exit`.
 
 use std::{
+    ffi::c_void,
+    io, mem, ptr,
     sync::{Arc, MutexGuard, atomic::Ordering, mpsc},
-    thread,
 };
 
 use crate::{
@@ -259,70 +260,68 @@ impl Thread {
         // only the child can read its own `gettid`, so hand it back over a
         // one-shot channel and block until it arrives.
         let (tx, rx) = mpsc::channel::<i64>();
-        let spawned = thread::Builder::new()
-            .name("chimera-guest".to_string())
-            .spawn(move || {
-                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
-                // Replicate the kernel's set-TID writes *before* running any guest
-                // code. The kernel populates the TID word(s) at clone time, so the
-                // child observes its own TID from the first instruction. glibc
-                // points these at `&pd->tid` (the thread's TCB identity) and reads
-                // it during early thread setup; it is also the thread's identity
-                // for, e.g., `pthread_rwlock` writer ownership (`__cur_writer`).
-                // Writing from the parent after the child is already running would
-                // race those reads with a stale TID.
-                // Both words are guest-controlled addresses, so the stores are
-                // fault-safe best-effort writes, matching the kernel exactly:
-                // its `put_user` for the set-TID words is unchecked, and a
-                // clone whose TID pointers are bogus still succeeds with the
-                // writes silently skipped (verified natively).
-                if tid > 0 {
-                    if flags & libc::CLONE_PARENT_SETTID as u64 != 0 {
-                        copy_to_guest(parent_tid, &(tid as i32).to_ne_bytes());
-                    }
-                    if flags & libc::CLONE_CHILD_SETTID as u64 != 0 {
-                        copy_to_guest(child_tid, &(tid as i32).to_ne_bytes());
-                    }
+        let spawned = spawn_detached(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i64;
+            // Replicate the kernel's set-TID writes *before* running any guest
+            // code. The kernel populates the TID word(s) at clone time, so the
+            // child observes its own TID from the first instruction. glibc
+            // points these at `&pd->tid` (the thread's TCB identity) and reads
+            // it during early thread setup; it is also the thread's identity
+            // for, e.g., `pthread_rwlock` writer ownership (`__cur_writer`).
+            // Writing from the parent after the child is already running would
+            // race those reads with a stale TID.
+            // Both words are guest-controlled addresses, so the stores are
+            // fault-safe best-effort writes, matching the kernel exactly:
+            // its `put_user` for the set-TID words is unchecked, and a
+            // clone whose TID pointers are bogus still succeeds with the
+            // writes silently skipped (verified natively).
+            if tid > 0 {
+                if flags & libc::CLONE_PARENT_SETTID as u64 != 0 {
+                    copy_to_guest(parent_tid, &(tid as i32).to_ne_bytes());
                 }
-                // Join the thread list before the parent's `clone` returns. A
-                // parent that then ends its own thread (`pthread_exit` from
-                // main) waits for every thread on the list; a child not yet on
-                // it would be left behind as the process exits.
-                let mut child = Thread::from_state(process, child_state, clear_child_tid);
-                child.register();
-                // A failed send means the parent already gave up; nothing to do.
-                let _ = tx.send(tid);
-                // The child runs until its guest issues `exit`/`exit_group`,
-                // which returns the run loop and ends this host thread — the
-                // rest of the process keeps running.
-                let reason = child.run();
-                // A fork inside this thread made it the main — and only —
-                // thread of a new process (see `Thread::reset_after_fork`).
-                // This host thread is all that child process has, so drive it
-                // the way `execv` drives the initial thread — installing any
-                // committed execve image and re-entering — and end the
-                // process with the guest's status. Nothing to clear-and-wake:
-                // a fork child has no joiner inside it.
-                if child.is_main()
-                    && let Ok(reason) = reason
-                {
-                    let code =
-                        crate::sys::linux::exec::drive(&mut child, reason).unwrap_or_else(|err| {
-                            eprintln!("chimera: fork child failed: {err}");
-                            127
-                        });
-                    std::process::exit(code);
+                if flags & libc::CLONE_CHILD_SETTID as u64 != 0 {
+                    copy_to_guest(child_tid, &(tid as i32).to_ne_bytes());
                 }
-                // Honor CLONE_CHILD_CLEARTID: clear the word and wake a joiner.
-                child.clear_tid_and_wake();
-            });
+            }
+            // Join the thread list before the parent's `clone` returns. A
+            // parent that then ends its own thread (`pthread_exit` from
+            // main) waits for every thread on the list; a child not yet on
+            // it would be left behind as the process exits.
+            let mut child = Thread::from_state(process, child_state, clear_child_tid);
+            child.register();
+            // A failed send means the parent already gave up; nothing to do.
+            let _ = tx.send(tid);
+            // The child runs until its guest issues `exit`/`exit_group`,
+            // which returns the run loop and ends this host thread — the
+            // rest of the process keeps running.
+            let reason = child.run();
+            // A fork inside this thread made it the main — and only —
+            // thread of a new process (see `Thread::reset_after_fork`).
+            // This host thread is all that child process has, so drive it
+            // the way `execv` drives the initial thread — installing any
+            // committed execve image and re-entering — and end the
+            // process with the guest's status. Nothing to clear-and-wake:
+            // a fork child has no joiner inside it.
+            if child.is_main()
+                && let Ok(reason) = reason
+            {
+                let code =
+                    crate::sys::linux::exec::drive(&mut child, reason).unwrap_or_else(|err| {
+                        eprintln!("chimera: fork child failed: {err}");
+                        127
+                    });
+                std::process::exit(code);
+            }
+            // Honor CLONE_CHILD_CLEARTID: clear the word and wake a joiner.
+            child.clear_tid_and_wake();
+        });
 
         match spawned {
-            // Drop the join handle: the host thread is detached and reclaims
-            // itself when its closure returns. The child is tracked by its
-            // kernel TID through the shared address space, never by a retained
-            // handle (an accumulating roster would leak under thread churn).
-            Ok(_handle) => rx.recv().unwrap_or(-(libc::EAGAIN as i64)),
+            // The host thread is detached and reclaims itself when its closure
+            // returns. The child is tracked by its kernel TID through the
+            // shared address space, never by a retained handle (an
+            // accumulating roster would leak under thread churn).
+            Ok(()) => rx.recv().unwrap_or(-(libc::EAGAIN as i64)),
             Err(_) => -(libc::EAGAIN as i64),
         }
     }
@@ -633,6 +632,39 @@ impl Thread {
         }
         None
     }
+}
+
+/// Run `f` on a detached host thread named `chimera-guest`, created with
+/// `pthread_create` rather than `std::thread`. Every `std::thread` takes a
+/// process-wide lock inside std (the stack-overflow handler's thread-info
+/// map) as it starts and as it exits, and std offers no way to hold it
+/// across a fork. A guest that forks while a sibling thread starts or exits
+/// would copy that lock held into the child, which then hangs the first
+/// time it takes it: when it creates a thread, or when its process exits
+/// through std's runtime cleanup.
+fn spawn_detached<F: FnOnce() + Send + 'static>(f: F) -> io::Result<()> {
+    extern "C" fn start<F: FnOnce()>(arg: *mut c_void) -> *mut c_void {
+        // SAFETY: `arg` is the `Box<F>` leaked below, handed over exactly once.
+        let f = unsafe { Box::from_raw(arg.cast::<F>()) };
+        unsafe { libc::pthread_setname_np(libc::pthread_self(), c"chimera-guest".as_ptr()) };
+        f();
+        ptr::null_mut()
+    }
+
+    let arg = Box::into_raw(Box::new(f));
+    unsafe {
+        let mut attr: libc::pthread_attr_t = mem::zeroed();
+        libc::pthread_attr_init(&mut attr);
+        libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED);
+        let mut thread: libc::pthread_t = mem::zeroed();
+        let rc = libc::pthread_create(&mut thread, &attr, start::<F>, arg.cast());
+        libc::pthread_attr_destroy(&mut attr);
+        if rc != 0 {
+            drop(Box::from_raw(arg));
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+    }
+    Ok(())
 }
 
 /// The base `struct clone_args` (`CLONE_ARGS_SIZE_VER0`): the 8 `u64` fields
