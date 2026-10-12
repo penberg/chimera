@@ -14,8 +14,11 @@ use std::sync::{
 };
 
 use crate::{
-    Error, SystemCalls,
-    arch::dispatch::ThreadState,
+    Backend, Error, SystemCalls,
+    arch::{
+        dispatch::{EXIT_KIND_BLOCK, ThreadState},
+        x86::sud,
+    },
     sys::{
         linux::{exec::PreparedExec, signal},
         mmap::AddressSpace,
@@ -27,23 +30,27 @@ use crate::{
 /// highest real-time signal is used as the one least likely to collide with a
 /// signal the guest itself installs. A do-nothing handler is installed for it,
 /// without `SA_RESTART`, purely so the kernel interrupts the blocking syscall.
-fn interrupt_signal() -> libc::c_int {
+pub fn interrupt_signal() -> libc::c_int {
     libc::SIGRTMAX()
 }
 
-extern "C" fn interrupt_noop(_sig: libc::c_int) {}
+extern "C" fn interrupt(_sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut libc::c_void) {
+    // A thread running guest code natively has no safepoint to reach, so the
+    // signal is its safepoint.
+    sud::preempt(uc, EXIT_KIND_BLOCK);
+}
 
 static INSTALL_INTERRUPT: Once = Once::new();
 
-/// Install the no-op handler for [`interrupt_signal`] once per process.
-fn install_interrupt_handler() {
-    INSTALL_INTERRUPT.call_once(|| unsafe {
+/// Install the no-op handler for [`interrupt_signal`].
+pub fn install_interrupt_handler() {
+    unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = interrupt_noop as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_flags = 0; // no SA_RESTART: a parked syscall must surface EINTR
+        sa.sa_sigaction = interrupt as *const () as usize;
+        libc::sigfillset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_SIGINFO; // no SA_RESTART: a parked syscall must surface EINTR
         libc::sigaction(interrupt_signal(), &sa, std::ptr::null_mut());
-    });
+    }
 }
 
 /// The shared state of a guest process: one per process, referenced by every
@@ -112,11 +119,17 @@ pub struct Process {
     /// `execve` validated it and consumed by the exec driver on the main host
     /// thread once the group has drained. Written before `execing` is set.
     exec_request: Mutex<Option<PreparedExec>>,
+    /// How every thread of the process executes guest code.
+    pub backend: Backend,
 }
 
 impl Process {
-    pub fn new(handler: Box<dyn SystemCalls>, code_cache_size: usize) -> Result<Self, Error> {
-        install_interrupt_handler();
+    pub fn new(
+        handler: Box<dyn SystemCalls>,
+        code_cache_size: usize,
+        backend: Backend,
+    ) -> Result<Self, Error> {
+        INSTALL_INTERRUPT.call_once(install_interrupt_handler);
         // Own the host SIGSEGV/SIGBUS slot so self-modifying-code write traps are
         // caught synchronously (see [`crate::sys::linux::fault`]).
         crate::sys::linux::fault::install();
@@ -131,6 +144,7 @@ impl Process {
             last_exit_status: AtomicI32::new(0),
             execing: AtomicBool::new(false),
             exec_request: Mutex::new(None),
+            backend,
         })
     }
 
@@ -309,12 +323,15 @@ impl Process {
     /// guards, which unlock on drop in both processes — the `pthread_atfork`
     /// discipline, applied at the one place Chimera forwards a fork. The
     /// lock order nests like `request_exec` (`exec_request`, then
-    /// `threads`); `addr_space` is never nested with either.
+    /// `threads`); `addr_space` is never nested with either. The vcpu
+    /// backend's process-wide lock, which the child takes when it attaches
+    /// again, is held the same way.
     pub fn lock_for_fork(&self) -> ForkLocks<'_> {
         ForkLocks {
             _exec_request: self.exec_request.lock().unwrap(),
             _threads: self.threads.lock().unwrap(),
             _addr_space: self.addr_space.lock().unwrap(),
+            _sud: sud::lock_for_fork(),
         }
     }
 
@@ -344,6 +361,7 @@ pub struct ForkLocks<'a> {
     _exec_request: MutexGuard<'a, Option<PreparedExec>>,
     _threads: MutexGuard<'a, Vec<*const ThreadState>>,
     _addr_space: MutexGuard<'a, AddressSpace>,
+    _sud: sud::ForkLock,
 }
 
 // SAFETY: the `handler` field is already `Send + Sync` (the `SystemCalls`

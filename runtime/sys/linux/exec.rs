@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::{
-    Error, SystemCalls,
+    Backend, Error, SystemCalls,
     process::Process,
     sys::mmap::{AddressSpace, copy_from_guest},
 };
@@ -37,6 +37,7 @@ pub fn execv(
     envs: Option<&[(OsString, OsString)]>,
     handler: Box<dyn SystemCalls>,
     code_cache_size: usize,
+    backend: Backend,
 ) -> Result<i32, Error> {
     // The first image's argv and envp come from the embedder: argv[0] is the
     // program path, then the supplied args; the environment is the explicit set
@@ -63,10 +64,10 @@ pub fn execv(
     };
     splice_shebang(&mut req, &*handler)?;
 
-    let main = load_elf(&req.path)?;
+    let main = load_elf(&req.path, backend)?;
     let (rip, interp_base, interp) = match &main.interp {
         Some(interp_path) => {
-            let interp = load_elf(interp_path)?;
+            let interp = load_elf(interp_path, backend)?;
             (interp.entry, interp.base, Some(interp))
         }
         None => (main.entry, 0, None),
@@ -78,7 +79,7 @@ pub fn execv(
     // The process's shared state: the address space, code cache, and the
     // embedder's syscall handler. The first thread is created against it; future
     // `clone(CLONE_VM)` siblings will share clones of this `Arc`.
-    let process = Arc::new(Process::new(handler, code_cache_size)?);
+    let process = Arc::new(Process::new(handler, code_cache_size, backend)?);
     // Publish the process for the synchronous fault handler before any guest
     // code runs, so a self-modifying-code write trap can reach the address
     // space.
@@ -141,10 +142,11 @@ pub fn drive(thread: &mut Thread, mut reason: ExitReason) -> Result<i32, Error> 
                 // Tear down the old image (unmapping its regions, so a fixed
                 // ET_EXEC can reuse its addresses), then map the new one.
                 thread.addr_space().reset();
-                let main = map_elf(&parsed)?;
+                let backend = thread.process().backend;
+                let main = map_elf(&parsed, backend)?;
                 let (rip, interp_base, interp) = match &parsed_interp {
                     Some(parsed_interp) => {
-                        let interp = map_elf(parsed_interp)?;
+                        let interp = map_elf(parsed_interp, backend)?;
                         (interp.entry, interp.base, Some(interp))
                     }
                     None => (main.entry, 0, None),

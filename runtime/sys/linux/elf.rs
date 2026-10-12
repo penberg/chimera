@@ -11,7 +11,7 @@ use std::{
     ptr,
 };
 
-use crate::Error;
+use crate::{Backend, Error};
 
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -74,8 +74,8 @@ pub struct LoadedElf {
 }
 
 /// Read, validate, and map an ELF image: [`parse_elf`] followed by [`map_elf`].
-pub fn load_elf(path: &Path) -> Result<LoadedElf, Error> {
-    map_elf(&parse_elf(path)?)
+pub fn load_elf(path: &Path, backend: Backend) -> Result<LoadedElf, Error> {
+    map_elf(&parse_elf(path)?, backend)
 }
 
 /// An ELF image read and validated, but not yet mapped. Producing one touches
@@ -228,7 +228,7 @@ pub fn parse_elf(path: &Path) -> Result<ParsedElf, Error> {
 
 /// Map a parsed ELF image into memory. The commit phase: the reservation and
 /// `PT_LOAD` mappings it makes cannot be rolled back.
-pub fn map_elf(parsed: &ParsedElf) -> Result<LoadedElf, Error> {
+pub fn map_elf(parsed: &ParsedElf, backend: Backend) -> Result<LoadedElf, Error> {
     let ParsedElf {
         ehdr,
         phdrs,
@@ -282,16 +282,10 @@ pub fn map_elf(parsed: &ParsedElf) -> Result<LoadedElf, Error> {
         if ph.p_flags & PF_W != 0 {
             prot |= libc::PROT_WRITE;
         }
-        // W^X: Chimera never executes guest pages natively — the dispatcher
-        // reads them and runs translated blocks from the code cache — so an
-        // executable segment is mapped read-only rather than `PROT_EXEC`. This
-        // mirrors the `PROT_EXEC` stripping the syscall driver applies to the
-        // libraries the dynamic linker maps later; here it covers the
-        // executable and interpreter images the runtime maps itself, which
-        // never pass through that path. `PROT_READ` keeps them translatable.
         if ph.p_flags & PF_X != 0 {
-            prot |= libc::PROT_READ;
+            prot |= libc::PROT_EXEC;
         }
+        let prot = backend.host_prot(prot);
 
         let fixed = if ehdr.e_type == ET_EXEC {
             libc::MAP_FIXED_NOREPLACE

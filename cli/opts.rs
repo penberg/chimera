@@ -1,6 +1,7 @@
 //! Command-line option parsing for the `chimera` program.
 
 use argh::FromArgs;
+use chimera::Backend;
 
 /// Run a command in zero-setup sandbox.
 #[derive(FromArgs)]
@@ -128,6 +129,12 @@ pub struct RunCmd {
     #[argh(option)]
     pub code_cache_size: Option<usize>,
 
+    /// how to execute guest code: `dbt` (the default) translates it and
+    /// confines control flow; `sud` runs it natively and traps only its
+    /// system calls, with Linux's syscall user dispatch (env: CHIMERA_BACKEND)
+    #[argh(option, from_str_fn(parse_backend))]
+    pub backend: Option<Backend>,
+
     /// the branch point: `host` for the live host (the default), a kept
     /// filesystem's id, or a path to a change-set directory — the run stacks
     /// a fresh change-set on it and the source stays untouched
@@ -162,3 +169,14 @@ pub struct RunCmd {
 #[derive(FromArgs)]
 #[argh(subcommand, name = "version")]
 pub struct VersionCmd {}
+
+/// Parse a `--backend` or `CHIMERA_BACKEND` value.
+pub fn parse_backend(value: &str) -> Result<Backend, String> {
+    match value {
+        "dbt" => Ok(Backend::Translator),
+        "sud" => Ok(Backend::SyscallUserDispatch),
+        _ => Err(format!(
+            "unknown backend `{value}`: expected `dbt` or `sud`"
+        )),
+    }
+}
