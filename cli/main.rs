@@ -110,8 +110,10 @@ fn main() -> ExitCode {
 
 fn version() -> ExitCode {
     println!(
-        "chimera version {} linux x86-64 {}",
+        "chimera version {} {} {} {}",
         env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
         if chimera::mpk_enabled() {
             "mpk"
         } else {
