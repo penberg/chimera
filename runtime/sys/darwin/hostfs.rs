@@ -106,12 +106,15 @@ impl HostFs {
         flags
     }
 
-    /// The extra open flags confinement adds.
-    fn open_flags(&self) -> libc::c_int {
+    /// The caller's open flags with confinement applied. A confined open
+    /// refuses a symlink anywhere in the path with `O_NOFOLLOW_ANY`, which
+    /// subsumes the caller's `O_NOFOLLOW` — and must replace it, since the
+    /// kernel rejects the two together with `EINVAL`.
+    fn open_flags(&self, flags: libc::c_int) -> libc::c_int {
         if self.confined {
-            libc::O_NOFOLLOW_ANY
+            (flags & !libc::O_NOFOLLOW) | libc::O_NOFOLLOW_ANY
         } else {
-            0
+            flags
         }
     }
 
@@ -122,7 +125,7 @@ impl HostFs {
             libc::openat(
                 self.root_fd.as_raw_fd(),
                 crel.as_ptr(),
-                flags | self.open_flags(),
+                self.open_flags(flags),
                 mode as libc::c_uint,
             )
         };
