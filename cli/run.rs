@@ -17,12 +17,24 @@ use chimera::{HostFs, MountFlags, Namespace, OverlayFs, Personality, Sandbox, Vf
 use crate::opts::RunCmd;
 use crate::{fs, prompt};
 
+/// The shell a run with no program starts: the user's own where the host
+/// names one, otherwise the platform's default.
+fn default_shell() -> String {
+    env::var("SHELL").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") {
+            "/bin/zsh".into()
+        } else {
+            "/bin/bash".into()
+        }
+    })
+}
+
 pub fn run(mut cmd: RunCmd) -> ExitCode {
     // Only a shell Chimera starts on its own gets a badged prompt; a program
     // the user named runs exactly as typed.
     let implicit_shell = cmd.argv.is_empty();
     if implicit_shell {
-        cmd.argv.push("/bin/bash".into());
+        cmd.argv.push(default_shell());
     }
     // Route the guest's filesystem syscalls through a userspace VFS mounted
     // at `/`. Every run works in a filesystem: by default it branches one —
@@ -124,19 +136,31 @@ pub fn run(mut cmd: RunCmd) -> ExitCode {
             }
         }
     };
-    // Held for the whole run: dropping the prompt removes the rc file.
+    // Badge the shell Chimera started itself, through whichever startup
+    // mechanism that shell has. Held for the whole run: dropping the prompt
+    // removes its startup files.
+    let mut zdotdir: Option<PathBuf> = None;
     let _prompt = if implicit_shell && !cmd.no_prompt {
-        match prompt::Prompt::new(fsys.as_ref()) {
-            Ok(prompt) => {
-                cmd.argv.push("--rcfile".into());
-                cmd.argv
-                    .push(prompt.rcfile().to_string_lossy().into_owned());
-                Some(prompt)
-            }
-            Err(err) => {
-                eprintln!("chimera: cannot configure prompt: {err}");
-                None
-            }
+        let badge = fsys.as_ref().map(prompt::filesystem_badge);
+        match prompt::shell_kind(Path::new(&cmd.argv[0])) {
+            Some(shell) => match prompt::Prompt::new(&shell, badge.as_deref()) {
+                Ok(prompt) => {
+                    match shell {
+                        prompt::Shell::Bash => {
+                            cmd.argv.push("--rcfile".into());
+                            cmd.argv
+                                .push(prompt.rcfile().to_string_lossy().into_owned());
+                        }
+                        prompt::Shell::Zsh => zdotdir = Some(prompt.dir().to_path_buf()),
+                    }
+                    Some(prompt)
+                }
+                Err(err) => {
+                    eprintln!("chimera: cannot configure prompt: {err}");
+                    None
+                }
+            },
+            None => None,
         }
     } else {
         None
@@ -170,6 +194,17 @@ pub fn run(mut cmd: RunCmd) -> ExitCode {
     if let Some(mib) = cmd.code_cache_size {
         sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
     }
+    // zsh finds its startup files where `$ZDOTDIR` points. `Sandbox::env`
+    // replaces inheritance, so the host environment is replayed around it.
+    if let Some(dir) = &zdotdir {
+        for (key, value) in env::vars_os() {
+            if key != "ZDOTDIR" {
+                sandbox.env(key, value);
+            }
+        }
+        sandbox.env("ZDOTDIR", dir);
+    }
+
     let personality = Personality::new(Namespace::with_root(root, MountFlags::NONE));
     sandbox.system_calls(personality);
 
