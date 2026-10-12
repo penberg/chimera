@@ -295,6 +295,14 @@ pub fn read_tsd_base() -> u64 {
     v & !7
 }
 
+/// Byte offset of the TSD array inside libpthread's pthread struct, recovered
+/// from the calling thread (whose TSD base the kernel set and whose struct
+/// `pthread_self` names). A libpthread layout constant, so any thread's pair
+/// yields the same value.
+pub fn host_tsd_offset() -> u64 {
+    read_tsd_base().wrapping_sub(unsafe { libc::pthread_self() } as u64)
+}
+
 /// Dump the full register file when `pc` is the `CHIMERA_BREAK` target (see
 /// `crate::trace`). Checked on every cache entry, so a spin inside a nested
 /// guest call is caught as well as one in the main run.

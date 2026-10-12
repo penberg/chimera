@@ -218,6 +218,21 @@ impl AddressSpace {
         )
     }
 
+    /// Whether `[start, start+len)` lies entirely within one recorded guest
+    /// region — the precondition for the runtime to unmap it on the guest's
+    /// behalf.
+    #[cfg(target_os = "macos")]
+    pub fn covers_range(&self, start: usize, len: usize) -> bool {
+        match self.regions.binary_search_by_key(&start, |r| r.start) {
+            Ok(i) => start.saturating_add(len) <= self.regions[i].start + self.regions[i].len,
+            Err(0) => false,
+            Err(i) => {
+                let region = &self.regions[i - 1];
+                start.saturating_add(len) <= region.start.saturating_add(region.len)
+            }
+        }
+    }
+
     /// Whether `addr` falls in a mapping the runtime made for the guest.
     /// `regions` is kept sorted and coalesced, so this is a binary search.
     fn in_guest_region(&self, addr: usize) -> bool {

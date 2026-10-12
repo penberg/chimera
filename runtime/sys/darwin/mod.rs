@@ -1,8 +1,9 @@
 //! The Darwin host: Mach-O loading (`macho`), the in-process linker (`dyld`),
 //! the process bootstrap and `execve` (`exec`), the per-thread run loop
 //! (`thread`), the syscall policy and raw-syscall bridge (`policy`,
-//! `syscall`), guest signals and synchronous faults (`signal`, `fault`), and
-//! the `fork` trap (`spawn`).
+//! `syscall`), guest signals and synchronous faults (`signal`, `fault`), the
+//! `fork` trap (`spawn`), and the callbacks a system library delivers on
+//! threads of its own (`callback`, `handoff`).
 //!
 //! The statics below are the process-wide facts the run loop answers for the
 //! guest in place of the shared libSystem and dyld, whose own answers would
@@ -20,9 +21,11 @@ use std::{
 
 use crate::sys::mmap::{copy_from_guest, copy_to_guest};
 
+pub mod callback;
 pub mod dyld;
 pub mod exec;
 pub mod fault;
+pub mod handoff;
 pub mod macho;
 pub mod policy;
 pub mod signal;

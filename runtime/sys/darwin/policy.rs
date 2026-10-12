@@ -5,6 +5,8 @@
 //! and hands everything else to the embedder hooks. BSD `exit` is intercepted
 //! earlier, in the dispatch loop.
 
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 use crate::{SyscallResult, SystemCall, SystemCalls, sys::host_syscall};
 
 use super::thread::Thread;
@@ -37,6 +39,9 @@ const SYS_SIGSUSPEND_NOCANCEL: u64 = 410;
 const SYS_PIPE: u64 = 42;
 /// `pthread_create`'s kernel primitive: create a new BSD thread.
 const SYS_BSDTHREAD_CREATE: u64 = 360;
+/// `pthread_exit`'s kernel primitive: free the stack, wake the joiner, and
+/// terminate the calling thread.
+const SYS_BSDTHREAD_TERMINATE: u64 = 361;
 /// libpthread's thread-registration syscall (redundant with the runtime's).
 const SYS_BSDTHREAD_REGISTER: u64 = 366;
 /// Machine-dependent syscall that installs the guest's `TPIDRRO_EL0` value.
@@ -49,6 +54,11 @@ const SYS_PROC_INFO: u64 = 336;
 const PROC_INFO_CALL_PIDINFO: u64 = 2;
 const PROC_PIDPATHINFO: u64 = 11;
 
+/// Cached `thread_start` (libpthread's kernel thread entry). The guest shares
+/// Chimera's libpthread, whose init already ran `bsdthread_register`, so we never
+/// see the guest register — resolve the (private-export) symbol directly.
+static THREAD_START: AtomicU64 = AtomicU64::new(0);
+
 /// This process's own Mach task port, the `target` a guest passes when it is
 /// operating on its own address space.
 fn mach_task_self() -> u64 {
@@ -56,6 +66,17 @@ fn mach_task_self() -> u64 {
         static mut mach_task_self_: libc::c_uint;
     }
     unsafe { mach_task_self_ as u64 }
+}
+
+fn thread_start_addr() -> u64 {
+    let cached = THREAD_START.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    const RTLD_DEFAULT: *mut core::ffi::c_void = (-2isize) as *mut core::ffi::c_void;
+    let addr = unsafe { libc::dlsym(RTLD_DEFAULT, c"thread_start".as_ptr()) as u64 };
+    THREAD_START.store(addr, Ordering::Relaxed);
+    addr
 }
 
 pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &dyn SystemCalls) {
@@ -194,19 +215,92 @@ pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &dyn SystemC
         SYS_BSDTHREAD_REGISTER => {
             call.set_result(SyscallResult::Ok(0));
         }
-        // Never forwarded: the host kernel would start a native thread running
-        // the guest untranslated, outside the sandbox. Refused until guest
-        // threads are run on host threads of Chimera's own; `pthread_create`
-        // reports the failure to the guest.
-        SYS_BSDTHREAD_CREATE => {
-            call.set_result(SyscallResult::Error(libc::ENOTSUP));
-        }
-        // Kernel-side fork+exec in one trap: forwarding it would start the
-        // spawned image natively, outside the sandbox. Refused until it is
-        // emulated as fork plus the in-process exec; libc's `posix_spawn`
-        // hands the error back to the guest.
-        SYS_POSIX_SPAWN => {
-            call.set_result(SyscallResult::Error(libc::ENOTSUP));
+        // `pthread_exit` reaches the kernel here. Never forward it directly — the
+        // kernel would terminate the host thread mid-run-loop, leaking the thread
+        // registration (its run guard never drops) and, for the main thread,
+        // corrupting the Rust runtime. For a worker: perform the kernel's guest-
+        // visible death effects here, synchronously — the stack munmap, and the
+        // joiner handshake (write `kport` with cleared generation bits into the
+        // exit gate, then a WAKE_ALL, exactly xnu's `uthread_joiner_wake`) — then
+        // stop the run loop. Deferring these to the real syscall in
+        // `guest_thread_entry` reorders them past the joiner's own progress: the
+        // woken joiner reuses the cached stack region and pthread struct for the
+        // next thread, and the late kernel munmap/wake then hit the reused
+        // addresses (an intermittent create+join deadlock or a
+        // "pthread_join() wake failure" abort under churn). Only the port
+        // release and the host thread's own death stay deferred; an extra live
+        // port name is invisible to the guest. For the main thread: POSIX keeps
+        // the process alive until the last thread ends, so park in
+        // `wait_for_others` and exit with the resulting status.
+        SYS_BSDTHREAD_TERMINATE => {
+            // No guest code runs here. By the time a thread reaches this
+            // syscall its own libpthread has already released its
+            // thread-local storage — measured: the thread faults on its own
+            // thread pointer inside any guest call made from this arm.
+            //
+            // The thread-local destructors are therefore meant to have run
+            // earlier, from `chimera_tlv_finalize`, which libpthread's own TSD
+            // cleanup would reach while the storage is still there. Measured,
+            // that hook does not fire: every observed drain happens at the
+            // end-of-run-loop backstop instead, which is *after* the joiner
+            // wake below — so a `pthread_join` can return before the thread's
+            // destructors have run. That is the `abi/tls-dtor.c` flake, and
+            // the reason this arm cannot simply drain them itself.
+            thread.tearing_down = true;
+            if thread.is_main() {
+                let status = thread.process().wait_for_others(&thread.state);
+                thread.exit_code = status;
+            } else {
+                let a = &call.args;
+                // The stack to free is whatever the guest passed. Unmap it
+                // only if it is entirely inside a region the runtime
+                // recorded: this arm runs the kernel's side of the teardown
+                // by hand, and a range that is not a recorded guest mapping
+                // is either already gone or someone else's — a live sibling's
+                // stack, which unmapping turns into a fault with no
+                // bookkeeping to explain it.
+                let mut free_stack = false;
+                if a[0] != 0 && a[1] != 0 {
+                    let mut space = thread.addr_space();
+                    if space.covers_range(a[0] as usize, a[1] as usize) {
+                        space.remove_region(a[0] as usize, a[1] as usize);
+                        space.note_unmap(a[0] as usize, a[1] as usize);
+                        free_stack = true;
+                    } else if crate::trace::trace() {
+                        eprintln!(
+                            "chimera: thread teardown skips unrecorded stack {:#x}+{:#x}",
+                            a[0], a[1]
+                        );
+                    }
+                }
+                // Leave the thread group and stop before releasing the
+                // joiner. Waking it first hands it a thread it is entitled to
+                // reap — and reaping frees the pthread struct this thread's
+                // guest thread pointer still names, so any thread-local
+                // access left on this side lands in memory the joiner has
+                // already given back. Measured: a `mach_vm_deallocate` of
+                // exactly that struct arriving while this thread was still in
+                // the group list.
+                thread.running = false;
+                thread.process().unregister_thread(&*thread.state);
+                if a[3] != 0 {
+                    signal_joiner(a[2], a[3]);
+                }
+                // The stack is *not* unmapped here. Guest code still runs on
+                // it after this syscall — libpthread reaches Chimera's TLV key
+                // destructor, and the thread-local destructors it owes run as
+                // guest calls on this very stack. Hand the range to the
+                // deferred real `bsdthread_terminate` instead, which frees it
+                // as the host thread dies: the same moment the kernel would,
+                // and after the last guest frame is gone.
+                thread.terminate_args = if free_stack {
+                    Some([a[0], a[1], a[2], 0])
+                } else {
+                    Some([0, 0, a[2], 0])
+                };
+            }
+            thread.running = false;
+            call.set_result(SyscallResult::Ok(0));
         }
         // Signal virtualization: dispositions, masks, and stacks are recorded
         // by the runtime, never forwarded raw — a forwarded `sigaction` would
@@ -294,6 +388,13 @@ pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &dyn SystemC
                 call.set_result(SyscallResult::Error(errno));
             }
         },
+        // Kernel-side fork+exec in one trap: forwarding it would start the
+        // spawned image natively, outside the sandbox. Refused until it is
+        // emulated as fork plus the in-process exec; libc's `posix_spawn`
+        // hands the error back to the guest.
+        SYS_POSIX_SPAWN => {
+            call.set_result(SyscallResult::Error(libc::ENOTSUP));
+        }
         // Runtime-owned because of its pair-return ABI: the second descriptor
         // comes back in `x1`, which the generic forward path discards.
         SYS_PIPE => {
@@ -302,6 +403,25 @@ pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &dyn SystemC
                 thread.state.regs[1] = fd1;
             }
             call.set_result(result);
+        }
+        // `pthread_create` reaches the kernel here. Never forward it — the host
+        // kernel would start a native thread running the guest untranslated (a
+        // sandbox escape). Spawn a host thread of our own that runs the dispatch
+        // loop over the shared Process, entering `thread_start` with the kernel's
+        // thread-start register convention.
+        SYS_BSDTHREAD_CREATE => {
+            let thread_start = thread_start_addr();
+            if thread_start == 0 {
+                call.set_result(SyscallResult::Error(libc::EPERM));
+            } else {
+                let a = &call.args;
+                let ret = thread.spawn_bsdthread(a[0], a[1], a[2], a[3], a[4], thread_start);
+                if ret < 0 {
+                    call.set_result(SyscallResult::Error(-ret as i32));
+                } else {
+                    call.set_result(SyscallResult::Ok(ret));
+                }
+            }
         }
         _ => handler.do_syscall(call),
     }
@@ -332,4 +452,33 @@ const MAP_JIT: u64 = 0x0800;
 /// the `pthread_jit_write_protect_np` interception in the dispatch loop.
 fn strip_map_jit(call: &mut SystemCall) {
     call.args[3] &= !MAP_JIT;
+}
+
+const SYS_ULOCK_WAKE: u64 = 516;
+const UL_UNFAIR_LOCK: u64 = 2;
+const ULF_WAKE_ALL: u64 = 0x100;
+const ULF_WAKE_ALLOW_NON_OWNER: u64 = 0x400;
+const ULF_NO_ERRNO: u64 = 0x0100_0000;
+
+unsafe extern "C" {
+    fn semaphore_signal(semaphore: u32) -> i32;
+}
+
+/// The joiner half of `bsdthread_terminate`'s kernel contract.
+/// `sema_or_ulock` is a semaphore port for a custom-stack thread (mach port
+/// names carry the default generation bits, `0b11`) and otherwise the aligned
+/// address of the joiner's `tl_exit_gate` ulock. For the gate, xnu's
+/// `uthread_joiner_wake` stores the dead thread's `kport` with the generation
+/// bits cleared — the "thread is gone" value `pthread_join` polls for — and
+/// then wakes all waiters as a non-owner.
+fn signal_joiner(kport: u64, sema_or_ulock: u64) {
+    if sema_or_ulock & 3 == 3 {
+        unsafe { semaphore_signal(sema_or_ulock as u32) };
+    } else {
+        let gate = sema_or_ulock as *const AtomicU32;
+        unsafe { (*gate).store(kport as u32 & !3, Ordering::Release) };
+        let op = UL_UNFAIR_LOCK | ULF_WAKE_ALL | ULF_WAKE_ALLOW_NON_OWNER | ULF_NO_ERRNO;
+        let call = SystemCall::new(SYS_ULOCK_WAKE, [op, sema_or_ulock, 0, 0, 0, 0, 0, 0]);
+        host_syscall(&call);
+    }
 }

@@ -99,6 +99,7 @@ pub fn execv(
     super::set_guest_args(frame.argc as i32, frame.argv, frame.envp, frame.apple);
     let process = Arc::new(Process::new(handler, code_cache_size)?);
     super::fault::set_process(&process);
+    super::callback::set_process(&process);
     start_profiler(&process);
     let mut thread = Thread::new(process, image.entry, frame.sp)?;
     record_regions(&mut thread, &image, &frame);

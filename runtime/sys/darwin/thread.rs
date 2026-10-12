@@ -5,7 +5,9 @@
 //! pending guest signal, answer the branches that never reach the translator
 //! — the return sentinels and the libSystem [`Escapes`] — run the vcpu, and
 //! handle the [`Exit`] it returns, until the guest issues BSD `exit` or its
-//! `main` returns through the seeded link register.
+//! `main` returns through the seeded link register. Multiple guest threads run
+//! concurrently: `bsdthread_create` spawns a host thread that runs this loop
+//! over the shared [`Process`] (see [`Thread::spawn_bsdthread`]).
 //!
 //! The host-side thread interrupt — the reserved signal that pulls a sibling
 //! out of a parked syscall — lives here too, behind the neutral `sys::thread`
@@ -17,7 +19,7 @@ use crate::{
     Error, SystemCall,
     arch::dispatch::{
         CALL_RETURN_SENTINEL, RETURN_SENTINEL, SIGRETURN_SENTINEL, ThreadState, Translator, X0, X1,
-        X2, X3, X4, X5, X6, X7, X16, read_tsd_base,
+        X2, X3, X4, X5, X6, X7, X16, host_tsd_offset, publish_ctx, read_tsd_base,
     },
     process::Process,
     sys::darwin::signal::Signals,
@@ -75,6 +77,16 @@ pub fn interrupt(tid: i32) {
 
 // === Guest threads ===
 
+// Not exposed by the `libc` crate on macOS, but a standard pthread entry: set
+// the thread's stack (lowest address + size) so libpthread does not allocate one.
+unsafe extern "C" {
+    fn pthread_attr_setstack(
+        attr: *mut libc::pthread_attr_t,
+        stackaddr: *mut libc::c_void,
+        stacksize: libc::size_t,
+    ) -> libc::c_int;
+}
+
 unsafe extern "C" {
     /// Declared here because `libc`'s binding is deprecated in favor of the
     /// `mach2` crate, which the runtime does not otherwise need.
@@ -99,6 +111,14 @@ struct Escapes {
     argc: u64,
     progname: u64,
     tlv_finalize: u64,
+    dispatch_apply: u64,
+    dispatch_apply_f: u64,
+    dispatch_async: u64,
+    dispatch_async_f: u64,
+    dispatch_group_async: u64,
+    dispatch_group_async_f: u64,
+    block_copy: u64,
+    block_release: u64,
     tlv_atexit: u64,
     cxa_thread_atexit: u64,
     cxa_atexit: u64,
@@ -137,6 +157,14 @@ impl Escapes {
             argv: symbol(c"_NSGetArgv"),
             argc: symbol(c"_NSGetArgc"),
             progname: symbol(c"getprogname"),
+            dispatch_apply: symbol(c"dispatch_apply"),
+            dispatch_apply_f: symbol(c"dispatch_apply_f"),
+            dispatch_async: symbol(c"dispatch_async"),
+            dispatch_async_f: symbol(c"dispatch_async_f"),
+            dispatch_group_async: symbol(c"dispatch_group_async"),
+            dispatch_group_async_f: symbol(c"dispatch_group_async_f"),
+            block_copy: symbol(c"_Block_copy"),
+            block_release: symbol(c"_Block_release"),
             tlv_atexit: symbol(c"_tlv_atexit"),
             cxa_thread_atexit: symbol(c"__cxa_thread_atexit"),
             cxa_atexit: symbol(c"__cxa_atexit"),
@@ -227,6 +255,12 @@ pub struct Thread {
     /// arm64 it is both first argument and result register, so the errno
     /// writeback destroys it.
     restart: Option<(u64, u64, u64)>,
+    /// `bsdthread_terminate` arguments for the real syscall `guest_thread_entry`
+    /// issues as the host thread's last act. The policy has already performed
+    /// the guest-visible death effects (stack munmap, joiner wake) in guest
+    /// program order, so only the Mach port slot is populated — the deferred
+    /// syscall releases the port and terminates the host thread, nothing more.
+    pub terminate_args: Option<[u64; 4]>,
 }
 
 impl Thread {
@@ -249,7 +283,12 @@ impl Thread {
             signals,
             restart: None,
             tlv_dtors: Vec::new(),
+            terminate_args: None,
         })
+    }
+
+    pub fn is_main(&self) -> bool {
+        self.is_main
     }
 
     /// Rebuild bookkeeping in the child of a forwarded `fork`. The caller is
@@ -264,6 +303,7 @@ impl Thread {
         self.is_main = true;
         let port = unsafe { mach_thread_self() };
         self.state.tid.store(port as i32, Ordering::Release);
+        crate::sys::darwin::callback::mark_fork_child();
         self.process.reset_after_fork(&self.state);
         // The profiler thread, like every other sibling, did not survive the
         // fork; a child under CHIMERA_PROFILE=1 restarts its own.
@@ -293,6 +333,103 @@ impl Thread {
         &self.process
     }
 
+    /// Spawn a guest thread for `bsdthread_create`: run `thread_start` (a shared-
+    /// libpthread address) on a fresh host thread with the kernel's thread-start
+    /// register convention, over this thread's shared [`Process`].
+    ///
+    /// The host thread is created with a stack Chimera allocates itself (via
+    /// `pthread_attr_setstack`). This is load-bearing: Chimera and the guest
+    /// share one libpthread, and if libpthread allocated the host thread's stack
+    /// from its own cache it would reclaim the *guest* thread's stack region
+    /// (allocated outside libpthread's tracking), unmapping it out from under the
+    /// running guest thread.
+    pub fn spawn_bsdthread(
+        &self,
+        func: u64,
+        arg: u64,
+        stack: u64,
+        pthread: u64,
+        flags: u64,
+        thread_start: u64,
+    ) -> i64 {
+        let mut state = ThreadState::new(thread_start, stack);
+        state.regs[X0] = pthread;
+        state.regs[X2] = func;
+        state.regs[X3] = arg;
+        state.regs[X4] = stack;
+        // The kernel ORs bit 28 into the flags when it starts the thread (the
+        // value libpthread passed to `bsdthread_create` does not have it); with
+        // it clear, `_pthread_start` takes an abort (`brk`) path. Match that.
+        state.regs[X5] = flags | 0x1000_0000;
+        // The kernel points the new thread's TSD base at the pthread struct's
+        // TSD array before it runs (`_pthread_start` asserts it). The array
+        // offset within the struct is libpthread's, not ours — recover it from
+        // this (host) thread, where base and struct are both readable.
+        state.guest_tsd = pthread.wrapping_add(host_tsd_offset());
+
+        const HOST_STACK_SIZE: usize = 1 << 20; // 1 MiB for the Rust run loop
+        let host_stack = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                HOST_STACK_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if host_stack == libc::MAP_FAILED {
+            return -(libc::EAGAIN as i64);
+        }
+
+        let report = Arc::new(crate::sys::darwin::handoff::Handoff::new());
+        let ctx = Box::new(GuestThreadCtx {
+            process: Arc::clone(&self.process),
+            state,
+            report: Arc::clone(&report),
+        });
+
+        let mut attr: libc::pthread_attr_t = unsafe { std::mem::zeroed() };
+        let mut tid: libc::pthread_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::pthread_attr_init(&mut attr);
+            pthread_attr_setstack(&mut attr, host_stack, HOST_STACK_SIZE);
+            libc::pthread_attr_setdetachstate(&mut attr, libc::PTHREAD_CREATE_DETACHED);
+            let rc = libc::pthread_create(
+                &mut tid,
+                &attr,
+                guest_thread_entry,
+                Box::into_raw(ctx) as *mut libc::c_void,
+            );
+            libc::pthread_attr_destroy(&mut attr);
+            rc
+        };
+        if rc != 0 {
+            unsafe { libc::munmap(host_stack, HOST_STACK_SIZE) };
+            return -(libc::EAGAIN as i64);
+        }
+        report.recv() as i64
+    }
+
+    /// Build a non-main thread from a prepared register state, sharing `process`.
+    fn from_state(process: Arc<Process>, mut state: Box<ThreadState>) -> Self {
+        let signals = Signals::new(Arc::clone(&process.sig_table));
+        state.pending_set = signals.pending_set_ptr() as u64;
+        Self {
+            state,
+            vcpu: Box::new(Translator::new(Arc::clone(&process))),
+            process,
+            running: false,
+            exit_code: 0,
+            is_main: false,
+            tearing_down: false,
+            signals,
+            restart: None,
+            tlv_dtors: Vec::new(),
+            terminate_args: None,
+        }
+    }
+
     /// Lock and return the shared guest address space (the code cache and guest
     /// mappings). Held only across a resolve/translate, never across `dispatch`.
     pub fn addr_space(&self) -> crate::process::AddrSpaceGuard<'_> {
@@ -308,8 +445,8 @@ impl Thread {
 
     /// Run the guest from its current entry state. Returns when it issues BSD
     /// `exit` or its `main` returns to the seeded link register — neither is
-    /// forwarded to the host kernel — or when a committed `execve` dissolves
-    /// the group.
+    /// forwarded to the host kernel — or when a sibling's committed `execve`
+    /// dissolves the group.
     pub fn run(&mut self) -> Result<ExitReason, Error> {
         // The main guest thread inherits this host thread's own TSD base as its
         // guest view — libSystem is shared and already initialized, so the main
@@ -410,8 +547,9 @@ impl Thread {
                 Exit::Safepoint => {}
             }
         }
-        // The thread's stack outlives its run, so this is the right moment
-        // for the destructors it owes.
+        // The main thread's stack outlives its run, so this is the right
+        // moment for it; a worker ran its own at `bsdthread_terminate`,
+        // before the guest stack it needs was unmapped, and leaves nothing.
         self.run_tlv_destructors();
         self.process.record_exit_status(self.exit_code);
         // A committed execve dissolves the group instead of ending the
@@ -497,9 +635,9 @@ impl Thread {
             // libpthread's TSD cleanup, running as translated guest code, has
             // reached this thread's thread-local storage: the guest's exit
             // path is far enough along that the destructors are due, and not
-            // so far that a joiner has been released. Run them here; the end
-            // of the run loop keeps a backstop for a thread whose cleanup
-            // never reaches this key.
+            // so far that a joiner has been released. Run them here — the
+            // `bsdthread_terminate` arm keeps a backstop for a thread whose
+            // cleanup never reaches this key.
             self.run_tlv_destructors();
             self.tearing_down = true;
             ret(ts, 0);
@@ -662,6 +800,123 @@ impl Thread {
                 ret(ts, unsafe { libc::dlclose(handle as *mut libc::c_void) }
                     as u64);
             }
+        } else if pc == esc.dispatch_apply || pc == esc.dispatch_apply_f {
+            // `dispatch_apply` runs the guest's callback on libdispatch's own
+            // worker threads — host threads with no translator context, which
+            // would execute guest code natively off a page that is not
+            // executable (and, were it executable, outside the sandbox). Run
+            // the iterations on runtime-owned threads instead, through the
+            // callback machinery, with this thread taking iterations too.
+            // The iterations run here, in order, on this thread: the API
+            // promises only that they all complete before it returns, not
+            // that they run in parallel or on any particular thread. Running
+            // them on runtime-owned threads instead was tried and reverted —
+            // such a thread is one the *guest* never created, so its
+            // thread-local storage is whatever an uninitialized pthread has,
+            // and guest code that reads a thread-local got garbage from it.
+            //
+            // `dispatch_apply(n, queue, block)` calls `block->invoke(block,
+            // i)` — the invoke pointer sits at offset 16 of a block object —
+            // while `dispatch_apply_f(n, queue, context, work)` calls
+            // `work(context, i)`.
+            let (n, work, ctx) = unsafe {
+                let (n, arg2, arg3) = ((*ts).regs[X0], (*ts).regs[X2], (*ts).regs[X3]);
+                if pc == esc.dispatch_apply {
+                    let mut invoke = [0u8; 8];
+                    if !crate::sys::mmap::copy_from_guest(arg2 + 16, &mut invoke) {
+                        return Err(Error::BadAccess(arg2 + 16));
+                    }
+                    (n, u64::from_ne_bytes(invoke), arg2)
+                } else {
+                    (n, arg3, arg2)
+                }
+            };
+            for i in 0..n {
+                self.run_guest_call2(work, ctx, i)?;
+                if !self.running {
+                    break;
+                }
+            }
+            ret(ts, 0);
+        } else if pc == esc.dispatch_async
+            || pc == esc.dispatch_async_f
+            || pc == esc.dispatch_group_async
+            || pc == esc.dispatch_group_async_f
+        {
+            // The queue keeps the work and the thread it runs on; only the
+            // pointer it calls changes. Hand libdispatch the runtime's shim
+            // and a context naming the guest's function, so the callback
+            // arrives on the library's worker thread and is run there through
+            // the translator (see `crate::sys::darwin::callback`). Forwarding
+            // the real call — rather than running the block here — is what
+            // keeps the library's own bookkeeping intact, group counts and
+            // queue ownership included.
+            //
+            // The group forms take the group ahead of the queue; the block
+            // forms pass `block` where the `_f` forms pass `(context, work)`,
+            // and call `block->invoke(block)`. A block may still be on the
+            // caller's stack, so it is copied to the heap first — as a guest
+            // call, since a block's copy helper is guest code too — and
+            // released after the callback runs.
+            let group = if pc == esc.dispatch_group_async || pc == esc.dispatch_group_async_f {
+                unsafe { (*ts).regs[X0] }
+            } else {
+                0
+            };
+            let base = if group != 0 { 1 } else { 0 };
+            let (queue, a, b) =
+                unsafe { ((*ts).regs[base], (*ts).regs[base + 1], (*ts).regs[base + 2]) };
+            let is_block = pc == esc.dispatch_async || pc == esc.dispatch_group_async;
+            let (work, arg, release) = if is_block {
+                let block = self.run_guest_call(esc.block_copy, a)?;
+                let mut invoke = [0u8; 8];
+                if !crate::sys::mmap::copy_from_guest(block + 16, &mut invoke) {
+                    return Err(Error::BadAccess(block + 16));
+                }
+                (
+                    u64::from_ne_bytes(invoke),
+                    block,
+                    Some((esc.block_release, block)),
+                )
+            } else {
+                (b, a, None)
+            };
+            let context = crate::sys::darwin::callback::wrap(work, arg, release);
+            unsafe extern "C" {
+                fn dispatch_async_f(
+                    queue: *mut libc::c_void,
+                    context: *mut libc::c_void,
+                    work: extern "C" fn(*mut libc::c_void),
+                );
+                fn dispatch_group_async_f(
+                    group: *mut libc::c_void,
+                    queue: *mut libc::c_void,
+                    context: *mut libc::c_void,
+                    work: extern "C" fn(*mut libc::c_void),
+                );
+            }
+            let shim = crate::sys::darwin::callback::shim;
+            if crate::sys::darwin::callback::is_fork_child() {
+                crate::sys::darwin::callback::enqueue(context, group);
+            } else {
+                unsafe {
+                    if group != 0 {
+                        dispatch_group_async_f(
+                            group as *mut libc::c_void,
+                            queue as *mut libc::c_void,
+                            context as *mut libc::c_void,
+                            shim,
+                        );
+                    } else {
+                        dispatch_async_f(
+                            queue as *mut libc::c_void,
+                            context as *mut libc::c_void,
+                            shim,
+                        );
+                    }
+                }
+            }
+            ret(ts, 0);
         } else if pc == esc.tlv_atexit || pc == esc.cxa_thread_atexit {
             // `_tlv_atexit(func, obj)` and `__cxa_thread_atexit(func, obj,
             // _)` register a thread-local destructor. Registering it with the
@@ -954,6 +1209,125 @@ fn never_restart(number: u64) -> bool {
             | SYS_POLL_NOCANCEL
             | SYS_SEMWAIT_SIGNAL_NOCANCEL
     )
+}
+
+/// Run one guest function on a host thread the runtime did not create — a
+/// library's worker thread delivering a callback the guest registered (see
+/// [`crate::sys::darwin::callback`]).
+///
+/// The thread has no translator context, so one is built here and torn down
+/// afterwards: a register file, this thread's ctx published in its TSD slot so
+/// translated code can find it, an alternate signal stack, and registration
+/// with the shared [`Process`] so a group-wide stop can reach the thread while
+/// it runs guest code. The guest runs on the host thread's own stack, below
+/// the frame this function occupies — the library gave the thread a stack for
+/// running work on, and this is that work.
+pub fn run_guest_callback(process: &Arc<Process>, func: u64, arg: u64) {
+    // The guest gets a stack of its own rather than a slice of this thread's.
+    // Carving the host stack — handing the guest everything below a fixed
+    // headroom — puts the guest's frames and Chimera's own on one stack
+    // growing towards each other, so the runtime's native depth becomes a
+    // silent correctness budget: exceed it and the dispatch loop's frames
+    // overwrite the guest's. Measured, by adding unrelated code to `escape`
+    // and watching every `cargo build` under Chimera die.
+    const GUEST_STACK_SIZE: usize = 1 << 20;
+    let stack = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            GUEST_STACK_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if stack == libc::MAP_FAILED {
+        eprintln!("chimera: guest callback: no stack");
+        return;
+    }
+    let guest_sp = (stack as u64 + GUEST_STACK_SIZE as u64) & !15;
+
+    let mut state = ThreadState::new(func, guest_sp);
+    state.guest_tsd = read_tsd_base();
+    let mut thread = Thread::from_state(Arc::clone(process), state);
+
+    crate::sys::darwin::fault::install_altstack();
+    unsafe {
+        let port = mach_thread_self();
+        thread.state.tid.store(port as i32, Ordering::Release);
+    }
+    thread.process().register_thread(&thread.state);
+    let _guard = ThreadGuard {
+        process: Arc::clone(process),
+        state: &*thread.state,
+    };
+
+    thread.running = true;
+    if let Err(err) = thread.run_guest_call(func, arg) {
+        eprintln!("chimera: guest callback failed: {err}");
+    }
+    unsafe { libc::munmap(stack, GUEST_STACK_SIZE) };
+    // The ctx is this frame's and dies with it; leave nothing for the next
+    // native code on this thread to find. (`run_guest_call` attached the
+    // vcpu; there is no detach, since a thread the runtime owns keeps its
+    // ctx for life.)
+    publish_ctx(std::ptr::null_mut());
+}
+
+/// State handed to a spawned guest thread's host entry.
+struct GuestThreadCtx {
+    process: Arc<Process>,
+    state: Box<ThreadState>,
+    report: Arc<crate::sys::darwin::handoff::Handoff>,
+}
+
+/// Host `pthread` entry for a guest thread from `bsdthread_create`. Reports the
+/// child's mach port to the waiting parent, then runs its dispatch loop.
+extern "C" fn guest_thread_entry(arg: *mut libc::c_void) -> *mut libc::c_void {
+    let ctx = unsafe { Box::from_raw(arg as *mut GuestThreadCtx) };
+    let GuestThreadCtx {
+        process,
+        mut state,
+        report,
+    } = *ctx;
+    let port = unsafe { mach_thread_self() } as u64;
+    state.regs[X1] = port;
+    // The kernel writes the new thread's mach port into the pthread struct when
+    // it creates a bsdthread; `_pthread_start` aborts ("Unable to allocate thread
+    // port") if that slot is unset. Replicate the write (self-port field at
+    // pthread + 0xf8 on the current libpthread).
+    unsafe { ((state.regs[X0] + 0xf8) as *mut u32).write(port as u32) };
+    report.send(port);
+    let mut child = Thread::from_state(process, state);
+    let reason = child.run();
+    // A fork in this thread made it the main (and only) thread of a new
+    // process; the parent's other host threads did not survive the fork. Keep
+    // driving it here, the way `execv` drives the initial thread — installing
+    // any committed execve image and re-entering — and end the process with
+    // the guest's status.
+    if child.is_main()
+        && let Ok(reason) = reason
+    {
+        let code = crate::sys::darwin::exec::drive(&mut child, reason).unwrap_or_else(|err| {
+            eprintln!("chimera: fork child failed: {err}");
+            127
+        });
+        std::process::exit(code);
+    }
+    // The guest ended this thread with `bsdthread_terminate`: the policy already
+    // freed the guest stack and woke the joiner in guest program order, stashed
+    // the Mach port, and stopped the run loop cleanly (the run guard already
+    // unregistered), so every Rust object can drop here. Now issue the real
+    // syscall as the host thread's last act — the kernel releases the port and
+    // terminates this host thread. It never returns. (Chimera's own mmap'd host
+    // stack for this thread leaks, as on any `pthread_attr_setstack` exit path.)
+    let terminate = child.terminate_args;
+    drop(child);
+    if let Some(a) = terminate {
+        let call = SystemCall::new(361, [a[0], a[1], a[2], a[3], 0, 0, 0, 0]);
+        crate::sys::host_syscall(&call);
+    }
+    std::ptr::null_mut()
 }
 
 /// Removes a thread from the shared [`Process`] thread list when its run loop

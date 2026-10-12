@@ -236,7 +236,6 @@ impl Process {
     /// until the last thread terminates, and the status is that last thread's —
     /// the caller's own, recorded before waiting, if no sibling outlives it —
     /// unless an `exit_group` set the whole group's.
-    #[cfg(target_os = "linux")]
     pub fn wait_for_others(&self, self_state: &ThreadState) -> i32 {
         let self_state = self_state as *const ThreadState;
         let mut threads = self.threads.lock().unwrap();
