@@ -75,7 +75,8 @@ pub fn install() {
     INSTALL.call_once(|| unsafe {
         let mut sa: libc::sigaction = mem::zeroed();
         sa.sa_sigaction = chimera_fault as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
+        // `sud::preempt` needs every signal blocked.
+        libc::sigfillset(&mut sa.sa_mask);
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         libc::sigaction(libc::SIGSEGV, &sa, ptr::null_mut());
         libc::sigaction(libc::SIGBUS, &sa, ptr::null_mut());
@@ -91,9 +92,16 @@ extern "C" fn chimera_fault(
     let si_code = unsafe { (*info).si_code };
     let rip = fault_rip(ucontext);
 
-    // A fault in natively running guest code is fatal like any other guest
-    // fault, but the paths below make system calls and run Rust, so first
-    // return to runtime conditions.
+    // Native guest code that branched to an address it cannot fetch leaves
+    // the guest as the translator does when it cannot fetch a branch target,
+    // and the guest receives the SIGSEGV.
+    if si_code > 0 && fault_addr == rip && sud::preempt(ucontext, sud::EXIT_KIND_FETCH_FAULT) {
+        return;
+    }
+
+    // Any other fault in natively running guest code is fatal like any
+    // other guest fault, but the paths below make system calls and run Rust,
+    // so first return to runtime conditions.
     sud::abandon_guest();
 
     // A `kill()`/`tgkill()`-raised SIGSEGV or SIGBUS (`si_code <= 0`) is not a
