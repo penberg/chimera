@@ -15,9 +15,6 @@ use crate::{
     arch::x86::{cache::BlockCache, trampoline::guarded_copy},
 };
 
-/// Guest page size (x86-64); SMC arming and invalidation work per page.
-const PAGE: usize = 4096;
-
 /// Size of the guest's break arena. `PROT_NONE` + `MAP_NORESERVE`, so the
 /// reservation costs address space only until the guest grows into it. A guest
 /// whose `brk` outgrows the arena sees the call fail with the break unchanged —
@@ -133,7 +130,8 @@ impl AddressSpace {
     /// A fault on any other page is not ours — a genuine guest fault. Runs in the
     /// synchronous fault handler, so it allocates nothing.
     pub fn on_smc_write(&mut self, addr: usize) -> bool {
-        let page = addr & !(PAGE - 1);
+        let page_size = host_page_size();
+        let page = addr & !(page_size - 1);
         if !self.armed.remove(&page) {
             // Already disarmed: a benign race if another thread just restored
             // write to this same page (re-run the store); otherwise not ours.
@@ -147,7 +145,7 @@ impl AddressSpace {
         unsafe {
             libc::mprotect(
                 page as *mut libc::c_void,
-                PAGE,
+                page_size,
                 libc::PROT_READ | libc::PROT_WRITE,
             );
         }
@@ -160,10 +158,11 @@ impl AddressSpace {
     /// too, but the `mprotect` to read-only is a no-op and the guest never writes
     /// it.
     fn arm_span(&mut self, start: u64, end: u64) {
+        let page_size = host_page_size();
         for page in pages(start as usize, (end - start) as usize) {
             if self.armed.insert(page) {
                 self.granted.remove(&page);
-                unsafe { libc::mprotect(page as *mut libc::c_void, PAGE, libc::PROT_READ) };
+                unsafe { libc::mprotect(page as *mut libc::c_void, page_size, libc::PROT_READ) };
             }
         }
     }
@@ -176,8 +175,9 @@ impl AddressSpace {
         if len == 0 {
             return;
         }
-        let lo = (start & !(PAGE - 1)) as u64;
-        let hi = ((start + len - 1) & !(PAGE - 1)) as u64;
+        let page_size = host_page_size();
+        let lo = (start & !(page_size - 1)) as u64;
+        let hi = ((start + len - 1) & !(page_size - 1)) as u64;
         self.code.invalidate_range(lo, hi);
         self.armed.retain(|&p| (p as u64) < lo || (p as u64) > hi);
         self.granted.retain(|&p| (p as u64) < lo || (p as u64) > hi);
@@ -483,17 +483,18 @@ pub fn copy_to_guest(addr: u64, buf: &[u8]) -> bool {
 }
 
 /// Page-aligned base addresses of every page the range `[start, start+len)`
-/// touches. Empty when `len` is zero.
+/// touches, at host page granularity. Empty when `len` is zero.
 fn pages(start: usize, len: usize) -> impl Iterator<Item = usize> {
-    let first = start & !(PAGE - 1);
+    let page_size = host_page_size();
+    let first = start & !(page_size - 1);
     let end = start.saturating_add(len);
-    let last = end.saturating_sub(1) & !(PAGE - 1);
+    let last = end.saturating_sub(1) & !(page_size - 1);
     let count = if len == 0 {
         0
     } else {
-        (last - first) / PAGE + 1
+        (last - first) / page_size + 1
     };
-    (0..count).map(move |i| first + i * PAGE)
+    (0..count).map(move |i| first + i * page_size)
 }
 
 fn round_mapping_len(len: usize) -> usize {
@@ -523,8 +524,6 @@ mod tests {
     use super::*;
     use std::ptr;
 
-    const PAGE_SIZE: usize = 4096;
-
     fn mmap_anon(len: usize) -> usize {
         let addr = unsafe {
             libc::mmap(
@@ -543,16 +542,16 @@ mod tests {
     #[test]
     fn add_region_coalesces_adjacent_ranges() {
         let mut addr_space = AddressSpace::new(crate::DEFAULT_CODE_CACHE_SIZE).unwrap();
-        let base = mmap_anon(PAGE_SIZE * 2);
+        let base = mmap_anon(host_page_size() * 2);
 
-        addr_space.add_region(base, PAGE_SIZE);
-        addr_space.add_region(base + PAGE_SIZE, PAGE_SIZE);
+        addr_space.add_region(base, host_page_size());
+        addr_space.add_region(base + host_page_size(), host_page_size());
 
         assert_eq!(
             addr_space.regions,
             vec![Region {
                 start: base,
-                len: PAGE_SIZE * 2,
+                len: host_page_size() * 2,
             }]
         );
     }
@@ -560,46 +559,51 @@ mod tests {
     #[test]
     fn remove_region_splits_partial_unmap() {
         let mut addr_space = AddressSpace::new(crate::DEFAULT_CODE_CACHE_SIZE).unwrap();
-        let base = mmap_anon(PAGE_SIZE * 3);
-        addr_space.add_region(base, PAGE_SIZE * 3);
+        let base = mmap_anon(host_page_size() * 3);
+        addr_space.add_region(base, host_page_size() * 3);
 
-        addr_space.remove_region(base + PAGE_SIZE, PAGE_SIZE);
+        addr_space.remove_region(base + host_page_size(), host_page_size());
         assert_eq!(
             addr_space.regions,
             vec![
                 Region {
                     start: base,
-                    len: PAGE_SIZE,
+                    len: host_page_size(),
                 },
                 Region {
-                    start: base + (PAGE_SIZE * 2),
-                    len: PAGE_SIZE,
+                    start: base + (host_page_size() * 2),
+                    len: host_page_size(),
                 },
             ]
         );
 
-        let ret = unsafe { libc::munmap((base + PAGE_SIZE) as *mut libc::c_void, PAGE_SIZE) };
+        let ret = unsafe {
+            libc::munmap(
+                (base + host_page_size()) as *mut libc::c_void,
+                host_page_size(),
+            )
+        };
         assert_eq!(ret, 0);
     }
 
     #[test]
     fn remap_region_moves_mapping() {
         let mut addr_space = AddressSpace::new(crate::DEFAULT_CODE_CACHE_SIZE).unwrap();
-        let old = mmap_anon(PAGE_SIZE);
-        let new = mmap_anon(PAGE_SIZE);
+        let old = mmap_anon(host_page_size());
+        let new = mmap_anon(host_page_size());
 
-        addr_space.add_region(old, PAGE_SIZE);
-        addr_space.remap_region(old, PAGE_SIZE, new, PAGE_SIZE, false);
+        addr_space.add_region(old, host_page_size());
+        addr_space.remap_region(old, host_page_size(), new, host_page_size(), false);
 
         assert_eq!(
             addr_space.regions,
             vec![Region {
                 start: new,
-                len: PAGE_SIZE,
+                len: host_page_size(),
             }]
         );
 
-        let ret = unsafe { libc::munmap(old as *mut libc::c_void, PAGE_SIZE) };
+        let ret = unsafe { libc::munmap(old as *mut libc::c_void, host_page_size()) };
         assert_eq!(ret, 0);
     }
 }
