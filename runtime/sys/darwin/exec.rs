@@ -33,6 +33,24 @@ use super::thread::{ExitReason, Thread};
 
 const STACK_SIZE: usize = 8 * 1024 * 1024;
 
+/// Ceiling on an image's `LC_MAIN.stacksize` request. Any image can name any
+/// value, and a reservation past this would fail or thrash rather than help.
+const MAX_STACK_SIZE: usize = 512 * 1024 * 1024;
+
+/// The main-thread stack to reserve for an image requesting `requested` bytes
+/// through `LC_MAIN.stacksize`, which is zero when it expresses no preference.
+/// The kernel honours that field, and so must Chimera: a language runtime that
+/// computes its stack-overflow limit from the stack it actually got will trip
+/// that check straight away if it was linked expecting more.
+fn main_stack_size(requested: u64) -> usize {
+    let want = (requested as usize).min(MAX_STACK_SIZE);
+    if want <= STACK_SIZE {
+        return STACK_SIZE;
+    }
+    let page = crate::sys::darwin::macho::PAGE_SIZE as usize;
+    want.div_ceil(page) * page
+}
+
 /// Darwin's whole-argument-block limit (`ARG_MAX`, 1 MiB) bounds any single
 /// argv/envp string too.
 const MAX_ARG_STRLEN: usize = 1024 * 1024;
@@ -84,6 +102,7 @@ pub fn execv(
 
     let image = load_macho(&target.host)?;
     handler.on_execve(&target.host);
+    super::set_unhonoured_entitlements(program, &image.entitlements);
     // A dynamic image carries imports and rebases that must be applied before
     // it runs; Chimera links it in-process rather than handing control to
     // Apple's dyld (see dyld.rs). A static image is dispatched as mapped.
@@ -92,11 +111,17 @@ pub fn execv(
     } else {
         None
     };
-    let frame = build_main_frame(&argv, &envp, program.as_os_str().as_bytes())?;
+    let frame = build_main_frame(
+        &argv,
+        &envp,
+        program.as_os_str().as_bytes(),
+        image.stack_size,
+    )?;
 
     super::set_executable_path(program);
     super::set_image_slide(image.slide);
     super::set_guest_args(frame.argc as i32, frame.argv, frame.envp, frame.apple);
+    super::set_main_stack(frame.stack.0 as u64, frame.stack.1 as u64);
     let process = Arc::new(Process::new(handler, code_cache_size)?);
     super::fault::set_process(&process);
     super::callback::set_process(&process);
@@ -121,7 +146,12 @@ pub fn execv(
 pub fn drive(thread: &mut Thread, mut reason: ExitReason) -> Result<i32, Error> {
     loop {
         match reason {
-            ExitReason::Exited(code) => return Ok(code),
+            ExitReason::Exited(code) => {
+                if code != 0 {
+                    super::entitlements_hint();
+                }
+                return Ok(code);
+            }
             ExitReason::Execve => {
                 // A committed execve: the calling thread — main or a sibling —
                 // already validated, parsed, and mapped the image and
@@ -177,8 +207,10 @@ pub fn drive(thread: &mut Thread, mut reason: ExitReason) -> Result<i32, Error> 
                 };
                 super::set_executable_path(&path);
                 super::set_image_slide(image.slide);
-                let frame = build_main_frame(&argv, &envp, path.as_os_str().as_bytes())?;
+                let frame =
+                    build_main_frame(&argv, &envp, path.as_os_str().as_bytes(), image.stack_size)?;
                 super::set_guest_args(frame.argc as i32, frame.argv, frame.envp, frame.apple);
+                super::set_main_stack(frame.stack.0 as u64, frame.stack.1 as u64);
                 record_regions(thread, &image, &frame);
                 thread.enter(image.entry, frame.sp);
                 enter_frame(thread, &frame);
@@ -417,6 +449,7 @@ pub fn prepare_exec(args: &[u64; 8], handler: &dyn SystemCalls) -> Result<Prepar
     let envp = read_guest_ptr_array(args[2], MAX_ARG_COUNT, MAX_ARG_STRLEN)?;
     splice_shebang(&mut target, &mut argv, handler)?;
     let image = load_macho(&target.host)?;
+    super::set_unhonoured_entitlements(&target.guest, &image.entitlements);
     Ok(PreparedExec {
         path: target.guest,
         host: target.host,
@@ -619,8 +652,9 @@ fn build_main_frame(
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
     exec_path: &[u8],
+    requested_stack: u64,
 ) -> Result<MainFrame, Error> {
-    let stack_size = STACK_SIZE;
+    let stack_size = main_stack_size(requested_stack);
     let stack = unsafe {
         libc::mmap(
             ptr::null_mut(),

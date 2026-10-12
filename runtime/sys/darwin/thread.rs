@@ -130,6 +130,8 @@ struct Escapes {
     malloc_zone_unregister: u64,
     malloc_default_zone: u64,
     malloc_get_all_zones: u64,
+    stackaddr: u64,
+    stacksize: u64,
     atfork: u64,
     analytics_send: u64,
     analytics_send_lazy: u64,
@@ -177,6 +179,8 @@ impl Escapes {
             malloc_zone_unregister: symbol(c"malloc_zone_unregister"),
             malloc_default_zone: symbol(c"malloc_default_zone"),
             malloc_get_all_zones: symbol(c"malloc_get_all_zones"),
+            stackaddr: symbol(c"pthread_get_stackaddr_np"),
+            stacksize: symbol(c"pthread_get_stacksize_np"),
             atfork: symbol(c"pthread_atfork"),
             analytics_send: analytics_symbol(c"AnalyticsSendEvent"),
             analytics_send_lazy: analytics_symbol(c"AnalyticsSendEventLazy"),
@@ -683,6 +687,18 @@ impl Thread {
             || pc == esc.analytics_send_event_lazy
         {
             ret(ts, 0);
+        } else if pc == esc.stackaddr {
+            // See `sys::darwin::guest_stackaddr`: libpthread's answer for the
+            // main thread names the host stack, not the one the guest runs on.
+            ret(
+                ts,
+                crate::sys::darwin::guest_stackaddr(unsafe { (*ts).regs[X0] }),
+            );
+        } else if pc == esc.stacksize {
+            ret(
+                ts,
+                crate::sys::darwin::guest_stacksize(unsafe { (*ts).regs[X0] }),
+            );
         } else if pc == esc.atfork {
             // Divert the handlers to the runtime's own list (see
             // `sys::darwin::GUEST_ATFORK`); `spawn::forked` runs them

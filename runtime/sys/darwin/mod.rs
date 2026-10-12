@@ -8,8 +8,9 @@
 //! The statics below are the process-wide facts the run loop answers for the
 //! guest in place of the shared libSystem and dyld, whose own answers would
 //! describe Chimera: the executed image's path and name, the entry frame, the
-//! image slide, the guest's view of the malloc zone list, and the `atfork`
-//! handlers it registered.
+//! image slide, the main thread's stack bounds, the guest's view of the malloc
+//! zone list, the `atfork` handlers it registered, and the entitlements its
+//! image carries that the kernel will not grant.
 
 use std::{
     os::unix::ffi::OsStrExt,
@@ -51,6 +52,40 @@ static IMAGE_SLIDE: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_image_slide(slide: u64) {
     IMAGE_SLIDE.store(slide, Ordering::Release);
+}
+
+/// The guest main thread's stack — the runtime-allocated mapping it actually
+/// runs on — and the host `pthread_t` of the thread running it. libpthread
+/// records the *host* main stack for that thread, so a guest asking
+/// `pthread_get_stackaddr_np`/`pthread_get_stacksize_np` about it would get
+/// bounds its own stack pointer lies outside; JavaScriptCore's stack
+/// sanitizer release-asserts on exactly that. The dispatch loop answers those
+/// queries from here instead. Worker threads need no override: their host
+/// pthreads are created with `pthread_attr_setstack` on the guest stack, so
+/// libpthread's answer is already the guest's.
+static MAIN_STACK_LO: AtomicU64 = AtomicU64::new(0);
+static MAIN_STACK_LEN: AtomicU64 = AtomicU64::new(0);
+static MAIN_PTHREAD: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_main_stack(lo: u64, len: u64) {
+    MAIN_STACK_LO.store(lo, Ordering::Release);
+    MAIN_STACK_LEN.store(len, Ordering::Release);
+    MAIN_PTHREAD.store(unsafe { libc::pthread_self() } as u64, Ordering::Release);
+}
+
+/// `pthread_get_stackaddr_np`: a stack's base is its highest address.
+pub fn guest_stackaddr(thread: u64) -> u64 {
+    if thread == MAIN_PTHREAD.load(Ordering::Acquire) {
+        return MAIN_STACK_LO.load(Ordering::Acquire) + MAIN_STACK_LEN.load(Ordering::Acquire);
+    }
+    unsafe { libc::pthread_get_stackaddr_np(thread as usize as libc::pthread_t) as u64 }
+}
+
+pub fn guest_stacksize(thread: u64) -> u64 {
+    if thread == MAIN_PTHREAD.load(Ordering::Acquire) {
+        return MAIN_STACK_LEN.load(Ordering::Acquire);
+    }
+    unsafe { libc::pthread_get_stacksize_np(thread as usize as libc::pthread_t) as u64 }
 }
 
 /// The guest's view of the malloc zone list, kept apart from the real one: a
@@ -137,6 +172,50 @@ pub fn guest_zone_list() -> (u64, u32) {
 
 pub fn clear_guest_zones() {
     *GUEST_ZONES.lock().unwrap() = None;
+}
+
+/// The current guest image's path and the entitlements the kernel will not
+/// grant it, kept for a failure-time hint rather than announced at load:
+/// nearly every Apple system binary carries some entitlement, so a load-time
+/// warning fires once per spawned child of an interactive guest and buries
+/// its output. The hardened-runtime relaxations (`com.apple.security.cs.*`)
+/// are dropped at recording — they permit what a non-hardened Chimera
+/// process may do anyway, so a guest loses nothing by running without them
+/// and listing them would misattribute the failure. Replaced by each exec'd
+/// image.
+static UNHONOURED_ENTITLEMENTS: Mutex<Option<(String, Vec<String>)>> = Mutex::new(None);
+
+pub fn set_unhonoured_entitlements(path: &Path, entitlements: &[String]) {
+    let kept: Vec<String> = entitlements
+        .iter()
+        .filter(|e| !e.starts_with("com.apple.security.cs."))
+        .cloned()
+        .collect();
+    *UNHONOURED_ENTITLEMENTS.lock().unwrap() = if kept.is_empty() {
+        None
+    } else {
+        Some((path.display().to_string(), kept))
+    };
+}
+
+/// Say once, after a run that failed, that the image ran stripped of its
+/// entitlements — the moment the fact explains something. Only the process
+/// the user started speaks: a forked child's failure surfaces through its
+/// parent, and a hint from every child of an interactive guest is the spam
+/// the load-time warning used to be.
+pub fn entitlements_hint() {
+    use std::sync::atomic::AtomicBool;
+    static PRINTED: AtomicBool = AtomicBool::new(false);
+    if callback::is_fork_child() || PRINTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if let Some((path, entitlements)) = &*UNHONOURED_ENTITLEMENTS.lock().unwrap() {
+        eprintln!(
+            "chimera: note: {path} is signed with entitlements the kernel will not grant \
+             under Chimera ({}); a permission error above may stem from that",
+            entitlements.join(", "),
+        );
+    }
 }
 
 /// Guest-registered `pthread_atfork` handlers, kept off libpthread's global
