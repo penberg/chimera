@@ -17,7 +17,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          # Add macos-latest once the Darwin port builds end-to-end.
+          - macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -39,5 +39,4 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: conformance
-        if: runner.os == 'Linux'
         run: make conformance

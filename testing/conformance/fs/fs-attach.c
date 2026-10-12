@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "portable.h"
 
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "write") == 0) {
@@ -32,9 +33,10 @@ int main(int argc, char **argv) {
         return strcmp(buf, "session-one") == 0 ? 0 : 33;
     }
     if (argc == 4 && strcmp(argv[1], "verify") == 0) {
-        char probe[4096];
+        char probe[4096], canon[PATH_MAX];
         struct stat st;
-        snprintf(probe, sizeof(probe), "%s/data%s", argv[2], argv[3]);
+        if (!resolved_dir_path(canon, sizeof(canon), argv[3])) return 40;
+        snprintf(probe, sizeof(probe), "%s/data%s", argv[2], canon);
         if (stat(probe, &st) == 0) {
             // Overlay ran: the file is filesystem-only.
             return stat(argv[3], &st) == 0 || errno != ENOENT ? 41 : 0;

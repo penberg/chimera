@@ -17,17 +17,19 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <unistd.h>
+#include "portable.h"
 
 static int check(const char *fifo) {
     // Writing a character device works and reaches the real device.
     int null = open("/dev/null", O_WRONLY);
     if (null < 0) return 31;
     if (write(null, "sink", 4) != 4) return 32;
-    struct stat st;
+    struct stat st, node;
     if (fstat(null, &st) != 0 || !S_ISCHR(st.st_mode)) return 33;
-    if (major(st.st_rdev) != 1 || minor(st.st_rdev) != 3) return 34;
+    // The descriptor names the real device node, whatever numbers this host
+    // gives it.
+    if (stat("/dev/null", &node) != 0 || st.st_rdev != node.st_rdev) return 34;
     close(null);
 
     // Reading /dev/zero produces zeros — the node, not a copied file.
@@ -67,7 +69,9 @@ static int verify(const char *delta, const char *fifo) {
     if (stat(probe, &st) == 0) return 51;
     // …and the guest's FIFO lives in the delta, not on the host.
     if (stat(fifo, &st) == 0) return 52;
-    snprintf(probe, sizeof(probe), "%s/data%s", delta, fifo);
+    char canon[PATH_MAX];
+    if (!resolved_dir_path(canon, sizeof(canon), fifo)) return 54;
+    snprintf(probe, sizeof(probe), "%s/data%s", delta, canon);
     if (stat(probe, &st) != 0 || !S_ISFIFO(st.st_mode)) return 53;
     return 0;
 }

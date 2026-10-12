@@ -23,6 +23,7 @@
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
+#include "portable.h"
 
 static int write_file(const char *path, const char *content) {
     int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);

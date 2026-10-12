@@ -11,23 +11,25 @@ mod arch;
 mod process;
 mod sys;
 mod syscall;
+#[cfg(target_os = "macos")]
+mod trace;
 mod vcpu;
 
 pub use syscall::{ForkHold, Passthrough, SyscallResult, SystemCall, SystemCalls};
 
-pub use sys::linux::syscall::host_syscall;
+pub use sys::host_syscall;
 
 pub use sys::{
     fs::{
         namespace::{MountFlags, Namespace},
         overlayfs::OverlayFs,
+        personality::Personality,
         vfs::{
             DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec,
             Vfs, WriteResult,
         },
     },
     hostfs::HostFs,
-    linux::Personality,
 };
 
 /// The tooling side of the filesystem delta format, for inspecting and
@@ -62,7 +64,14 @@ pub const MAX_CODE_CACHE_SIZE: usize = i32::MAX as usize;
 /// Whether the host supports memory protection keys for the translated-code
 /// cache.
 pub fn mpk_enabled() -> bool {
-    arch::mpk_enabled()
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch::mpk_enabled()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 /// A sandboxed guest program, configured but not yet running.

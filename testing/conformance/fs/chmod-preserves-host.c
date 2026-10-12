@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "portable.h"
 
 static int lower_target(const char *fixture, char *out, size_t size) {
     char lower[PATH_MAX], canon[PATH_MAX];

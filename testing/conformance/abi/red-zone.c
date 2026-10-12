@@ -55,6 +55,12 @@ int main(void) {
 // the guest's sp when it rewrites a branch, since a guest may park sp one word
 // above a guard page. Stash a sentinel below sp, branch in each direction, and
 // confirm it survives.
+//
+// What makes this hard on arm64 is that a terminator needs a scratch register
+// before it can reach the thread context, and the only store that needs no
+// base register is sp-relative. Chimera keeps x17 as its context register
+// inside translated code and the guest's x17 in the context, so a terminator
+// frees x16 with one store through x17 and never touches the guest stack.
 int main(void) {
     uint64_t acc = 0;
     asm volatile(

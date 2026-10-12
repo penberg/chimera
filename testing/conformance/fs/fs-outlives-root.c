@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "portable.h"
 
 static int scenario(const char *probe) {
     int p[2];
@@ -71,15 +72,16 @@ static int await(const char *report) {
 // state directory holds the probe, and the host path stays absent. Native
 // and --unsafe runs wrote straight to disk.
 static int verify_kept(const char *statedir, const char *probe) {
-    char path[4096];
+    char path[4096], canon[PATH_MAX];
     struct stat st;
+    if (!resolved_dir_path(canon, sizeof(canon), probe)) return 50;
     DIR *dir = opendir(statedir);
     if (dir) {
         struct dirent *e;
         while ((e = readdir(dir))) {
             if (e->d_name[0] == '.') continue;
             snprintf(path, sizeof(path), "%s/%s/data%s", statedir, e->d_name,
-                     probe);
+                     canon);
             if (stat(path, &st) == 0) {
                 closedir(dir);
                 return stat(probe, &st) == 0 ? 51 : 0;
@@ -93,15 +95,16 @@ static int verify_kept(const char *statedir, const char *probe) {
 // After the --rm run's tree has fully exited, the branch is gone: no kept
 // filesystem holds the probe, and the host path never appeared.
 static int verify_rm(const char *statedir, const char *probe) {
-    char path[4096];
+    char path[4096], canon[PATH_MAX];
     struct stat st;
+    if (!resolved_dir_path(canon, sizeof(canon), probe)) return 60;
     DIR *dir = opendir(statedir);
     if (dir) {
         struct dirent *e;
         while ((e = readdir(dir))) {
             if (e->d_name[0] == '.') continue;
             snprintf(path, sizeof(path), "%s/%s/data%s", statedir, e->d_name,
-                     probe);
+                     canon);
             if (stat(path, &st) == 0) {
                 closedir(dir);
                 return 61;

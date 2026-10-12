@@ -320,6 +320,14 @@ impl Vfs for HostFs {
         check(unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), tp, flags) })
     }
 
+    fn bind(
+        &self,
+        path: &Path,
+        bind: &mut dyn FnMut(&Path) -> Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        bind(&self.host_path(path))
+    }
+
     fn mknod(&self, path: &Path, mode: Mode, dev: u64) -> Result<(), Errno> {
         let cpath = cpath(&self.host_path(path))?;
         check(unsafe { libc::mknod(cpath.as_ptr(), mode.0 as libc::mode_t, dev as libc::dev_t) })
@@ -381,6 +389,10 @@ impl Vfs for HostFs {
             return None;
         }
         Some(stat_to_stat(&st))
+    }
+
+    fn materialize(&self, path: &Path) -> Result<PathBuf, Errno> {
+        Ok(HostFs::host_path(self, path))
     }
 
     fn host_path(&self, path: &Path) -> Option<PathBuf> {
@@ -745,6 +757,11 @@ fn stat_to_stat(st: &libc::stat) -> Stat {
             sec: st.st_ctime,
             nsec: st.st_ctime_nsec,
         },
+        btime: Timespec {
+            sec: st.st_ctime,
+            nsec: st.st_ctime_nsec,
+        },
+        flags: 0,
     }
 }
 

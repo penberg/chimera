@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "portable.h"
 
 #ifdef NEWVER
 #define VERSION_EXIT 77
@@ -55,7 +56,8 @@ static int prep(const char *dir) {
     char path[4096], line[4096];
     if (mkdir(dir, 0755) != 0) return 21;
     snprintf(path, sizeof(path), "%s/prog", dir);
-    if (copy_file("/proc/self/exe", path, 0755) != 0) return 22;
+    char exe[PATH_MAX];
+    if (copy_file(self_exe(exe, sizeof(exe)), path, 0755) != 0) return 22;
     int n = snprintf(line, sizeof(line), "#!%s\n", path);
     snprintf(path, sizeof(path), "%s/script", dir);
     int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0755);

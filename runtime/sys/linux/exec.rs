@@ -223,7 +223,7 @@ pub struct PreparedExec {
 /// thread disturbed.
 pub fn prepare_exec(
     number: u64,
-    args: &[u64; 6],
+    args: &[u64; 8],
     handler: &dyn SystemCalls,
 ) -> Result<PreparedExec, Error> {
     let mut req = read_request(number, args, handler)?;
@@ -328,14 +328,14 @@ fn record_regions(
 ) -> Result<(), Error> {
     addr_space.init_program_break()?;
     for &(start, len) in &main.regions {
-        addr_space.add_region(start as usize, len as usize);
+        addr_space.add_runtime_region(start as usize, len as usize);
     }
     if let Some(interp) = interp {
         for &(start, len) in &interp.regions {
-            addr_space.add_region(start as usize, len as usize);
+            addr_space.add_runtime_region(start as usize, len as usize);
         }
     }
-    addr_space.add_region(stack_start, stack_len);
+    addr_space.add_runtime_region(stack_start, stack_len);
     Ok(())
 }
 
@@ -361,7 +361,7 @@ struct ExecRequest {
 /// `/proc/self/fd` handling stands in for [`Passthrough`].
 fn read_request(
     number: u64,
-    args: &[u64; 6],
+    args: &[u64; 8],
     handler: &dyn SystemCalls,
 ) -> Result<ExecRequest, Error> {
     let (dirfd, rawptr, flags, argv_ptr, envp_ptr) = if number == libc::SYS_execveat as u64 {

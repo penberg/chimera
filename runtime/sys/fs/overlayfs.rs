@@ -624,6 +624,29 @@ impl Vfs for OverlayFs {
             .mutate_upper(path, |upper| upper.utimens(path, follow, times))
     }
 
+    fn bind(
+        &self,
+        path: &Path,
+        bind: &mut dyn FnMut(&Path) -> Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        // A new name, placed like `mknod`'s: a lower-visible one is EEXIST
+        // (the upper cannot see it), a whiteout is replaced in one exchange.
+        match self.inner.visibility(path)? {
+            Visibility::Lower if self.inner.lower_visible(path) => {
+                return Err(Errno::EEXIST);
+            }
+            Visibility::Whiteout => {
+                return self
+                    .inner
+                    .delta
+                    .replace_whiteout(path, |staging| bind(staging));
+            }
+            _ => {}
+        }
+        self.inner.delta.materialize_parents(path)?;
+        self.inner.upper.bind(path, bind)
+    }
+
     fn mknod(&self, path: &Path, mode: Mode, dev: u64) -> Result<(), Errno> {
         // The node is a new name: a lower-visible one must answer EEXIST
         // here, because the upper (where the node lands) cannot see it.
@@ -713,6 +736,11 @@ impl Vfs for OverlayFs {
             return None;
         }
         self.inner.lower.stat_fast(path, follow)
+    }
+
+    fn materialize(&self, path: &Path) -> Result<PathBuf, Errno> {
+        self.inner.ensure_upper(path)?;
+        Ok(self.inner.delta.data_path(path))
     }
 
     fn host_path(&self, path: &Path) -> Option<PathBuf> {
@@ -1655,8 +1683,13 @@ mod tests {
 
         let st = fs.stat_fast(Path::new("/d/f"), true).unwrap().unwrap();
         assert_eq!(st.file_type, FileType::Regular);
-        let via_link = fs.stat_fast(Path::new("/link/f"), true).unwrap().unwrap();
-        assert_eq!(via_link.ino, st.ino);
+        // A symlink chain is the lower's to resolve wholesale, which a lower
+        // that confines in-kernel does; a scratch-rooted lower that cannot
+        // (Darwin, where only `/` confines) declines it to the walk instead.
+        if fs.inner.lower.confines() {
+            let via_link = fs.stat_fast(Path::new("/link/f"), true).unwrap().unwrap();
+            assert_eq!(via_link.ino, st.ino);
+        }
         let l = fs.stat_fast(Path::new("/link"), false).unwrap().unwrap();
         assert_eq!(l.file_type, FileType::Symlink);
         assert_eq!(
@@ -1783,12 +1816,16 @@ mod tests {
         )
         .unwrap();
 
-        // Clean all the way down: the chain answers wholesale.
-        let st = outer
-            .stat_fast(Path::new("/link/g"), true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(st.size, 7);
+        // Clean all the way down: the chain answers wholesale — when the
+        // host lower resolves symlinks itself (see
+        // `stat_fast_serves_only_clean_deltas`).
+        if inner.inner.lower.confines() {
+            let st = outer
+                .stat_fast(Path::new("/link/g"), true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(st.size, 7);
+        }
 
         // The inner overlay shadows the symlink's target; the outer delta is
         // still clean, but the answer is no longer the host's.

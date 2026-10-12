@@ -235,7 +235,13 @@ fn apply_change(change: &Change) -> Result<(), ApplyError> {
         if let Some(parent) = host.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(&change.upper, host)?;
+        // Bytes only: `fs::copy` would clone the upper file whole on some
+        // hosts, bookkeeping xattrs included, and the metadata replay below
+        // chooses what else comes along.
+        io::copy(
+            &mut fs::File::open(&change.upper)?,
+            &mut fs::File::create(host)?,
+        )?;
         replay_metadata(&md, &change.upper, host, replayable_xattr)?;
         // Advance the origin to the exact host identity this apply produced
         // (after the metadata replay, whose timestamps are part of it): the
