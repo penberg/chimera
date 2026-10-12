@@ -283,7 +283,7 @@ unsafe fn ib_store(entry: *mut u64, key: u64, host: u64) {
     }
 }
 
-/// Publish a link slot's value: the successor's linked entry, or zero to
+/// Publish a link slot's value: the successor's entry, or zero to
 /// unlink. A single aligned atomic store, so translated code reading the slot
 /// never sees a torn value — it takes either the old destination (or the cold
 /// path, if zero) or the new one.
@@ -349,13 +349,12 @@ struct HostBlock {
     pc_map: Vec<(u32, u64)>,
 }
 
-/// One translated block: the dispatcher's entry point and the entry a linked
-/// predecessor branches to (which pops the guest x16/x17 off the guest stack
-/// before the body).
+/// One translated block: its entry point, which the dispatcher, a linked
+/// predecessor and the inline indirect-branch probe all use — each arrives
+/// with `x17 = ctx` and x16 clobbered, which is what the prologue expects.
 #[derive(Clone, Copy)]
 struct Block {
     host: u64,
-    linked: u64,
 }
 
 impl BlockCache {
@@ -390,7 +389,7 @@ impl BlockCache {
     /// `None` for the span.
     ///
     /// A translation is also linked into the cache's branch graph: every edge
-    /// already waiting on this guest PC gets the new block's linked entry, and
+    /// already waiting on this guest PC gets the new block's entry, and
     /// the new block's own outgoing edges take their targets' entries where
     /// those are already translated. After warm-up a chain of linked blocks
     /// runs back-to-back inside one `dispatch` call instead of returning to
@@ -406,14 +405,13 @@ impl BlockCache {
             // Reaching here means an indirect branch missed the table (a
             // direct-mapped collision evicted the entry); reinstate it so the
             // hot target returns to the inline probe's fast path.
-            self.cache.ib_insert(guest_pc, block.linked);
+            self.cache.ib_insert(guest_pc, block.host);
             return Ok((block.host, None));
         }
         let Translation {
             host_pc,
             host_end,
             guest_end,
-            linked_pc,
             pc_map,
             edges,
         } = translate(
@@ -423,17 +421,9 @@ impl BlockCache {
             syscall_exit,
             trap_exit,
         )?;
-        self.map.insert(
-            guest_pc,
-            Block {
-                host: host_pc,
-                linked: linked_pc,
-            },
-        );
-        // Attribution is keyed by the emitted extent, which begins at the
-        // linked entry — a fault taken there belongs to this block too.
+        self.map.insert(guest_pc, Block { host: host_pc });
         self.host_blocks
-            .insert(linked_pc, HostBlock { host_end, pc_map });
+            .insert(host_pc, HostBlock { host_end, pc_map });
         // Index the block under every guest page it touches.
         let mut page = guest_pc & !(PAGE - 1);
         let last = guest_end.saturating_sub(1) & !(PAGE - 1);
@@ -446,15 +436,15 @@ impl BlockCache {
         }
         // Publish for the inline indirect-branch probe, then link the edges
         // waiting for this block and this block's own.
-        self.cache.ib_insert(guest_pc, linked_pc);
+        self.cache.ib_insert(guest_pc, host_pc);
         if let Some(slots) = self.links.get(&guest_pc) {
             for &slot in slots {
-                write_link_slot(slot, linked_pc);
+                write_link_slot(slot, host_pc);
             }
         }
         for OutEdge { target_guest, slot } in edges {
             if let Some(&target) = self.map.get(&target_guest) {
-                write_link_slot(slot, target.linked);
+                write_link_slot(slot, target.host);
             }
             self.links.entry(target_guest).or_default().push(slot);
         }

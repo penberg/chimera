@@ -287,8 +287,12 @@ fn try_deliver_guest_fault(
         let m = &*mc;
         let c = &mut *ctx;
         // The mcontext is the live guest register file — copy it into ctx so
-        // the run loop resumes exactly where the fault interrupted.
-        c.regs[..29].copy_from_slice(&m.x);
+        // the run loop resumes exactly where the fault interrupted. All but
+        // x17: inside translated code that register is the ctx pointer, and
+        // the guest's x17 is already in its slot (a wrapper that had loaded
+        // it into the register faulted before the instruction could write).
+        c.regs[..17].copy_from_slice(&m.x[..17]);
+        c.regs[18..29].copy_from_slice(&m.x[18..29]);
         c.regs[29] = m.fp;
         c.regs[30] = m.lr;
         c.sp = m.sp;

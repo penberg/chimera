@@ -2,10 +2,11 @@
 //! the guest register file it operates on.
 //!
 //! [`ThreadState`] holds the guest register file. Translated code reaches it
-//! through this host thread's pthread TSD slot: each block's prologue reads
-//! `TPIDRRO_EL0`, masks it to the pthread struct, and loads the [`ThreadState`]
-//! pointer from the ctx key's slot (see `super::translate::emit_load_ctx`). That
-//! keeps every guest GPR — `x18` included — free to hold its own value.
+//! through `x17`, Chimera's reserved register inside the cache: `dispatch`
+//! enters every block with it holding the pointer, and where a guest
+//! instruction has to use x17 itself, the translator re-derives the pointer
+//! from this host thread's pthread TSD slot (see
+//! `super::translate::emit_load_ctx`).
 //!
 //! [`Translator::run`] resolves (translating on a miss) the block at the guest
 //! PC, enters the cache through [`dispatch`], and reports why the cache exited
@@ -24,10 +25,11 @@ use crate::{
     vcpu::{Exit, Vcpu},
 };
 
-use super::trampoline::{dispatch, exit_block, exit_syscall_no_stack, exit_trap};
+use super::trampoline::{dispatch, exit_block, exit_syscall, exit_trap};
 
 /// Reserved pthread TSD slot holding each host thread's [`ThreadState`]
-/// pointer. Translated code reads it inline through `TPIDRRO_EL0 + slot*8` (see
+/// pointer. Translated code reads it inline through `TPIDRRO_EL0 + slot*8` to
+/// re-derive its x17 after a guest instruction has used the register (see
 /// `super::translate::emit_load_ctx`); each thread writes it at run start with
 /// [`publish_ctx`]. Per-thread — correct for concurrent guest threads, which a
 /// process-wide global could not serve without racing.
@@ -130,11 +132,13 @@ pub const X16: usize = 16;
 /// align(16))]` keeps `fpstate` 16-byte aligned for the paired `ldp/stp q`.
 #[repr(C, align(16))]
 pub struct ThreadState {
-    /// Guest GPRs x0..x30, each round-tripped by the trampolines. x18 is an
-    /// ordinary guest register here (the context lives in a pthread TSD slot,
-    /// not a register); x16 is the sole exception — the entry path leaves it
-    /// holding the host-PC target and the block prologue reloads its guest value
-    /// from this slot.
+    /// Guest GPRs x0..x30. Two are not round-tripped by the trampolines: x16
+    /// carries the host-PC target across every cache entry, and the block
+    /// prologue reloads its guest value from this slot; x17 holds this very
+    /// context's address inside translated code, so its guest value lives here
+    /// alone — the translator keeps the slot current (see
+    /// `super::translate`), and `dispatch` never loads it. x18 is an ordinary
+    /// guest register.
     pub regs: [u64; 31],
     /// Padding that brings `fpstate` to a 16-byte boundary (offset 256).
     pub _pad: u64,
@@ -244,9 +248,7 @@ impl Vcpu for Translator {
 
     fn run(&mut self, state: &mut ThreadState) -> Exit {
         let block_exit = exit_block as *const () as u64;
-        // SVC sites exit through the no-stack tail, which honors the kernel's
-        // "syscalls don't touch the user stack" contract.
-        let syscall_exit = exit_syscall_no_stack as *const () as u64;
+        let syscall_exit = exit_syscall as *const () as u64;
         let trap_exit = exit_trap as *const () as u64;
 
         let pc = state.pc;

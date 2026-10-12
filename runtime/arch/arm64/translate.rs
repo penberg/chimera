@@ -3,20 +3,29 @@
 //! operands — ADR, ADRP, LDR-literal — fixed up to refer to the original
 //! guest target), and rewrites the terminator into a sequence that:
 //!
-//! 1. saves the guest's x16 and x17 by pushing them onto the guest stack
-//!    (these are the only GPRs the exit trampoline tail won't see in their
-//!    original registers — everything else is loaded directly from live
-//!    registers),
+//! 1. saves the guest's x16 into `ctx.regs[16]`, freeing it as scratch (every
+//!    other GPR reaches the exit trampoline in its own register),
 //! 2. computes the next guest PC into `ctx.pc`, performing any side effects
 //!    the original terminator mandated (e.g., BL writing `next_ip` to x30),
 //! 3. branches to the appropriate exit trampoline (`exit_block` for ordinary
-//!    block boundaries, `exit_syscall` for SVC).
+//!    block boundaries, `exit_syscall` for SVC, `exit_trap` for BRK).
+//!
+//! One register is Chimera's inside translated code: `x17` holds the context
+//! pointer at every guest-instruction boundary, and the guest's own x17 lives
+//! in `ctx.regs[17]`. That is what lets a terminator free a scratch register
+//! without first having one — arm64 has no register-free store except
+//! relative to `sp`, and writing below the guest's `sp` is exactly what a
+//! translator must not do (`testing/conformance/abi/red-zone.c`). A guest
+//! instruction that names x17 is wrapped: the guest value is loaded in, the
+//! instruction runs, and if it may have written x17 the result is stored back
+//! through a register the instruction leaves alone, with the context
+//! re-derived from the host thread's TSD slot (see [`emit_load_ctx`]). The
+//! `dispatch` trampoline enters every block with `x17 = ctx`, and a linked
+//! predecessor arrives the same way, so a block has one entry point.
 //!
 //! Per-block prologue: every emitted block starts with a load that re-syncs
 //! x16 from `ctx.regs[16]`, because `dispatch` and every exit stub clobber x16
-//! to carry their branch target. No GPR is reserved across translated code; the
-//! context pointer is reached per-thread through the host thread's pthread TSD
-//! slot, read inline via `TPIDRRO_EL0` (see [`emit_load_ctx`]).
+//! to carry their branch target.
 
 use std::ptr;
 
@@ -48,13 +57,15 @@ fn page_mapped(page: u64) -> bool {
 }
 
 /// Emit the sequence that loads this host thread's `ThreadState` pointer into
-/// `reg` from its reserved pthread TSD slot, reached through `TPIDRRO_EL0`.
-/// Per-thread and signal-safe — unlike a reserved register (libSystem and the
-/// kernel clobber `x18`) or a process-wide global (concurrent guest threads
-/// race on it). The guest cannot interfere: `TPIDRRO_EL0` is read-only from EL0
-/// and `thread_set_tsd_base` is intercepted, and the slot is one libpthread
-/// reserves and never touches (see [`CHIMERA_CTX_TSD_SLOT`]). The slot offset
-/// (`slot * 8`) is a compile-time constant baked into the load.
+/// `reg` from its reserved pthread TSD slot, reached through `TPIDRRO_EL0` —
+/// how the context pointer is re-derived once a guest instruction that names
+/// x17 has had the register. Per-thread and signal-safe, and beyond the
+/// guest's reach: `TPIDRRO_EL0` is read-only from EL0 and `thread_set_tsd_base`
+/// is intercepted, and the slot is one libpthread reserves and never touches
+/// (see [`CHIMERA_CTX_TSD_SLOT`]). The slot offset (`slot * 8`) is a
+/// compile-time constant baked into the load. (`x18`, the platform's reserved
+/// register, would have served without the slot — but libSystem and the kernel
+/// clobber it across ordinary guest code.)
 fn emit_load_ctx(out: &mut Vec<u32>, reg: u8) {
     out.push(enc_mrs_tpidrro(reg)); // reg = TPIDRRO_EL0
     out.push(enc_and_not7(reg, reg)); // reg = TSD base (mask the CPU-number bits)
@@ -74,16 +85,13 @@ fn enc_and_not7(rd: u8, rn: u8) -> u32 {
 /// The result of translating one guest basic block: where its host code
 /// begins and ends, the guest address just past the terminator (so the caller
 /// can arm the page(s) the block covers for self-modifying-code detection),
-/// and the host-offset → guest-PC map for fault attribution.
+/// and the host-offset → guest-PC map for fault attribution. `host_pc` is the
+/// block's one entry point, for the dispatcher and a linked predecessor alike:
+/// both arrive with `x17 = ctx` and x16 clobbered.
 pub struct Translation {
     pub host_pc: u64,
     pub host_end: u64,
     pub guest_end: u64,
-    /// Entry point for a *linked* predecessor, a few words below `host_pc`:
-    /// it pops the guest x16/x17 the predecessor's stub pushed and falls into
-    /// the block body, skipping the ctx-based prologue `host_pc` starts with.
-    /// This is the address a link slot holds.
-    pub linked_pc: u64,
     /// One entry per guest instruction: the block-relative host word offset
     /// where its expansion begins, paired with its guest PC. Offsets ascend,
     /// so a faulting host PC maps to a guest PC by binary search; host words
@@ -91,7 +99,7 @@ pub struct Translation {
     pub pc_map: Vec<(u32, u64)>,
     /// This block's outgoing direct edges: for each, the guest PC it targets
     /// and the address of the link slot its exit stub reads. The cache fills
-    /// the slot with the target block's `linked_pc` once that block exists.
+    /// the slot with the target block's entry once that block exists.
     pub edges: Vec<OutEdge>,
 }
 
@@ -117,18 +125,10 @@ pub fn translate(
     let ib_table = cache.ib_table_addr();
     let mut out: Vec<u32> = Vec::new();
 
-    // Linked entry (the address a predecessor's link slot holds): a linked
-    // predecessor left the guest's x16/x17 on the guest stack rather than in
-    // ctx, so pop them and skip the ctx-based prologue below. Two words, so
-    // the dispatcher's entry point is `host_pc = block start + 8`.
-    out.push(enc_ldp_post_index(16, 17, 31, 16));
-    out.push(enc_b_imm(5)); // over the 4-word prologue, into the body
-
-    // Block prologue: re-sync x16 from ctx.regs[16]. An entry from `dispatch`
-    // or from an exit trampoline arrives with x16 clobbered. Load this
-    // thread's ctx from its TSD slot, then read regs[16].
-    emit_load_ctx(&mut out, 16);
-    out.push(enc_ldr_imm(16, 16, regs_off(16))); // x16 = ctx.regs[16]
+    // Block prologue: re-sync x16 from ctx.regs[16]. Every entry — from
+    // `dispatch`, from a linked predecessor's exit stub, from the inline
+    // indirect-branch probe — arrives with x17 = ctx and x16 clobbered.
+    out.push(enc_ldr_imm(16, 17, regs_off(16))); // x16 = ctx.regs[16]
 
     let mut pc = guest_pc;
     let mut count = 0;
@@ -219,19 +219,23 @@ pub fn translate(
         let insn = unsafe { ptr::read_unaligned(pc as *const u32) };
         match classify_at(insn, pc) {
             InsnKind::Other => {
-                out.push(insn);
+                match x17_use(insn) {
+                    None => out.push(insn),
+                    Some(use_) => emit_x17_wrapped(&mut out, insn, use_),
+                }
                 pc += 4;
                 count += 1;
             }
             InsnKind::Adr { rd, imm } => {
-                emit_imm64_compact(&mut out, rd, pc.wrapping_add(imm as u64));
+                let target = pc.wrapping_add(imm as u64);
+                emit_into_guest_reg(&mut out, rd, |out, rd| emit_imm64_compact(out, rd, target));
                 pc += 4;
                 count += 1;
             }
             InsnKind::Adrp { rd, imm } => {
                 let base = pc & !0xFFF;
                 let target = base.wrapping_add((imm << 12) as u64);
-                emit_imm64_compact(&mut out, rd, target);
+                emit_into_guest_reg(&mut out, rd, |out, rd| emit_imm64_compact(out, rd, target));
                 pc += 4;
                 count += 1;
             }
@@ -241,12 +245,14 @@ pub fn translate(
                 is_64,
             } => {
                 let addr = pc.wrapping_add(byte_offset as u64);
-                emit_imm64_compact(&mut out, rt, addr);
-                if is_64 {
-                    out.push(enc_ldr_imm(rt, rt, 0));
-                } else {
-                    out.push(enc_ldr32_imm(rt, rt, 0));
-                }
+                emit_into_guest_reg(&mut out, rt, |out, rt| {
+                    emit_imm64_compact(out, rt, addr);
+                    if is_64 {
+                        out.push(enc_ldr_imm(rt, rt, 0));
+                    } else {
+                        out.push(enc_ldr32_imm(rt, rt, 0));
+                    }
+                });
                 pc += 4;
                 count += 1;
             }
@@ -255,16 +261,13 @@ pub fn translate(
                 byte_offset,
                 kind,
             } => {
-                // Replace `ldr <fp>t, label` with:
-                //   str x16, [sp, #-16]!     ; spill a scratch GPR
-                //   movz/movk x16, target    ; materialize literal addr
-                //   ldr <fp>t, [x16, #0]     ; load from there
-                //   ldr x16, [sp], #16        ; restore
+                // Replace `ldr <fp>t, label` with the absolute address
+                // materialized in x16, which is parked in ctx around it.
                 let addr = pc.wrapping_add(byte_offset as u64);
-                out.push(enc_str_pre_index(16, 31, -16));
+                out.push(enc_str_imm(16, 17, regs_off(16)));
                 emit_imm64_compact(&mut out, 16, addr);
                 out.push(enc_ldr_fp_imm0(rt, 16, kind));
-                out.push(enc_ldr_post_index(16, 31, 16));
+                out.push(enc_ldr_imm(16, 17, regs_off(16)));
                 pc += 4;
                 count += 1;
             }
@@ -335,31 +338,28 @@ pub fn translate(
                 break;
             }
             InsnKind::BranchReg { rn } => {
-                emit_terminator_indirect(&mut out, rn, None, exit_tramp, ib_table);
+                emit_terminator_indirect(&mut out, rn, None, false, exit_tramp, ib_table);
                 break;
             }
             InsnKind::BranchLinkReg { rn, next_ip } => {
-                emit_terminator_indirect(&mut out, rn, Some(next_ip), exit_tramp, ib_table);
+                emit_terminator_indirect(&mut out, rn, Some(next_ip), false, exit_tramp, ib_table);
                 break;
             }
             InsnKind::Ret { rn } => {
-                emit_terminator_indirect(&mut out, rn, None, exit_tramp, ib_table);
+                emit_terminator_indirect(&mut out, rn, None, false, exit_tramp, ib_table);
                 break;
             }
             InsnKind::PacRet { use_b_key } => {
                 let _ = use_b_key;
-                out.push(enc_xpaci(30));
-                emit_terminator_indirect(&mut out, 30, None, exit_tramp, ib_table);
+                emit_terminator_indirect(&mut out, 30, None, true, exit_tramp, ib_table);
                 break;
             }
             InsnKind::PacBranchReg { rn } => {
-                out.push(enc_xpaci(rn));
-                emit_terminator_indirect(&mut out, rn, None, exit_tramp, ib_table);
+                emit_terminator_indirect(&mut out, rn, None, true, exit_tramp, ib_table);
                 break;
             }
             InsnKind::PacBranchLinkReg { rn, next_ip } => {
-                out.push(enc_xpaci(rn));
-                emit_terminator_indirect(&mut out, rn, Some(next_ip), exit_tramp, ib_table);
+                emit_terminator_indirect(&mut out, rn, Some(next_ip), true, exit_tramp, ib_table);
                 break;
             }
             InsnKind::PacNop => {
@@ -369,11 +369,12 @@ pub fn translate(
             }
             InsnKind::MrsTpidrro { rt } => {
                 // rt = ctx.guest_tsd, the guest's virtualized TSD base. An xzr
-                // destination discards the read; emitting the ctx load would
-                // turn xzr into a zero base register, so emit nothing.
+                // destination discards the read; emitting the load would turn
+                // xzr into a zero base register, so emit nothing.
                 if rt != 31 {
-                    emit_load_ctx(&mut out, rt);
-                    out.push(enc_ldr_imm(rt, rt, guest_tsd_off()));
+                    emit_into_guest_reg(&mut out, rt, |out, rt| {
+                        out.push(enc_ldr_imm(rt, 17, guest_tsd_off()))
+                    });
                 }
                 pc += 4;
                 count += 1;
@@ -399,35 +400,208 @@ pub fn translate(
         let words: Vec<String> = out.iter().map(|w| format!("{w:08x}")).collect();
         eprintln!("chimera: emit {guest_pc:#x} [{}]", words.join(" "));
     }
-    let linked_pc = cache.emit(&out)?;
+    let host_pc = cache.emit(&out)?;
     Ok(Translation {
-        // The dispatcher (and any exit trampoline) enters past the two-word
-        // linked entry, which only a linked predecessor may run.
-        host_pc: linked_pc + 8,
-        host_end: linked_pc + (out.len() as u64) * 4,
+        host_pc,
+        host_end: host_pc + (out.len() as u64) * 4,
         guest_end: pc + 4,
-        linked_pc,
         pc_map,
         edges,
     })
 }
 
+// === The reserved register ===
+
+/// How a guest instruction may touch x17, read off its encoding's register
+/// fields, or `None` when it cannot name the register at all. The answer errs
+/// toward naming it: a field that is a register in one encoding and an
+/// immediate in a neighbour is taken as a register, and a destination field
+/// that is sometimes flags (`ccmp`) as a write. Either costs a wrapper the
+/// instruction did not need, never a value it did: the wrapper loads the
+/// guest's x17 in before the instruction regardless, so storing it back after
+/// one that did not write it stores what was there.
+#[derive(Clone, Copy)]
+struct X17Use {
+    /// Whether the instruction may write x17, which the wrapper must then
+    /// store to `ctx.regs[17]`.
+    writes: bool,
+}
+
+/// The register fields a load/store encoding may carry: `Rt` (bits 0-4), `Rn`
+/// (5-9), `Rt2` (10-14), and `Rm`/`Rs` (16-20).
+fn x17_use(insn: u32) -> Option<X17Use> {
+    const R: u32 = 17;
+    let field = |lo: u32| (insn >> lo) & 0x1F;
+    let (rd, rn, ra, rm) = (field(0), field(5), field(10), field(16));
+    let (named, writes) = match (insn >> 25) & 0xF {
+        // Data-processing immediate: Rd is written, Rn read; extract reads
+        // Rm as well. Move-wide and bitfield insert read Rd too, which the
+        // unconditional pre-load covers.
+        0b1000 | 0b1001 => match (insn >> 23) & 0x7 {
+            0b000 | 0b001 | 0b101 => (rd == R, rd == R),
+            0b111 => (rd == R || rn == R || rm == R, rd == R),
+            _ => (rd == R || rn == R, rd == R),
+        },
+        // Branches never reach the plain copy (they are terminators); what is
+        // left is the system class, whose `mrs`/`msr`/`sys` name Rt.
+        0b1010 | 0b1011 => (rd == R, rd == R),
+        // Loads and stores.
+        0b0100 | 0b0110 | 0b1100 | 0b1110 => {
+            // `V` (bit 26) makes Rt (and Rt2) SIMD&FP registers; the base and
+            // an index register stay general.
+            let v = (insn >> 26) & 1 == 1;
+            match (insn >> 27) & 0x7 {
+                // Advanced SIMD load/store structures: a GPR base, written
+                // back by the post-index forms, which may also index by Rm.
+                0b001 if v => {
+                    let post = (insn >> 23) & 1 == 1;
+                    (rn == R || (post && rm == R), post && rn == R)
+                }
+                // Exclusives, compare-and-swap, ordered loads and stores:
+                // Rt, Rt2 and the Rs status register may all be written.
+                0b001 => (
+                    rd == R || rn == R || ra == R || rm == R,
+                    rd == R || ra == R || rm == R,
+                ),
+                // Literal loads are rewritten before this; LDAPR/STLR and the
+                // memory-copy instructions remain, the latter writing every
+                // register they name.
+                0b011 => (
+                    (!v && rd == R) || rn == R || rm == R,
+                    (!v && rd == R) || rn == R || rm == R,
+                ),
+                // Register pairs: Rt and Rt2, and the base, written back by
+                // the pre- and post-index forms (bit 23).
+                0b101 => {
+                    let writeback = (insn >> 23) & 1 == 1;
+                    (
+                        (!v && (rd == R || ra == R)) || rn == R,
+                        (!v && (rd == R || ra == R)) || (writeback && rn == R),
+                    )
+                }
+                // Single registers: unsigned offset (bit 24), the immediate
+                // forms with bits 11:10 selecting unscaled/post/unprivileged/
+                // pre (writeback for post and pre), and the bit-21 family —
+                // register offset, atomics with an Rs source, PAC-authenticated
+                // loads with a writeback option.
+                0b111 => {
+                    if (insn >> 24) & 1 == 1 {
+                        ((!v && rd == R) || rn == R, !v && rd == R)
+                    } else if (insn >> 21) & 1 == 0 {
+                        let writeback = (insn >> 10) & 1 == 1;
+                        (
+                            (!v && rd == R) || rn == R,
+                            (!v && rd == R) || (writeback && rn == R),
+                        )
+                    } else {
+                        (
+                            (!v && rd == R) || rn == R || rm == R,
+                            (!v && rd == R) || rn == R,
+                        )
+                    }
+                }
+                _ => (
+                    rd == R || rn == R || ra == R || rm == R,
+                    rd == R || rn == R || ra == R || rm == R,
+                ),
+            }
+        }
+        // Data-processing register: Rd written, Rn and Rm read, Ra too for
+        // the three-source group (bits 28:24 = 11011).
+        0b0101 | 0b1101 => {
+            let three_source = (insn >> 24) & 0x1F == 0b11011;
+            (
+                rd == R || rn == R || rm == R || (three_source && ra == R),
+                rd == R,
+            )
+        }
+        // SIMD and floating point: general registers appear only in the
+        // conversions and moves between a GPR and a vector register
+        // (`sf 0 S 11110 type 1 rmode opcode 000000 Rn Rd`) and in the SIMD
+        // copy group (`0 Q op 01110000 imm5 0 imm4 1 Rn Rd`: `dup`, `ins`,
+        // `umov`, `smov` with a general operand).
+        0b0111 | 0b1111 => {
+            let fp_int = insn & 0x5F20_FC00 == 0x1E20_0000;
+            let simd_copy = insn & 0x9FE0_8400 == 0x0E00_0400;
+            if fp_int || simd_copy {
+                (rd == R || rn == R, rd == R)
+            } else {
+                (false, false)
+            }
+        }
+        // Reserved, SVE and SME: not emitted for this host, so take every
+        // field as a register.
+        _ => (
+            rd == R || rn == R || ra == R || rm == R,
+            rd == R || rn == R || ra == R || rm == R,
+        ),
+    };
+    named.then_some(X17Use { writes })
+}
+
+/// A register the instruction names in none of its fields, to park across
+/// it: the wrapper stores it to its own `ctx` slot before the instruction,
+/// uses it as the base that saves the instruction's x17 afterwards, and
+/// restores it. Any of the 28 other general registers will do; the lowest is
+/// taken.
+fn park_register(insn: u32) -> u8 {
+    let fields = [
+        insn & 0x1F,
+        (insn >> 5) & 0x1F,
+        (insn >> 10) & 0x1F,
+        (insn >> 16) & 0x1F,
+    ];
+    (0u32..31)
+        .filter(|r| !matches!(r, 16 | 17))
+        .find(|r| !fields.contains(r))
+        .expect("an instruction names at most four registers") as u8
+}
+
+/// Emit a guest instruction that names x17, with the guest's x17 in the
+/// register while it runs. Before: the guest value replaces the context
+/// pointer. After: the context is re-derived from the TSD slot — into x17
+/// itself when the instruction only read it, or, when it may have written it,
+/// into a parked register that then serves as the base to store the result,
+/// so no value is lost for want of a free register.
+fn emit_x17_wrapped(out: &mut Vec<u32>, insn: u32, use_: X17Use) {
+    if !use_.writes {
+        out.push(enc_ldr_imm(17, 17, regs_off(17))); // x17 = guest x17
+        out.push(insn);
+        emit_load_ctx(out, 17);
+        return;
+    }
+    let park = park_register(insn);
+    out.push(enc_str_imm(park, 17, regs_off(park as usize))); // park
+    out.push(enc_ldr_imm(17, 17, regs_off(17))); // x17 = guest x17
+    out.push(insn);
+    emit_load_ctx(out, park); // park = ctx
+    out.push(enc_str_imm(17, park, regs_off(17))); // ctx.regs[17] = guest x17
+    out.push(enc_mov_reg(17, park)); // x17 = ctx
+    out.push(enc_ldr_imm(park, 17, regs_off(park as usize))); // unpark
+}
+
+/// Emit a rewrite whose result lands in guest register `rd`. For any register
+/// but x17 the rewrite writes it directly. For x17 the value is produced in
+/// x16 — parked in its ctx slot around the rewrite — and stored to
+/// `ctx.regs[17]`, where the guest's x17 lives.
+fn emit_into_guest_reg(out: &mut Vec<u32>, rd: u8, produce: impl FnOnce(&mut Vec<u32>, u8)) {
+    if rd != 17 {
+        produce(out, rd);
+        return;
+    }
+    out.push(enc_str_imm(16, 17, regs_off(16)));
+    produce(out, 16);
+    out.push(enc_str_imm(16, 17, regs_off(17)));
+    out.push(enc_ldr_imm(16, 17, regs_off(16)));
+}
+
 // === Terminator emission ===
 
-/// Push the guest x16/x17 to the guest stack, then load the ctx pointer
-/// into x17. After this sequence, x16 and x17 are scratch and `[sp, #0]`
-/// / `[sp, #8]` hold the guest values of x16 / x17.
-///
-/// The push writes below the guest's sp. AAPCS64 reserves nothing there and
-/// XNU itself pushes signal frames into it, so this breaks no guarantee — but
-/// a guest whose sp sits within 16 bytes of a guard page would not have taken
-/// the fault this can. Freeing a register without first having one is not
-/// possible on arm64, so the spill stays; `abi/red-zone.c` tracks the
-/// divergence and records what was ruled out.
-fn emit_save_x16_x17_and_load_ctx(out: &mut Vec<u32>) {
-    // stp x16, x17, [sp, #-16]!
-    out.push(enc_stp_pre_index(16, 17, 31, -16));
-    emit_load_ctx(out, 17); // x17 = ctx (this thread's TSD slot)
+/// Save the guest's x16 into `ctx.regs[16]`, freeing it as the stub's scratch.
+/// x17 is already the context pointer, so this is the whole bootstrap: one
+/// store, nothing on the guest stack.
+fn emit_save_x16(out: &mut Vec<u32>) {
+    out.push(enc_str_imm(16, 17, regs_off(16)));
 }
 
 /// Final tail of every exit stub: store the new pc into ctx.pc using x17
@@ -441,7 +615,7 @@ fn emit_exit_tail(out: &mut Vec<u32>, exit_tramp: u64) {
 /// Exit tail for an edge whose guest target is statically known: try the
 /// direct link first, fall back to the trampoline. `slot` is a word of
 /// ordinary read-write memory the cache fills with the successor block's
-/// linked entry once that block is translated (and re-zeroes when it is
+/// entry once that block is translated (and re-zeroes when it is
 /// invalidated), so linking never rewrites code — no JIT write-protect
 /// toggling, no instruction-cache maintenance, and a lock-free reader sees
 /// either the old value or the new one.
@@ -455,8 +629,8 @@ fn emit_exit_tail(out: &mut Vec<u32>, exit_tramp: u64) {
 /// boundary.
 ///
 /// Entry state matches [`emit_exit_tail`]: `x16` = next guest PC, `x17` =
-/// ctx, and the guest's own x16/x17 saved on the guest stack — which is why
-/// the link targets the successor's `linked_pc`, the entry that pops them.
+/// ctx, the guest's x16 saved in ctx — which is exactly what the successor's
+/// prologue expects, so the link targets the block entry itself.
 fn emit_exit_tail_linked(out: &mut Vec<u32>, exit_tramp: u64, slot: u64, poll: bool) {
     out.push(enc_str_imm(16, 17, pc_off())); // ctx.pc = x16
     if poll {
@@ -489,7 +663,7 @@ fn emit_terminator_direct(
     slot: Option<u64>,
     poll: bool,
 ) {
-    emit_save_x16_x17_and_load_ctx(out);
+    emit_save_x16(out);
     if let Some(next_ip) = next_ip_for_lr {
         // x30 = next_ip (BL semantics: discard guest x30 and write next_ip)
         emit_imm64_compact(out, 16, next_ip);
@@ -503,13 +677,9 @@ fn emit_terminator_direct(
 }
 
 /// Build one arm of a two-way terminator: materialize its next guest PC into
-/// x16 and emit its exit tail (linked or plain). `reload_ctx` re-derives x17
-/// for the arms of a test whose operand forced x17 to be borrowed.
-fn cond_arm(next_pc: u64, edge: Edge, exit_tramp: u64, reload_ctx: bool) -> Vec<u32> {
+/// x16 and emit its exit tail (linked or plain).
+fn cond_arm(next_pc: u64, edge: Edge, exit_tramp: u64) -> Vec<u32> {
     let mut arm = Vec::new();
-    if reload_ctx {
-        emit_load_ctx(&mut arm, 17);
-    }
     emit_imm64_compact(&mut arm, 16, next_pc);
     match edge.slot {
         Some(slot) => emit_exit_tail_linked(&mut arm, exit_tramp, slot, edge.poll),
@@ -536,33 +706,28 @@ pub struct TwoWay {
 }
 
 fn emit_terminator_cond(out: &mut Vec<u32>, cond: u8, ways: TwoWay, exit_tramp: u64) {
-    // The guest's NZCV is still live here: pushing x16/x17 and loading the ctx
-    // (stp/mrs/and/ldr) leaves the flags untouched, so the condition can be
-    // tested directly rather than materialized through `csel`. Each arm then
-    // ends in its own exit tail, which is what makes both edges linkable.
-    emit_save_x16_x17_and_load_ctx(out);
-    let not_taken_arm = cond_arm(ways.fallthrough, ways.not_taken, exit_tramp, false);
-    let taken_arm = cond_arm(ways.target, ways.taken, exit_tramp, false);
+    // The guest's NZCV is still live here: saving x16 leaves the flags
+    // untouched, so the condition can be tested directly rather than
+    // materialized through `csel`. Each arm then ends in its own exit tail,
+    // which is what makes both edges linkable.
+    emit_save_x16(out);
+    let not_taken_arm = cond_arm(ways.fallthrough, ways.not_taken, exit_tramp);
+    let taken_arm = cond_arm(ways.target, ways.taken, exit_tramp);
     out.push(enc_b_cond(cond, not_taken_arm.len() as i32 + 1));
     out.extend_from_slice(&not_taken_arm);
     out.extend_from_slice(&taken_arm);
 }
 
-/// Save the guest x16/x17 and get the register-test terminators' operand into
-/// a register that survives it. CBZ/TBZ read `rt` and touch no flags, but the
-/// stub is about to clobber x16/x17 — so when `rt` is one of those, its guest
-/// value is reloaded from the stack slot the push just wrote, into x17. The
-/// arms then re-derive the ctx pointer for themselves.
+/// Save the guest x16 and name the register the register-test terminators
+/// should test. CBZ/TBZ read `rt` and touch no flags. x16 still holds its
+/// guest value after the save, so it is tested in place; the guest's x17
+/// lives in ctx and is loaded into the freed x16 for the test.
 fn emit_test_operand(out: &mut Vec<u32>, rt: u8) -> u8 {
-    out.push(enc_stp_pre_index(16, 17, 31, -16));
+    emit_save_x16(out);
     match rt {
-        16 => {
-            out.push(enc_ldr_imm(17, 31, 0)); // ldr x17, [sp]
-            17
-        }
         17 => {
-            out.push(enc_ldr_imm(17, 31, 8)); // ldr x17, [sp, #8]
-            17
+            out.push(enc_ldr_imm(16, 17, regs_off(17)));
+            16
         }
         _ => rt,
     }
@@ -577,8 +742,8 @@ fn emit_terminator_cbz(
     exit_tramp: u64,
 ) {
     let test_reg = emit_test_operand(out, rt);
-    let not_taken_arm = cond_arm(ways.fallthrough, ways.not_taken, exit_tramp, true);
-    let taken_arm = cond_arm(ways.target, ways.taken, exit_tramp, true);
+    let not_taken_arm = cond_arm(ways.fallthrough, ways.not_taken, exit_tramp);
+    let taken_arm = cond_arm(ways.target, ways.taken, exit_tramp);
     let over = not_taken_arm.len() as i32 + 1;
     out.push(if sf {
         enc_cbz64(test_reg, nonzero, over)
@@ -598,8 +763,8 @@ fn emit_terminator_tbz(
     exit_tramp: u64,
 ) {
     let test_reg = emit_test_operand(out, rt);
-    let not_taken_arm = cond_arm(ways.fallthrough, ways.not_taken, exit_tramp, true);
-    let taken_arm = cond_arm(ways.target, ways.taken, exit_tramp, true);
+    let not_taken_arm = cond_arm(ways.fallthrough, ways.not_taken, exit_tramp);
+    let taken_arm = cond_arm(ways.target, ways.taken, exit_tramp);
     // TBZ's imm14 is in instruction units — ample for an arm of this size.
     out.push(enc_tbz(
         test_reg,
@@ -611,66 +776,35 @@ fn emit_terminator_tbz(
     out.extend_from_slice(&taken_arm);
 }
 
+/// `BR`/`BLR`/`RET` and their PAC-authenticating forms (`strip_pac`, which
+/// lowers the authentication to `xpaci` on the target — Chimera keeps every
+/// pointer unsigned). The target is read from `rn` before anything is
+/// clobbered: x16 is its own guest value until the save, and the guest's x17
+/// is in ctx.
 fn emit_terminator_indirect(
     out: &mut Vec<u32>,
     rn: u8,
     next_ip_for_lr: Option<u64>,
+    strip_pac: bool,
     exit_tramp: u64,
     ib_table: u64,
 ) {
-    // The source register `rn` could be x16 or x17, whose guest values
-    // are about to be (or already have been) pushed onto the stack. We
-    // capture rn FIRST into a temp on the stack, then proceed.
-    //
-    // Sequence:
-    //   str rn, [sp, #-16]!         ; spill rn (if rn=16/17 still live)
-    //   stp x16, x17, [sp, #-16]!   ; now save guest x16, x17 too
-    //   (but that double-pushes for rn != 16/17)
-    //
-    // Easier: handle each case.
-    //   rn != 16, 17, 30:  rn's live value is its guest value. Push x16/x17,
-    //                      load ctx, build next_ip / pc / tail using rn
-    //                      directly.
-    //   rn == 16:          rn's guest value is in the live x16 BEFORE we
-    //                      stp. Capture into a temp first.
-    //   rn == 17:          similarly.
-    //   rn == 30 + BL:     for BL we'll overwrite x30 with next_ip, so
-    //                      capture x30 first.
-    //
-    // For BL: we read x30 BEFORE overwriting. The original x30 is the
-    // *new* x30 = next_ip; the OLD x30 (return address of caller) is what
-    // exit_block stores into ctx.regs[30]. Wait — BLR semantics: x30 =
-    // next_ip; pc = xRn. The OLD x30 is discarded. So we just need to
-    // overwrite x30 with next_ip; the next_ip ends up in ctx.regs[30]
-    // when exit_block runs (because it reads live x30).
-
-    // Step 1: save guest x16, x17 (we'll clobber them).
-    out.push(enc_stp_pre_index(16, 17, 31, -16));
-
-    // Step 2: load ctx into x17.
-    emit_load_ctx(out, 17); // x17 = ctx (this thread's TSD slot)
-
-    // Step 3: read the indirect target (xRn's guest value) into x16.
-    if rn == 16 {
-        // Guest x16 was just pushed at [sp, #0] (16 bytes below current sp,
-        // but sp was pre-decremented, so it's at [sp, #0]).
-        out.push(enc_ldr_imm(16, 31, 0));
-    } else if rn == 17 {
-        out.push(enc_ldr_imm(16, 31, 8));
-    } else {
-        // Plain mov x16, xRn.
-        out.push(enc_mov_reg(16, rn));
+    emit_save_x16(out);
+    match rn {
+        16 => {}
+        17 => out.push(enc_ldr_imm(16, 17, regs_off(17))),
+        _ => out.push(enc_mov_reg(16, rn)),
     }
-
-    // Step 4: if this is a call (BL/BLR), set x30 = next_ip. We use
-    // a small scratch dance: spill x16 to ctx.pc, build next_ip in x16,
-    // mov it to x30, then rebuild target in x16.
+    if strip_pac {
+        out.push(enc_xpaci(16));
+    }
+    // A call sets x30 = next_ip after the target has been read (BLR x30
+    // reads the old value). The target is parked in ctx.pc while x16
+    // materializes the return address.
     if let Some(next_ip) = next_ip_for_lr {
-        // ctx.pc = x16 (the target we just read)
         out.push(enc_str_imm(16, 17, pc_off()));
         emit_imm64_compact(out, 16, next_ip);
         out.push(enc_mov_reg(30, 16));
-        // Re-read ctx.pc back into x16 to set up the tail.
         out.push(enc_ldr_imm(16, 17, pc_off()));
     }
 
@@ -689,8 +823,9 @@ fn emit_terminator_indirect(
 /// this probe, every function return leaves the cache.
 ///
 /// Entry state matches [`emit_exit_tail`]: `x16` = target guest PC, `x17` =
-/// ctx, guest x16/x17 on the guest stack. The probe borrows one more
-/// register (x0) through a second stack slot, popped on both paths.
+/// ctx, guest x16 saved in ctx. The probe borrows x0 and x1, parked in their
+/// own ctx slots and restored on both paths, and keeps x17 as the context
+/// throughout — the successor's prologue expects it.
 ///
 /// The table is read with a single aligned `ldp`, which is single-copy atomic
 /// on this backend's hardware (see `CodeCache::ib_insert`), so the key and
@@ -713,27 +848,26 @@ fn emit_ib_probe(out: &mut Vec<u32>, exit_tramp: u64, ib_table: u64) {
     emit_imm64_fixed(&mut cold, 16, exit_tramp);
     cold.push(enc_br(16));
 
-    // The probe proper, with x0 borrowed as a third scratch register.
+    // The probe proper, with x0 and x1 borrowed as scratch.
     let mut probe = Vec::new();
-    probe.push(enc_str_pre_index(0, 31, -16)); // spill guest x0
-    probe.push(enc_ldr_imm(16, 17, pc_off())); // x16 = target
+    probe.push(enc_stp_imm(0, 1, 17, regs_off(0))); // park guest x0, x1
+    probe.push(enc_ldr_imm(16, 17, pc_off())); // x16 = target (the poll used x16)
     emit_imm64_fixed(&mut probe, 0, IB_HASH_MULT);
     probe.push(enc_mul(0, 16, 0)); // x0 = target * MULT
     probe.push(enc_lsr_imm(0, 0, 64 - IB_BITS)); // x0 = slot index
-    emit_imm64_fixed(&mut probe, 17, ib_table); // x17 = table base (ctx dropped)
-    probe.push(enc_add_lsl(0, 17, 0, 4)); // x0 = &entry (16 bytes each)
-    probe.push(enc_ldp_imm0(17, 0, 0)); // x17 = key, x0 = host
-    probe.push(enc_eor_reg(17, 17, 16)); // zero exactly when the key matches
+    emit_imm64_fixed(&mut probe, 1, ib_table); // x1 = table base
+    probe.push(enc_add_lsl(0, 1, 0, 4)); // x0 = &entry (16 bytes each)
+    probe.push(enc_ldp_imm(1, 0, 0, 0)); // x1 = key, x0 = host
+    probe.push(enc_eor_reg(1, 1, 16)); // zero exactly when the key matches
     // A miss (wrong key, or an empty slot) skips the four hit words —
-    // cbnz/mov/restore/br — landing on the restore-and-cold tail below.
-    probe.push(enc_cbz64(17, true, 5));
+    // cbz/mov/restore/br — landing on the restore-and-cold tail below.
+    probe.push(enc_cbz64(1, true, 5));
     probe.push(enc_cbz64(0, false, 4)); // empty slot -> miss
-    probe.push(enc_mov_reg(16, 0)); // x16 = successor linked entry
-    probe.push(enc_ldr_post_index(0, 31, 16)); // restore guest x0
+    probe.push(enc_mov_reg(16, 0)); // x16 = successor entry
+    probe.push(enc_ldp_imm(0, 1, 17, regs_off(0))); // restore guest x0, x1
     probe.push(enc_br(16));
-    // Miss: restore x0 and the ctx pointer, then fall into the cold tail.
-    probe.push(enc_ldr_post_index(0, 31, 16));
-    emit_load_ctx(&mut probe, 17);
+    // Miss: restore x0 and x1, then fall into the cold tail.
+    probe.push(enc_ldp_imm(0, 1, 17, regs_off(0)));
 
     // Poll first: if a stop or a pending signal is armed, skip the probe.
     out.push(enc_ldr32_imm(16, 17, exit_requested_off()));
@@ -747,29 +881,17 @@ fn emit_ib_probe(out: &mut Vec<u32>, exit_tramp: u64, ib_table: u64) {
 /// instruction — a guest handler that returns re-executes it, exactly as it
 /// would natively.
 fn emit_terminator_brk(out: &mut Vec<u32>, pc: u64, trap_exit: u64) {
-    emit_save_x16_x17_and_load_ctx(out);
+    emit_save_x16(out);
     emit_imm64_compact(out, 16, pc);
     emit_exit_tail(out, trap_exit);
 }
 
+/// `SVC`: the syscall number is in the guest's x16, saved like any other
+/// terminator's; the resume pc is the next instruction. Nothing touches the
+/// guest stack, which is the kernel's own contract for a syscall
+/// (`testing/conformance/abi/syscall-no-stack-touch.c`).
 fn emit_terminator_svc(out: &mut Vec<u32>, next_ip: u64, syscall_tramp: u64) {
-    // SVC: real kernels switch to their own kernel stack and never touch
-    // the user stack — `testing/conformance/abi/syscall-no-stack-touch.c`
-    // exercises exactly this property. Unlike the generic `B`/`BL` exit
-    // paths (which spill x16/x17 to the guest stack), the SVC stub stores
-    // the syscall number directly into `ctx.regs[16]` and clobbers x17 as
-    // the ctx scratch. Discarding x17 is fine: AArch64 PCS marks it as
-    // IP1, an inter-procedure-call scratch that callees and the kernel
-    // are free to clobber.
-    //
-    //   mrs  x17, tpidrro_el0 ; and ; ldr  ; x17 = ctx (this thread's TSD slot)
-    //   str  x16, [x17, #regs_off(16)]    ; ctx.regs[16] = syscall number
-    //   movz/movk x16, #next_ip
-    //   str  x16, [x17, #pc_off]           ; ctx.pc = resume pc
-    //   movz/movk x16, #syscall_tramp
-    //   br   x16
-    emit_load_ctx(out, 17); // x17 = ctx (this thread's TSD slot)
-    out.push(enc_str_imm(16, 17, regs_off(16)));
+    emit_save_x16(out);
     emit_imm64_compact(out, 16, next_ip);
     out.push(enc_str_imm(16, 17, pc_off()));
     emit_imm64_fixed(out, 16, syscall_tramp);
@@ -1099,25 +1221,30 @@ fn enc_eor_reg(rd: u8, rn: u8, rm: u8) -> u32 {
     0xCA000000 | ((rm as u32 & 0x1F) << 16) | ((rn as u32 & 0x1F) << 5) | (rd as u32 & 0x1F)
 }
 
-/// `ldp <rt1>, <rt2>, [<rn>]` — 64-bit signed-offset load pair at offset 0.
-fn enc_ldp_imm0(rt1: u8, rt2: u8, rn: u8) -> u32 {
-    0xA9400000 | ((rt2 as u32 & 0x1F) << 10) | ((rn as u32 & 0x1F) << 5) | (rt1 as u32 & 0x1F)
+/// `ldp <rt1>, <rt2>, [<rn>, #imm]` — 64-bit signed-offset load pair.
+fn enc_ldp_imm(rt1: u8, rt2: u8, rn: u8, byte_offset: u32) -> u32 {
+    let imm7 = (byte_offset / 8) & 0x7F;
+    0xA9400000
+        | (imm7 << 15)
+        | ((rt2 as u32 & 0x1F) << 10)
+        | ((rn as u32 & 0x1F) << 5)
+        | (rt1 as u32 & 0x1F)
+}
+
+/// `stp <rt1>, <rt2>, [<rn>, #imm]` — 64-bit signed-offset store pair.
+fn enc_stp_imm(rt1: u8, rt2: u8, rn: u8, byte_offset: u32) -> u32 {
+    let imm7 = (byte_offset / 8) & 0x7F;
+    0xA9000000
+        | (imm7 << 15)
+        | ((rt2 as u32 & 0x1F) << 10)
+        | ((rn as u32 & 0x1F) << 5)
+        | (rt1 as u32 & 0x1F)
 }
 
 /// `b.<cond> <insn_offset>` — conditional branch, offset in instructions.
 fn enc_b_cond(cond: u8, insn_offset: i32) -> u32 {
     let imm19 = (insn_offset as u32) & 0x7FFFF;
     0x54000000 | (imm19 << 5) | (cond as u32 & 0xF)
-}
-
-/// `ldp <rt1>, <rt2>, [<rn>], #imm` — 64-bit post-index load pair.
-fn enc_ldp_post_index(rt1: u8, rt2: u8, rn: u8, byte_offset: i32) -> u32 {
-    let imm7 = ((byte_offset / 8) as u32) & 0x7F;
-    0xA8C00000
-        | (imm7 << 15)
-        | ((rt2 as u32 & 0x1F) << 10)
-        | ((rn as u32 & 0x1F) << 5)
-        | (rt1 as u32 & 0x1F)
 }
 
 fn enc_movz(rd: u8, imm: u16, shift: u8) -> u32 {
@@ -1149,37 +1276,8 @@ fn enc_str_imm(rt: u8, rn: u8, byte_offset: u32) -> u32 {
     0xF9000000 | (imm12 << 10) | ((rn as u32 & 0x1F) << 5) | (rt as u32 & 0x1F)
 }
 
-/// `str xt, [sp, #imm]!` — pre-indexed store with writeback. `rn=31`
-/// is SP. imm is signed 9-bit.
-fn enc_str_pre_index(rt: u8, rn: u8, imm: i32) -> u32 {
-    let imm9 = ((imm as u32) & 0x1FF) << 12;
-    0xF8000C00 | imm9 | ((rn as u32 & 0x1F) << 5) | (rt as u32 & 0x1F)
-}
-
-/// `ldr xt, [sp], #imm` — post-indexed load with writeback.
-fn enc_ldr_post_index(rt: u8, rn: u8, imm: i32) -> u32 {
-    let imm9 = ((imm as u32) & 0x1FF) << 12;
-    0xF8400400 | imm9 | ((rn as u32 & 0x1F) << 5) | (rt as u32 & 0x1F)
-}
-
-/// `stp xt1, xt2, [rn, #imm]!` — pre-indexed STP with writeback. imm is
-/// signed 7-bit *8 (so byte_offset must be a multiple of 8).
-fn enc_stp_pre_index(rt1: u8, rt2: u8, rn: u8, byte_offset: i32) -> u32 {
-    let imm7 = ((byte_offset / 8) & 0x7F) as u32;
-    0xA9800000
-        | (imm7 << 15)
-        | ((rt2 as u32 & 0x1F) << 10)
-        | ((rn as u32 & 0x1F) << 5)
-        | (rt1 as u32 & 0x1F)
-}
-
 fn enc_br(rn: u8) -> u32 {
     0xD61F0000 | ((rn as u32 & 0x1F) << 5)
-}
-
-fn enc_b_imm(insn_offset: i32) -> u32 {
-    let imm26 = (insn_offset as u32) & 0x03FFFFFF;
-    0x14000000 | imm26
 }
 
 fn enc_cbz32(rt: u8, nonzero: bool, insn_offset: i32) -> u32 {

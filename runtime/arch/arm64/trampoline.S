@@ -7,12 +7,13 @@
 // sets `exit_kind = SYSCALL` so the dispatcher knows to invoke the
 // embedder's `SystemCalls` handler before re-entering the cache.
 //
-// No GPR is reserved across translated code. Translated blocks find their
-// ThreadState through a per-thread pthread TSD slot (read via TPIDRRO_EL0 —
-// see translate::emit_load_ctx), so nothing needs a reserved register. Apple's
-// arm64 platform reserves x18 for the kernel, which on macOS may be silently
-// zeroed on signal delivery, which is one reason the ctx lives in the TSD, not
-// a register.
+// x17 is Chimera's inside translated code: `dispatch` enters the cache with
+// it holding the ctx pointer, every exit stub reaches the ctx through it, and
+// the guest's own x17 lives in `ctx.regs[17]` — which is why neither path
+// moves the hardware x17 to or from that slot. (Apple's platform reserves x18,
+// which would have done, but macOS silently zeroes it across kernel entries;
+// the translator re-derives x17 from a pthread TSD slot where a guest
+// instruction has had to use it — see translate::emit_load_ctx.)
 //
 // All TS_* placeholders are field offsets into ThreadState, supplied by
 // global_asm! via offset_of!. Update the struct and the asm picks up the
@@ -25,7 +26,6 @@
 .globl _exit_block
 .globl _exit_syscall
 .globl _exit_trap
-.globl _exit_syscall_no_stack
 
 // fn dispatch(ctx: *mut ThreadState /* x0 */, host_pc: u64 /* x1 */)
 //
@@ -76,7 +76,7 @@ _dispatch:
     mov     sp, x9
 
     // Load guest GPRs from regs[]. x0 stays as the ctx base until the end;
-    // we load x16 last because it carries host_pc into the branch.
+    // x16 carries host_pc into the branch, and x17 is the ctx itself.
     ldr     x1,  [x0, #({TS_REGS} + 8)]
     ldp     x2,  x3,  [x0, #({TS_REGS} + 16)]
     ldp     x4,  x5,  [x0, #({TS_REGS} + 32)]
@@ -85,7 +85,7 @@ _dispatch:
     ldp     x10, x11, [x0, #({TS_REGS} + 80)]
     ldp     x12, x13, [x0, #({TS_REGS} + 96)]
     ldp     x14, x15, [x0, #({TS_REGS} + 112)]
-    ldr     x17, [x0, #({TS_REGS} + 136)]
+    mov     x17, x0
     ldp     x18, x19, [x0, #({TS_REGS} + 144)]
     ldp     x20, x21, [x0, #({TS_REGS} + 160)]
     ldp     x22, x23, [x0, #({TS_REGS} + 176)]
@@ -100,14 +100,13 @@ _dispatch:
     // x16 has been clobbered; every translated block's prologue reloads it.
 
 // Common exit-trampoline tail. Reached after the per-block exit stub has:
-//   - pushed guest x16/x17 to the guest stack (the very first thing it does)
+//   - saved guest x16 into ctx.regs[16] (the very first thing it does)
 //   - written next_pc to ctx.pc
-//   - loaded the ctx pointer into x17
-//   - branched here via x16 (so x16 is also free)
+//   - branched here via x16 (so x16 is free)
 //
 // Pre-conditions on entry:
-//   - x0..x15, x18..x30 hold guest values
-//   - sp = guest_sp - 16, with guest x16 at [sp, #0] and guest x17 at [sp, #8]
+//   - x0..x15, x18..x30 hold guest values; guest x17 is in ctx.regs[17]
+//   - sp = guest sp, untouched
 //   - x16 = scratch (was the trampoline target), x17 = ctx pointer
 .macro EXIT_TAIL_COMMON
     // Save x0..x15 directly via the ctx base in x17.
@@ -127,11 +126,7 @@ _dispatch:
     stp     x26, x27, [x17, #({TS_REGS} + 208)]
     stp     x28, x29, [x17, #({TS_REGS} + 224)]
     str     x30, [x17, #({TS_REGS} + 240)]
-    // Pop the pushed guest x16/x17 off the guest stack and store them in
-    // their proper slots.
-    ldp     x0,  x1,  [sp], #16
-    stp     x0,  x1,  [x17, #({TS_REGS} + 128)]
-    // Save guest sp (now back to its pre-push value).
+    // Save guest sp.
     mov     x0, sp
     str     x0, [x17, #{TS_SP}]
     // Save NZCV.
@@ -207,80 +202,13 @@ _exit_trap:
     str     x16, [x17, #{TS_EXIT_KIND}]
     EXIT_TAIL_COMMON
 
+// An SVC exited the cache. Same flow as _exit_block, but record
+// exit_kind = SYSCALL before restoring chimera state. x16 — already
+// clobbered by the exit stub — is the scratch; touching x0 here would
+// overwrite the guest's x0 *before* EXIT_TAIL_COMMON has a chance to save it.
+// Nothing here touches the guest stack, honouring the kernel's own contract
+// for a syscall (`testing/conformance/abi/syscall-no-stack-touch.c`).
 _exit_syscall:
-    // Same flow as _exit_block, but record exit_kind = SYSCALL before
-    // restoring chimera state. We must use x16 — already clobbered by the
-    // exit stub — as the scratch; touching x0 here would overwrite the
-    // guest's x0 *before* EXIT_TAIL_COMMON has a chance to save it,
-    // causing every syscall to see x0 = 1 (the EXIT_KIND_SYSCALL value).
     mov     x16, #{EXIT_KIND_SYSCALL}
     str     x16, [x17, #{TS_EXIT_KIND}]
     EXIT_TAIL_COMMON
-
-// Variant of _exit_syscall for SVC sites: assumes the per-block stub
-// already saved guest x16 directly into `ctx.regs[16]` and did NOT push
-// anything onto the guest stack. The kernel's SVC contract is "user
-// stack untouched", and our translator must honour that — any guest that
-// parks `sp` over a guard page (as the syscall-no-stack-touch
-// conformance test does) would otherwise fault when our stub pushed.
-//
-// Pre-conditions on entry:
-//   - x0..x15 hold guest values (x16 already saved by the stub).
-//   - x17 = ctx pointer (set by the stub).
-//   - x18..x30 hold guest values.
-//   - sp = guest_sp (untouched).
-//
-// x17's guest value is discarded: x17 is an IP scratch register per the
-// AArch64 PCS, and Darwin syscalls are free to clobber it.
-_exit_syscall_no_stack:
-    stp     x0,  x1,  [x17, #({TS_REGS} + 0)]
-    stp     x2,  x3,  [x17, #({TS_REGS} + 16)]
-    stp     x4,  x5,  [x17, #({TS_REGS} + 32)]
-    stp     x6,  x7,  [x17, #({TS_REGS} + 48)]
-    stp     x8,  x9,  [x17, #({TS_REGS} + 64)]
-    stp     x10, x11, [x17, #({TS_REGS} + 80)]
-    stp     x12, x13, [x17, #({TS_REGS} + 96)]
-    stp     x14, x15, [x17, #({TS_REGS} + 112)]
-    // x16: already saved by the stub. x17: not preserved (scratch).
-    stp     x18, x19, [x17, #({TS_REGS} + 144)]
-    stp     x20, x21, [x17, #({TS_REGS} + 160)]
-    stp     x22, x23, [x17, #({TS_REGS} + 176)]
-    stp     x24, x25, [x17, #({TS_REGS} + 192)]
-    stp     x26, x27, [x17, #({TS_REGS} + 208)]
-    stp     x28, x29, [x17, #({TS_REGS} + 224)]
-    str     x30, [x17, #({TS_REGS} + 240)]
-    mov     x0, sp
-    str     x0, [x17, #{TS_SP}]
-    mrs     x0, nzcv
-    str     x0, [x17, #{TS_NZCV}]
-    stp     q0,  q1,  [x17, #({TS_FPSTATE} + 0)]
-    stp     q2,  q3,  [x17, #({TS_FPSTATE} + 32)]
-    stp     q4,  q5,  [x17, #({TS_FPSTATE} + 64)]
-    stp     q6,  q7,  [x17, #({TS_FPSTATE} + 96)]
-    stp     q8,  q9,  [x17, #({TS_FPSTATE} + 128)]
-    stp     q10, q11, [x17, #({TS_FPSTATE} + 160)]
-    stp     q12, q13, [x17, #({TS_FPSTATE} + 192)]
-    stp     q14, q15, [x17, #({TS_FPSTATE} + 224)]
-    stp     q16, q17, [x17, #({TS_FPSTATE} + 256)]
-    stp     q18, q19, [x17, #({TS_FPSTATE} + 288)]
-    stp     q20, q21, [x17, #({TS_FPSTATE} + 320)]
-    stp     q22, q23, [x17, #({TS_FPSTATE} + 352)]
-    stp     q24, q25, [x17, #({TS_FPSTATE} + 384)]
-    stp     q26, q27, [x17, #({TS_FPSTATE} + 416)]
-    stp     q28, q29, [x17, #({TS_FPSTATE} + 448)]
-    stp     q30, q31, [x17, #({TS_FPSTATE} + 480)]
-    mrs     x0, fpsr
-    str     w0, [x17, #({TS_FPSTATE} + 512)]
-    mrs     x0, fpcr
-    str     w0, [x17, #({TS_FPSTATE} + 516)]
-    mov     x0, #{EXIT_KIND_SYSCALL}
-    str     x0, [x17, #{TS_EXIT_KIND}]
-    ldr     x0, [x17, #{TS_CHIMERA_SP}]
-    mov     sp, x0
-    ldp     x29, x30, [sp], #16
-    ldp     x27, x28, [sp], #16
-    ldp     x25, x26, [sp], #16
-    ldp     x23, x24, [sp], #16
-    ldp     x21, x22, [sp], #16
-    ldp     x19, x20, [sp], #16
-    ret

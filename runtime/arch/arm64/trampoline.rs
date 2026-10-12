@@ -41,7 +41,7 @@ global_asm!(
 unsafe extern "C" {
     pub fn dispatch(ctx: *mut ThreadState, host_pc: u64);
     pub fn exit_block();
-    pub fn exit_syscall_no_stack();
+    pub fn exit_syscall();
     /// Tail for a guest `BRK`: records `exit_kind = TRAP` and unwinds.
     pub fn exit_trap();
     /// Re-entry after a synchronous fault redirected into a guest handler: the
