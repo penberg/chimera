@@ -323,12 +323,15 @@ impl Process {
     /// guards, which unlock on drop in both processes — the `pthread_atfork`
     /// discipline, applied at the one place Chimera forwards a fork. The
     /// lock order nests like `request_exec` (`exec_request`, then
-    /// `threads`); `addr_space` is never nested with either.
+    /// `threads`); `addr_space` is never nested with either. The vcpu
+    /// backend's process-wide lock, which the child takes when it attaches
+    /// again, is held the same way.
     pub fn lock_for_fork(&self) -> ForkLocks<'_> {
         ForkLocks {
             _exec_request: self.exec_request.lock().unwrap(),
             _threads: self.threads.lock().unwrap(),
             _addr_space: self.addr_space.lock().unwrap(),
+            _sud: sud::lock_for_fork(),
         }
     }
 
@@ -358,6 +361,7 @@ pub struct ForkLocks<'a> {
     _exec_request: MutexGuard<'a, Option<PreparedExec>>,
     _threads: MutexGuard<'a, Vec<*const ThreadState>>,
     _addr_space: MutexGuard<'a, AddressSpace>,
+    _sud: sud::ForkLock,
 }
 
 // SAFETY: the `handler` field is already `Send + Sync` (the `SystemCalls`

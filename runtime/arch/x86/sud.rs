@@ -24,7 +24,7 @@ use std::{
     mem::{self, offset_of},
     ptr,
     sync::{
-        Mutex,
+        Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -81,6 +81,18 @@ struct Installed {
 unsafe impl Send for Installed {}
 
 static INSTALLED: Mutex<Option<Installed>> = Mutex::new(None);
+
+/// [`INSTALLED`], held across a forwarded `fork` (see
+/// `Process::lock_for_fork`).
+pub struct ForkLock {
+    _installed: MutexGuard<'static, Option<Installed>>,
+}
+
+pub fn lock_for_fork() -> ForkLock {
+    ForkLock {
+        _installed: INSTALLED.lock().unwrap(),
+    }
+}
 
 /// Whether this process runs guest code natively.
 pub fn active() -> bool {
