@@ -292,6 +292,14 @@ impl Vfs for HostFs {
         })
     }
 
+    fn bind(
+        &self,
+        path: &Path,
+        bind: &mut dyn FnMut(&Path) -> Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        bind(&self.host_path(path))
+    }
+
     fn mknod(&self, path: &Path, mode: Mode, dev: u64) -> Result<(), Errno> {
         let crel = crel(path)?;
         // A FIFO is the one node an unprivileged process may create, and

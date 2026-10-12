@@ -10,6 +10,7 @@ use std::{
 
 use crate::{
     ForkHold, SyscallResult, SystemCall, SystemCalls, host_syscall, sys::hostfs::BACKING_FLOOR,
+    sys::mmap::copy_from_guest,
 };
 
 use super::{
@@ -26,6 +27,43 @@ pub const FD_LINK_PREFIXES: &[&[u8]] = &[b"/dev/fd/", b"/proc/self/fd/", b"/proc
 pub fn is_magic_exe(p: &Path) -> bool {
     let s = p.as_os_str().as_bytes();
     s == b"/proc/self/exe" || s == b"/proc/thread-self/exe"
+}
+
+/// The path a `sockaddr_un` of `len` bytes at `addr` names, or `None` for
+/// an address the kernel should see as the guest built it: not `AF_UNIX`,
+/// unnamed, or in Linux's abstract namespace (a leading NUL), which no
+/// filesystem path can reach. Linux's `sockaddr_un` is `sa_family_t` then
+/// `sun_path[108]`.
+pub fn unix_socket_path(addr: u64, len: usize) -> Option<Vec<u8>> {
+    const HEADER: usize = 2;
+    const SUN_PATH: usize = 108;
+    let len = len.min(HEADER + SUN_PATH);
+    if len <= HEADER {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    if !copy_from_guest(addr, &mut buf)
+        || u16::from_ne_bytes([buf[0], buf[1]]) as i32 != libc::AF_UNIX
+    {
+        return None;
+    }
+    let path = &buf[HEADER..];
+    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    (end > 0).then(|| path[..end].to_vec())
+}
+
+/// A `sockaddr_un` naming the host path `path`, NUL-terminated, or `None`
+/// when the path does not fit `sun_path`.
+pub fn unix_sockaddr(path: &[u8]) -> Option<Vec<u8>> {
+    const SUN_PATH: usize = 108;
+    if path.len() >= SUN_PATH {
+        return None;
+    }
+    let mut out = Vec::with_capacity(2 + path.len() + 1);
+    out.extend_from_slice(&(libc::AF_UNIX as u16).to_ne_bytes());
+    out.extend_from_slice(path);
+    out.push(0);
+    Some(out)
 }
 
 /// `execveat(fd, "", AT_EMPTY_PATH)`: the fd names the file.
@@ -374,6 +412,16 @@ impl SystemCalls for Personality {
 
             // Everything else — including host-fd I/O and syscalls not modeled
             // here — goes to the host kernel unchanged.
+            // A Unix-domain socket's name is a path in the namespace.
+            libc::SYS_bind => {
+                self.bind_unix(call);
+                return;
+            }
+            libc::SYS_connect => {
+                self.connect_unix(call);
+                return;
+            }
+
             _ => {
                 call.set_result(host_syscall(call));
                 return;

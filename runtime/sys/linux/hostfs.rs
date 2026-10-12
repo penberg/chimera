@@ -320,6 +320,14 @@ impl Vfs for HostFs {
         check(unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), tp, flags) })
     }
 
+    fn bind(
+        &self,
+        path: &Path,
+        bind: &mut dyn FnMut(&Path) -> Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        bind(&self.host_path(path))
+    }
+
     fn mknod(&self, path: &Path, mode: Mode, dev: u64) -> Result<(), Errno> {
         let cpath = cpath(&self.host_path(path))?;
         check(unsafe { libc::mknod(cpath.as_ptr(), mode.0 as libc::mode_t, dev as libc::dev_t) })

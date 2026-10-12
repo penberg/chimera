@@ -624,6 +624,29 @@ impl Vfs for OverlayFs {
             .mutate_upper(path, |upper| upper.utimens(path, follow, times))
     }
 
+    fn bind(
+        &self,
+        path: &Path,
+        bind: &mut dyn FnMut(&Path) -> Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        // A new name, placed like `mknod`'s: a lower-visible one is EEXIST
+        // (the upper cannot see it), a whiteout is replaced in one exchange.
+        match self.inner.visibility(path)? {
+            Visibility::Lower if self.inner.lower_visible(path) => {
+                return Err(Errno::EEXIST);
+            }
+            Visibility::Whiteout => {
+                return self
+                    .inner
+                    .delta
+                    .replace_whiteout(path, |staging| bind(staging));
+            }
+            _ => {}
+        }
+        self.inner.delta.materialize_parents(path)?;
+        self.inner.upper.bind(path, bind)
+    }
+
     fn mknod(&self, path: &Path, mode: Mode, dev: u64) -> Result<(), Errno> {
         // The node is a new name: a lower-visible one must answer EEXIST
         // here, because the upper (where the node lands) cannot see it.

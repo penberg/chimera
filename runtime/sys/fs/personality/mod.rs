@@ -999,6 +999,56 @@ impl Personality {
         Ok(0)
     }
 
+    // === Unix-domain sockets ===
+    //
+    // A socket's name is a path like any other — resolved through the
+    // namespace, created in the layer serving its directory — but the node
+    // is made by `bind` and found by `connect`, which name it through a
+    // `sockaddr_un` the host kernel reads directly. The two calls are
+    // serviced by rewriting that address to the host path the namespace
+    // resolves to, so the node lands in an overlay's upper layer and a
+    // connect finds it in whichever layer holds it; everything else about
+    // the socket — the descriptor, the bytes — stays the kernel's.
+
+    /// `bind(2)` on a Unix-domain socket; `call.args` are `(fd, addr, len)`.
+    /// An unnamed, abstract, or non-Unix address is the kernel's business.
+    fn bind_unix(&self, call: &mut SystemCall) {
+        let Some(raw) = os::unix_socket_path(call.args[1], call.args[2] as usize) else {
+            call.set_result(host_syscall(call));
+            return;
+        };
+        let result = (|| {
+            // The name is new, never resolved: a trailing symlink is in use,
+            // the way `mknod` finds it existing.
+            let r = self.resolve_write_raw(libc::AT_FDCWD, &raw, false)?;
+            r.fs.bind(&r.rel, &mut |host| forward_unix_address(call, host))
+        })();
+        call.set_result(match result {
+            Ok(()) => SyscallResult::Ok(0),
+            Err(Errno(libc::EEXIST)) => SyscallResult::Error(libc::EADDRINUSE),
+            Err(e) => SyscallResult::Error(e.raw()),
+        });
+    }
+
+    /// `connect(2)` on a Unix-domain socket: the name resolves to the host
+    /// path of the node, in whichever layer serves it.
+    fn connect_unix(&self, call: &mut SystemCall) {
+        let Some(raw) = os::unix_socket_path(call.args[1], call.args[2] as usize) else {
+            call.set_result(host_syscall(call));
+            return;
+        };
+        let result = (|| {
+            let abs = self.abs_path(libc::AT_FDCWD, &raw)?;
+            let r = self.ns.resolve(&abs, true)?;
+            let host = r.fs.host_path(&r.rel).ok_or(Errno::ENOENT)?;
+            forward_unix_address(call, &host)
+        })();
+        call.set_result(match result {
+            Ok(()) => SyscallResult::Ok(0),
+            Err(e) => SyscallResult::Error(e.raw()),
+        });
+    }
+
     fn mknod(&self, dirfd: i32, pathptr: u64, mode: u32, dev: u64) -> Result<i64, Errno> {
         // mknod names the entry it creates; a trailing symlink is EEXIST, so
         // never follow the final component.
@@ -1107,6 +1157,73 @@ impl Personality {
 
 /// `true` when the guest names an attribute inside the overlay's bookkeeping
 /// namespace, which it may neither read nor forge.
+/// Forward a Unix-domain socket call with its address rewritten to `host`,
+/// restoring the guest's own argument afterwards so observers read the call
+/// as the guest made it. A host path too long for `sun_path` — an overlay's
+/// upper path is deep — is reached through a short private symlink to its
+/// directory: only the final name must be the real one, since that is the
+/// name `bind` creates and `connect` opens.
+fn forward_unix_address(call: &mut SystemCall, host: &Path) -> Result<(), Errno> {
+    let mut alias = None;
+    let addr = match os::unix_sockaddr(host.as_os_str().as_bytes()) {
+        Some(addr) => addr,
+        None => {
+            let a = SocketAlias::new(host)?;
+            let addr = os::unix_sockaddr(a.path.as_os_str().as_bytes())
+                .ok_or(Errno(libc::ENAMETOOLONG))?;
+            alias = Some(a);
+            addr
+        }
+    };
+    let saved = (call.args[1], call.args[2]);
+    call.args[1] = addr.as_ptr() as u64;
+    call.args[2] = addr.len() as u64;
+    let result = host_syscall(call);
+    (call.args[1], call.args[2]) = saved;
+    drop(alias);
+    match result {
+        SyscallResult::Ok(_) => Ok(()),
+        SyscallResult::Error(e) => Err(Errno(e)),
+    }
+}
+
+/// A short path to a socket whose real path does not fit `sun_path`: a
+/// private directory under `/tmp` holding one symlink to the socket's
+/// directory, removed when the call is done.
+struct SocketAlias {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl SocketAlias {
+    fn new(host: &Path) -> Result<Self, Errno> {
+        let parent = host.parent().ok_or(Errno(libc::ENAMETOOLONG))?;
+        let name = host.file_name().ok_or(Errno(libc::ENAMETOOLONG))?;
+        let mut template = b"/tmp/chimera-sock-XXXXXX\0".to_vec();
+        let made = unsafe { libc::mkdtemp(template.as_mut_ptr() as *mut libc::c_char) };
+        if made.is_null() {
+            return Err(Errno::from_io(&std::io::Error::last_os_error()));
+        }
+        let dir = PathBuf::from(OsStr::from_bytes(&template[..template.len() - 1]));
+        let link = dir.join("d");
+        if let Err(e) = std::os::unix::fs::symlink(parent, &link) {
+            let _ = std::fs::remove_dir(&dir);
+            return Err(Errno::from_io(&e));
+        }
+        Ok(Self {
+            path: link.join(name),
+            dir,
+        })
+    }
+}
+
+impl Drop for SocketAlias {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.dir.join("d"));
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
 fn marker_name(nameptr: u64) -> bool {
     unsafe { read_cstr(nameptr) }.starts_with(XATTR_NAMESPACE)
 }

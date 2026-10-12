@@ -23,6 +23,7 @@ use std::{
 
 use crate::{
     ForkHold, SyscallResult, SystemCall, SystemCalls, host_syscall,
+    sys::mmap::copy_from_guest,
     sys::{fs::vfs::FileType, fsops},
 };
 
@@ -102,6 +103,9 @@ const SYS_OPEN_NOCANCEL: u64 = 398;
 const SYS_CLOSE_NOCANCEL: u64 = 399;
 const SYS_FCNTL_NOCANCEL: u64 = 406;
 const SYS_FSYNC_NOCANCEL: u64 = 408;
+const SYS_CONNECT: u64 = 98;
+const SYS_BIND: u64 = 104;
+const SYS_CONNECT_NOCANCEL: u64 = 409;
 const SYS_READV_NOCANCEL: u64 = 411;
 const SYS_WRITEV_NOCANCEL: u64 = 412;
 const SYS_PREAD_NOCANCEL: u64 = 414;
@@ -145,6 +149,41 @@ pub const FD_LINK_PREFIXES: &[&[u8]] = &[b"/dev/fd/"];
 /// `apple[]` vector serve that, outside the filesystem.
 pub fn is_magic_exe(_p: &Path) -> bool {
     false
+}
+
+/// The path a `sockaddr_un` of `len` bytes at `addr` names, or `None` for
+/// an address the kernel should see as the guest built it: not `AF_UNIX`, or
+/// unnamed. Darwin's `sockaddr_un` leads with `sun_len` and `sun_family` as
+/// one byte each, then `sun_path[104]`.
+pub fn unix_socket_path(addr: u64, len: usize) -> Option<Vec<u8>> {
+    const HEADER: usize = 2;
+    const SUN_PATH: usize = 104;
+    let len = len.min(HEADER + SUN_PATH);
+    if len <= HEADER {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    if !copy_from_guest(addr, &mut buf) || buf[1] as i32 != libc::AF_UNIX {
+        return None;
+    }
+    let path = &buf[HEADER..];
+    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    (end > 0).then(|| path[..end].to_vec())
+}
+
+/// A `sockaddr_un` naming the host path `path`, NUL-terminated and sized,
+/// or `None` when the path does not fit `sun_path`.
+pub fn unix_sockaddr(path: &[u8]) -> Option<Vec<u8>> {
+    const SUN_PATH: usize = 104;
+    if path.len() >= SUN_PATH {
+        return None;
+    }
+    let mut out = Vec::with_capacity(2 + path.len() + 1);
+    out.push((2 + path.len() + 1) as u8);
+    out.push(libc::AF_UNIX as u8);
+    out.extend_from_slice(path);
+    out.push(0);
+    Some(out)
 }
 
 /// `execve` always names its file by path here.
@@ -480,6 +519,16 @@ impl SystemCalls for Personality {
             SYS_FLISTXATTR => {
                 let result = host_syscall(call);
                 call.set_result(strip_marker_names(result, a[1], a[2] as usize));
+                return;
+            }
+
+            // A Unix-domain socket's name is a path in the namespace.
+            SYS_BIND => {
+                self.bind_unix(call);
+                return;
+            }
+            SYS_CONNECT | SYS_CONNECT_NOCANCEL => {
+                self.connect_unix(call);
                 return;
             }
 

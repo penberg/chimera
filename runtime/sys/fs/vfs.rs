@@ -110,6 +110,18 @@ pub trait Vfs: Send + Sync {
     /// Report filesystem-wide statistics for `statfs` by path.
     fn statfs(&self, path: &Path) -> Result<StatFs, Errno>;
 
+    /// Create the Unix-domain socket node a `bind` names. Only the `bind`
+    /// itself can make the node, so the filesystem decides where the new
+    /// name lives — a layered one places it in its writable layer, under the
+    /// same whiteout and first-wins rules as [`Vfs::mknod`] — and calls
+    /// `bind` with the host path to create it at. A name already present
+    /// answers `EEXIST`, which the caller reports as `bind`'s `EADDRINUSE`.
+    fn bind(
+        &self,
+        path: &Path,
+        bind: &mut dyn FnMut(&Path) -> Result<(), Errno>,
+    ) -> Result<(), Errno>;
+
     /// Resolve a lexically normalized path to its final object in one step,
     /// when the filesystem can prove the per-component walk would agree —
     /// which means no symlink participates anywhere in the chain and the
