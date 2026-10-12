@@ -25,6 +25,11 @@ mimalloc = "0.1.52"
 regex = "1"
 
 [[test]]
+name = "sud-after-translator"
+path = "tests/sud-after-translator.rs"
+harness = false
+
+[[test]]
 name = "sud-attach-failure"
 path = "tests/sud-attach-failure.rs"
 harness = false

@@ -43,15 +43,15 @@ extern "C" fn interrupt(_sig: libc::c_int, _info: *mut libc::siginfo_t, uc: *mut
 
 static INSTALL_INTERRUPT: Once = Once::new();
 
-/// Install the no-op handler for [`interrupt_signal`] once per process.
-fn install_interrupt_handler() {
-    INSTALL_INTERRUPT.call_once(|| unsafe {
+/// Install the handler for [`interrupt_signal`].
+pub fn install_interrupt_handler() {
+    unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = interrupt as *const () as usize;
         libc::sigfillset(&mut sa.sa_mask);
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK; // no SA_RESTART: a parked syscall must surface EINTR
         libc::sigaction(interrupt_signal(), &sa, std::ptr::null_mut());
-    });
+    }
 }
 
 /// The shared state of a guest process: one per process, referenced by every
@@ -130,7 +130,7 @@ impl Process {
         code_cache_size: usize,
         backend: Backend,
     ) -> Result<Self, Error> {
-        install_interrupt_handler();
+        INSTALL_INTERRUPT.call_once(install_interrupt_handler);
         // Own the host SIGSEGV/SIGBUS slot so self-modifying-code write traps are
         // caught synchronously (see [`crate::sys::linux::fault`]).
         crate::sys::linux::fault::install();
