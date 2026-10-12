@@ -15,8 +15,17 @@ pub mod shebang;
 #[cfg(target_os = "linux")]
 pub use linux::{fsops, hostfs};
 
+/// The host program loader and its parsed-image type, the guest signal engine,
+/// and the synchronous fault handler — re-exported host-neutrally so the
+/// process model names `sys::{exec, signal, fault}` rather than a per-OS path.
 #[cfg(target_os = "linux")]
-pub use linux::exec;
+pub use linux::{exec, fault, signal};
+
+/// The host thread-interrupt primitive, re-exported host-neutrally so the
+/// process model names `sys::thread::{install_interrupt_handler, interrupt}`
+/// rather than a per-OS path.
+#[cfg(target_os = "linux")]
+pub use linux::thread;
 
 /// The host syscall policy — the driver the arch dispatcher calls per guest
 /// syscall — re-exported host-neutrally so the crate-root `syscall` module

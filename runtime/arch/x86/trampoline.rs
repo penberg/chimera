@@ -78,7 +78,7 @@ unsafe extern "C" {
 /// up ([`fetch_copy_span`]), so the common case — every byte readable — costs
 /// a memcpy, not a syscall. Returns the byte-exact readable prefix length:
 /// `buf.len()` on a full copy, 0 when `src` itself is unreadable. Callers run
-/// only after [`crate::sys::linux::fault::install`]; without the handler an
+/// only after [`crate::sys::fault::install`]; without the handler an
 /// unreadable byte is a fatal fault.
 pub fn fetch_copy(src: u64, buf: &mut [u8]) -> usize {
     unsafe { chimera_fetch_copy(buf.as_mut_ptr(), src as *const u8, buf.len()) }
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn fetch_copy_returns_readable_prefix() {
-        crate::sys::linux::fault::install();
+        crate::sys::fault::install();
 
         // A readable page followed by a PROT_NONE page, so a copy can start
         // readable and fault partway through.
