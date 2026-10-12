@@ -6,9 +6,11 @@ RUNNER ?= $(CARGO_TARGET_DIR)/debug/chimera run
 # and are dropped here instead, until the Darwin port catches up.
 EXCLUDE := $(if $(filter Darwin,$(shell uname -s)),--exclude fs,)
 
-# The backends `make conformance` runs the suite under; syscall user dispatch
-# exists only on x86-64 Linux. Run one with `make conformance BACKENDS=sud`.
-BACKENDS := dbt $(if $(filter Linux-x86_64,$(shell uname -s)-$(shell uname -m)),sud,)
+# The backends `make conformance` runs the suite under: the translator, and
+# syscall user dispatch where the host can run it (x86-64 Linux 5.11 or
+# later), which the freshly built Chimera finds out by running a program
+# under it. Run one with `make conformance BACKENDS=sud`.
+BACKENDS = dbt $(shell $(RUNNER) --backend sud --unsafe /bin/true >/dev/null 2>&1 && echo sud)
 
 build:
 	cargo build --quiet
