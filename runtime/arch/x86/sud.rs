@@ -57,6 +57,10 @@ const SI_KERNEL: libc::c_int = 0x80;
 const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
 const FP_SW_BYTES: usize = 464;
 
+/// `exit_kind` of native guest code that branched to an address it cannot
+/// fetch. Raised by the SIGSEGV/SIGBUS handler.
+pub const EXIT_KIND_FETCH_FAULT: u64 = 3;
+
 /// Size of the alternate stack the SIGSYS handler runs on.
 const ALT_STACK_SIZE: usize = 64 * 1024;
 
@@ -241,6 +245,7 @@ impl Vcpu for SyscallUserDispatch {
         match state.exit_kind {
             EXIT_KIND_SYSCALL => Exit::Syscall,
             EXIT_KIND_TRAP => Exit::Breakpoint,
+            EXIT_KIND_FETCH_FAULT => Exit::FetchFault,
             _ => Exit::Safepoint,
         }
     }
