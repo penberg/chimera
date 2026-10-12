@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include "portable.h"
 
 static int write_file(const char *path, const char *content) {
     int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
@@ -30,10 +31,6 @@ static int write_file(const char *path, const char *content) {
     ssize_t n = (ssize_t)strlen(content);
     if (write(fd, content, n) != n) return -1;
     return close(fd);
-}
-
-static int rename2(const char *from, const char *to, unsigned flags) {
-    return (int)syscall(SYS_renameat2, AT_FDCWD, from, AT_FDCWD, to, flags);
 }
 
 static int prep(const char *d) {

@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "portable.h"
 
 extern char **environ;
 
@@ -61,7 +62,9 @@ static int prep(const char *fixture) {
     snprintf(path, sizeof(path), "%s/lower", fixture);
     if (mkdir(path, 0755) != 0 && errno != EEXIST) return 12;
     snprintf(path, sizeof(path), "%s/lower/prog", fixture);
-    if (copy_file("/bin/false", path, 0755) != 0) return 13;
+    // The old version: a program that exits 1, wherever the host keeps it.
+    const char *old = access("/bin/false", X_OK) == 0 ? "/bin/false" : "/usr/bin/false";
+    if (copy_file(old, path, 0755) != 0) return 13;
     // Record the old version's size so verify can prove the host kept it.
     struct stat st;
     if (stat(path, &st) != 0) return 14;
@@ -146,7 +149,8 @@ int main(int argc, char **argv) {
         return exec_proof(argv[2], argv[3]);
     if (argc != 3) return 10;
     if (strcmp(argv[1], "prep") == 0) return prep(argv[2]);
-    if (strcmp(argv[1], "check") == 0) return check(argv[2], "/proc/self/exe");
+    char exe[PATH_MAX];
+    if (strcmp(argv[1], "check") == 0) return check(argv[2], self_exe(exe, sizeof(exe)));
     if (strcmp(argv[1], "verify") == 0) return verify(argv[2]);
     return 10;
 }

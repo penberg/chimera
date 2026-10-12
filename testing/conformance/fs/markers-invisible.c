@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <unistd.h>
+#include "portable.h"
 
 static int mkdirs(const char *path) {
     char buf[PATH_MAX];

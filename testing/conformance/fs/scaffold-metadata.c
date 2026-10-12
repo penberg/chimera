@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "portable.h"
 
 static int prep(char **dirs) {
     for (int i = 0; i < 3; i++) {

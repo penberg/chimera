@@ -16,12 +16,17 @@
 int main(int argc, char **argv) {
     (void)argc;
 
-    // The binary itself reads through the overlay: ELF magic intact.
+    // The binary itself reads through the overlay: its magic intact.
     int fd = open(argv[0], O_RDONLY);
     if (fd < 0) return 1;
     char magic[4];
     if (read(fd, magic, 4) != 4) return 2;
+#ifdef __APPLE__
+    // A 64-bit Mach-O header, MH_MAGIC_64, as the little-endian host lays it out.
+    if (memcmp(magic, "\xcf\xfa\xed\xfe", 4) != 0) return 3;
+#else
     if (memcmp(magic, "\x7f" "ELF", 4) != 0) return 3;
+#endif
     close(fd);
 
     struct stat st;
