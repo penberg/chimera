@@ -18,8 +18,8 @@
 //! method per operation, speaking symbolic [`Stat`]s and raw guest buffers.
 //! The guest's own ABI — which syscall numbers mean what, how `struct stat`
 //! and a directory entry are laid out, which `fcntl` command is which — is
-//! the business of one submodule per host ([`linux`]), which implements
-//! [`SystemCalls`] by decoding the call and encoding the answer.
+//! the business of one submodule per host ([`linux`], [`darwin`]), which
+//! implements [`SystemCalls`] by decoding the call and encoding the answer.
 
 use std::{
     borrow::Cow,
@@ -42,11 +42,15 @@ use super::{
     vfs::{DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, Timespec},
 };
 
+#[cfg(target_os = "macos")]
+mod darwin;
 #[cfg(target_os = "linux")]
 mod linux;
 
 /// The host's decoder, which also supplies the few per-kernel facts the
 /// shared code branches on.
+#[cfg(target_os = "macos")]
+use darwin as os;
 #[cfg(target_os = "linux")]
 use linux as os;
 

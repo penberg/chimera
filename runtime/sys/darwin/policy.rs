@@ -80,6 +80,20 @@ fn thread_start_addr() -> u64 {
 }
 
 pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &dyn SystemCalls) {
+    // The guest and Chimera share one libSystem, and with it one thread-local
+    // `errno`. Servicing a syscall takes libc calls of Chimera's own — a
+    // filesystem probing for an entry that is not there, an xattr that is
+    // not set — whose failures would otherwise surface in the guest as an
+    // `errno` it never earned: a program that inspects `errno` after a loop
+    // (`ls` after `fts_read`) reports a phantom error. The guest's own libc
+    // sets `errno` from the result this function commits, so what it held
+    // on entry is restored on the way out.
+    let errno = unsafe { *libc::__error() };
+    service(thread, call, handler);
+    unsafe { *libc::__error() = errno };
+}
+
+fn service(thread: &mut Thread, call: &mut SystemCall, handler: &dyn SystemCalls) {
     handler.pre_syscall(call);
 
     match call.number {

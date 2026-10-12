@@ -19,7 +19,6 @@ pub use syscall::{ForkHold, Passthrough, SyscallResult, SystemCall, SystemCalls}
 
 pub use sys::host_syscall;
 
-#[cfg(target_os = "linux")]
 pub use sys::{
     fs::{
         namespace::{MountFlags, Namespace},
@@ -41,7 +40,6 @@ pub use sys::{
 /// in the host's own xattr spelling. The format itself is owned by this
 /// crate; the CLI's `chimera fs` subcommands consume these rather than
 /// reimplementing the on-disk knowledge.
-#[cfg(target_os = "linux")]
 pub mod delta {
     pub use crate::sys::fs::delta::{
         Origin, copy_path_xattrs, is_applied, is_opaque, is_whiteout, mark_applied, origin,

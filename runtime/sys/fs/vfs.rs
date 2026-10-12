@@ -135,6 +135,16 @@ pub trait Vfs: Send + Sync {
         self.confines().then(|| self.stat(path, follow))
     }
 
+    /// The host path a mutation of `path` may be applied to directly, for the
+    /// host-specific attribute calls the Personality forwards rather than
+    /// models (`setattrlist`, `chflags`, …). A layered filesystem brings the
+    /// entry into its writable layer first, so the forwarded call lands on
+    /// the copy the guest's view is served from; a filesystem with no host
+    /// backing answers `EROFS`.
+    fn materialize(&self, _path: &Path) -> Result<PathBuf, Errno> {
+        Err(Errno::EROFS)
+    }
+
     /// The host path backing a mount-relative path, if this filesystem is host
     /// passthrough. The runtime uses it to load an `execve` target through its
     /// ELF loader without reaching back through this trait byte by byte; a
@@ -432,6 +442,12 @@ pub struct Stat {
     pub atime: Timespec,
     pub mtime: Timespec,
     pub ctime: Timespec,
+    /// Creation time, where the host records one (Darwin's `st_birthtime`); a
+    /// host without it reports the inode change time here.
+    pub btime: Timespec,
+    /// BSD file flags (`st_flags`: `UF_IMMUTABLE`, `UF_HIDDEN`, …); zero on a
+    /// host without them.
+    pub flags: u32,
 }
 
 /// One entry from a directory snapshot, the raw material for `getdents64`.

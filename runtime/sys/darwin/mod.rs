@@ -2,8 +2,9 @@
 //! the process bootstrap and `execve` (`exec`), the per-thread run loop
 //! (`thread`), the syscall policy and raw-syscall bridge (`policy`,
 //! `syscall`), guest signals and synchronous faults (`signal`, `fault`), the
-//! process-creation traps (`spawn`), and the callbacks a system library
-//! delivers on threads of its own (`callback`, `handoff`).
+//! process-creation traps (`spawn`), the callbacks a system library delivers
+//! on threads of its own (`callback`, `handoff`), and the host side of the
+//! filesystem layer (`hostfs`, `fsops`).
 //!
 //! The statics below are the process-wide facts the run loop answers for the
 //! guest in place of the shared libSystem and dyld, whose own answers would
@@ -27,7 +28,9 @@ pub mod callback;
 pub mod dyld;
 pub mod exec;
 pub mod fault;
+pub mod fsops;
 pub mod handoff;
+pub mod hostfs;
 pub mod macho;
 pub mod policy;
 pub mod signal;

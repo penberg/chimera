@@ -1,13 +1,10 @@
-// The filesystem, its prompt badge, and the FUSE mount exist where the
-// runtime's filesystem layer does: Linux, so far.
-#[cfg(target_os = "linux")]
 mod fs;
+// A merged view is served over FUSE, which only the Linux kernel offers.
 #[cfg(target_os = "linux")]
 mod fuser;
 #[cfg(target_os = "linux")]
 mod mount;
 mod opts;
-#[cfg(target_os = "linux")]
 mod prompt;
 mod run;
 
@@ -59,7 +56,6 @@ fn main() -> ExitCode {
         #[cfg(target_os = "linux")]
         Command::Mount(cmd) => mount::command(cmd),
         Command::Version(_) => version(),
-        #[cfg(target_os = "linux")]
         Command::Fs(cmd) => fs::command(cmd.action),
     }
 }

@@ -23,13 +23,12 @@ pub use darwin::syscall::{host_syscall, write_syscall_result};
 #[cfg(target_os = "macos")]
 pub use darwin::policy;
 
-/// The userspace filesystem layer. Its host seams exist on Linux only so far;
-/// a Darwin guest's file syscalls reach the host directly.
-#[cfg(target_os = "linux")]
 pub mod fs;
 pub mod mmap;
 pub mod shebang;
 
+#[cfg(target_os = "macos")]
+pub use darwin::{fsops, hostfs};
 /// The host's passthrough filesystem and the host primitives the delta
 /// format is written against, re-exported host-neutrally so the shared
 /// filesystem layer names `sys::hostfs` and `sys::fsops`.

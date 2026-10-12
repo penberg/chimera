@@ -15,11 +15,10 @@ pub struct Opts {
 pub enum Command {
     Run(RunCmd),
     // A mount serves a filesystem's merged view over FUSE, which only the
-    // Linux kernel offers; the filesystem itself exists on Linux only so far.
+    // Linux kernel offers.
     #[cfg(target_os = "linux")]
     Mount(MountCmd),
     Version(VersionCmd),
-    #[cfg(target_os = "linux")]
     Fs(FsCmd),
 }
 
@@ -52,7 +51,6 @@ pub struct MountCmd {
 }
 
 /// Manage filesystems: the change-sets kept runs leave behind.
-#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "fs")]
 pub struct FsCmd {
@@ -61,7 +59,6 @@ pub struct FsCmd {
 }
 
 /// `fs` subcommands.
-#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand)]
 pub enum FsAction {
@@ -74,14 +71,12 @@ pub enum FsAction {
 }
 
 /// List kept filesystems.
-#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "list")]
 pub struct FsListCmd {}
 
 /// Show what a filesystem changed, relative to the live host: A added,
 /// M modified, D deleted.
-#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "diff")]
 pub struct FsDiffCmd {
@@ -93,7 +88,6 @@ pub struct FsDiffCmd {
 /// Copy a filesystem's changes onto the host — the adopt step. A file whose
 /// host copy changed since the filesystem copied it up is refused, not
 /// clobbered.
-#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "apply")]
 pub struct FsApplyCmd {
@@ -104,7 +98,6 @@ pub struct FsApplyCmd {
 
 /// Fork a filesystem: a new filesystem seeded with a copy of the source's
 /// changes, leaving the source untouched. Prints the new filesystem's id.
-#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "branch")]
 pub struct FsBranchCmd {
@@ -114,7 +107,6 @@ pub struct FsBranchCmd {
 }
 
 /// Remove filesystems.
-#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "rm")]
 pub struct FsRmCmd {
@@ -124,7 +116,6 @@ pub struct FsRmCmd {
 }
 
 /// Remove every filesystem no live session is using, after confirmation.
-#[cfg(target_os = "linux")]
 #[derive(FromArgs)]
 #[argh(subcommand, name = "prune")]
 pub struct FsPruneCmd {
@@ -160,11 +151,11 @@ pub struct RunCmd {
     #[argh(switch, long = "unsafe")]
     pub unsafe_: bool,
 
-    /// leave the default Bash prompt unchanged
+    /// leave the shell's default prompt unchanged
     #[argh(switch)]
     pub no_prompt: bool,
 
-    /// the program and its arguments (default: /bin/bash). Greedy: option
+    /// the program and its arguments (default: a shell). Greedy: option
     /// parsing stops at the program token, so the guest's own flags need no `--`
     /// separator.
     #[argh(positional, greedy)]

@@ -383,6 +383,10 @@ impl Vfs for HostFs {
         Some(stat_to_stat(&st))
     }
 
+    fn materialize(&self, path: &Path) -> Result<PathBuf, Errno> {
+        Ok(HostFs::host_path(self, path))
+    }
+
     fn host_path(&self, path: &Path) -> Option<PathBuf> {
         Some(HostFs::host_path(self, path))
     }
@@ -745,6 +749,11 @@ fn stat_to_stat(st: &libc::stat) -> Stat {
             sec: st.st_ctime,
             nsec: st.st_ctime_nsec,
         },
+        btime: Timespec {
+            sec: st.st_ctime,
+            nsec: st.st_ctime_nsec,
+        },
+        flags: 0,
     }
 }
 

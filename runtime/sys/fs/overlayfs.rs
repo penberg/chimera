@@ -715,6 +715,11 @@ impl Vfs for OverlayFs {
         self.inner.lower.stat_fast(path, follow)
     }
 
+    fn materialize(&self, path: &Path) -> Result<PathBuf, Errno> {
+        self.inner.ensure_upper(path)?;
+        Ok(self.inner.delta.data_path(path))
+    }
+
     fn host_path(&self, path: &Path) -> Option<PathBuf> {
         match self.inner.visibility(path).ok()? {
             // The serving layer answers, so an execve of a modified binary
@@ -1655,8 +1660,13 @@ mod tests {
 
         let st = fs.stat_fast(Path::new("/d/f"), true).unwrap().unwrap();
         assert_eq!(st.file_type, FileType::Regular);
-        let via_link = fs.stat_fast(Path::new("/link/f"), true).unwrap().unwrap();
-        assert_eq!(via_link.ino, st.ino);
+        // A symlink chain is the lower's to resolve wholesale, which a lower
+        // that confines in-kernel does; a scratch-rooted lower that cannot
+        // (Darwin, where only `/` confines) declines it to the walk instead.
+        if fs.inner.lower.confines() {
+            let via_link = fs.stat_fast(Path::new("/link/f"), true).unwrap().unwrap();
+            assert_eq!(via_link.ino, st.ino);
+        }
         let l = fs.stat_fast(Path::new("/link"), false).unwrap().unwrap();
         assert_eq!(l.file_type, FileType::Symlink);
         assert_eq!(
@@ -1783,12 +1793,16 @@ mod tests {
         )
         .unwrap();
 
-        // Clean all the way down: the chain answers wholesale.
-        let st = outer
-            .stat_fast(Path::new("/link/g"), true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(st.size, 7);
+        // Clean all the way down: the chain answers wholesale — when the
+        // host lower resolves symlinks itself (see
+        // `stat_fast_serves_only_clean_deltas`).
+        if inner.inner.lower.confines() {
+            let st = outer
+                .stat_fast(Path::new("/link/g"), true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(st.size, 7);
+        }
 
         // The inner overlay shadows the symlink's target; the outer delta is
         // still clean, but the answer is no longer the host's.

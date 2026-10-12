@@ -18,14 +18,13 @@
 
 use crate::{
     SyscallResult, SystemCall, SystemCalls,
-    sys::mmap::{copy_from_guest, copy_to_guest},
+    sys::{
+        hostfs::BACKING_FLOOR,
+        mmap::{copy_from_guest, copy_to_guest},
+    },
 };
 
 use super::{exec, thread::Thread};
-
-/// The lowest descriptor number the runtime keeps for itself; the guest's
-/// descriptors live below it.
-const BACKING_FLOOR: i32 = 512;
 
 // The guest syscalls a file action stands for (`<sys/syscall.h>`).
 const SYS_OPEN: u64 = 5;
