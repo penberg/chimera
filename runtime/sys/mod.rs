@@ -7,6 +7,7 @@ pub mod linux;
 pub mod fs;
 #[cfg(target_arch = "x86_64")]
 pub mod mmap;
+pub mod shebang;
 
 /// The host's passthrough filesystem and the host primitives the delta
 /// format is written against, re-exported host-neutrally so the shared

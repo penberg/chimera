@@ -16,7 +16,8 @@ use std::{
 use crate::{
     Error, SystemCalls,
     process::Process,
-    sys::mmap::{AddressSpace, copy_from_guest},
+    sys::mmap::{AddressSpace, read_guest_cstr, read_guest_ptr_array},
+    sys::shebang::shebang_line,
 };
 
 use super::{
@@ -265,12 +266,14 @@ fn splice_shebang(req: &mut ExecRequest, handler: &dyn SystemCalls) -> Result<()
         req.raw.clone()
     };
     for _ in 0..4 {
-        let Some((interp, optarg)) = shebang_line(&req.path)? else {
+        let Some((interp, arg)) = shebang_line(&req.path, SHEBANG_BUF)? else {
             break;
         };
         let mut argv: Vec<Vec<u8>> = Vec::with_capacity(req.argv.len() + 2);
         argv.push(interp.clone());
-        if let Some(arg) = optarg {
+        // Linux hands the interpreter everything after its name as a single
+        // argument, embedded blanks and all.
+        if !arg.is_empty() {
             argv.push(arg);
         }
         argv.push(script);
@@ -304,58 +307,6 @@ fn resolve_exec_path(
 /// The kernel inspects this many leading bytes of an image to choose its
 /// loader (`BINPRM_BUF_SIZE`); a shebang line must fit inside them.
 const SHEBANG_BUF: usize = 256;
-
-/// A parsed shebang line: the interpreter path and its optional argument.
-type ShebangLine = (Vec<u8>, Option<Vec<u8>>);
-
-/// Parse `path`'s shebang line: `Ok(None)` when the image is not a `#!`
-/// script, otherwise the interpreter path and its optional argument. Kernel
-/// semantics throughout: the line ends at the first newline and must fit
-/// the probe buffer, trailing blanks are trimmed, the interpreter ends at
-/// the first blank, and everything after it — embedded blanks included — is
-/// a single argument. A shebang that names no interpreter is a malformed
-/// image, reported as `ENOEXEC`.
-fn shebang_line(path: &Path) -> Result<Option<ShebangLine>, Error> {
-    use std::io::Read;
-
-    let mut file = fs::File::open(path).map_err(|e| Error::io("execve", e))?;
-    let mut buf = [0u8; SHEBANG_BUF];
-    let mut len = 0;
-    while len < buf.len() {
-        match file
-            .read(&mut buf[len..])
-            .map_err(|e| Error::io("execve", e))?
-        {
-            0 => break,
-            n => len += n,
-        }
-    }
-    let buf = &buf[..len];
-    if len < 2 || &buf[..2] != b"#!" {
-        return Ok(None);
-    }
-    let line = match buf.iter().position(|&b| b == b'\n') {
-        Some(nl) => &buf[2..nl],
-        None if len < SHEBANG_BUF => &buf[2..],
-        None => {
-            return Err(Error::BadBinary(
-                "shebang line does not fit the interpreter probe buffer".into(),
-            ));
-        }
-    };
-    let blank = |b: u8| b == b' ' || b == b'\t';
-    let line = &line[..line.len() - line.iter().rev().take_while(|&&b| blank(b)).count()];
-    let rest = &line[line.iter().take_while(|&&b| blank(b)).count()..];
-    if rest.is_empty() {
-        return Err(Error::BadBinary("shebang names no interpreter".into()));
-    }
-    let end = rest.iter().position(|&b| blank(b)).unwrap_or(rest.len());
-    let interp = rest[..end].to_vec();
-    let after = &rest[end..];
-    let arg = &after[after.iter().take_while(|&&b| blank(b)).count()..];
-    let optarg = (!arg.is_empty()).then(|| arg.to_vec());
-    Ok(Some((interp, optarg)))
-}
 
 /// Format a `KEY=VALUE` environment entry (no trailing NUL; `build_stack` adds
 /// it).
@@ -423,8 +374,8 @@ fn read_request(
     Ok(ExecRequest {
         path,
         raw,
-        argv: read_guest_ptr_array(argv_ptr)?,
-        envp: read_guest_ptr_array(envp_ptr)?,
+        argv: read_guest_ptr_array(argv_ptr, MAX_ARG_COUNT, MAX_ARG_STRLEN)?,
+        envp: read_guest_ptr_array(envp_ptr, MAX_ARG_COUNT, MAX_ARG_STRLEN)?,
     })
 }
 
@@ -437,67 +388,6 @@ const MAX_ARG_STRLEN: usize = 32 * PAGE_SIZE as usize;
 /// at least a stack pointer, so more entries than `ARG_MAX / 8` could never
 /// fit on the guest stack anyway; reject them with `E2BIG` up front.
 const MAX_ARG_COUNT: usize = STACK_SIZE / 4 / 8;
-
-/// A guest-memory read failed or overran its bound while decoding an exec
-/// request. Carried as an [`Error::Io`] so [`exec_errno`] hands the errno to
-/// the caller exactly as the kernel's user-copy path would.
-fn arg_error(errno: i32, what: &str) -> Error {
-    Error::io(
-        format!("execve: {what}"),
-        std::io::Error::from_raw_os_error(errno),
-    )
-}
-
-/// Copy a NUL-terminated string out of guest memory without trusting the
-/// pointer (see `copy_from_guest`), in chunks that stop at page boundaries so
-/// a string ending just before an unmapped page is not failed by over-reading
-/// past it. `cap` is the kernel's limit for this kind of string: filling it
-/// without a NUL fails with `toolong` (`ENAMETOOLONG` for a pathname, `E2BIG`
-/// for an argv/envp entry), and an unreadable byte fails with `EFAULT`, the
-/// way the kernel's user-copy would.
-fn read_guest_cstr(ptr: u64, cap: usize, toolong: i32) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::new();
-    let mut addr = ptr;
-    while out.len() < cap {
-        let page_left = (PAGE_SIZE - (addr % PAGE_SIZE)) as usize;
-        let mut chunk = vec![0u8; page_left.min(cap - out.len())];
-        if !copy_from_guest(addr, &mut chunk) {
-            return Err(arg_error(libc::EFAULT, "unreadable string"));
-        }
-        if let Some(nul) = chunk.iter().position(|&b| b == 0) {
-            chunk.truncate(nul);
-            out.extend_from_slice(&chunk);
-            return Ok(out);
-        }
-        addr += chunk.len() as u64;
-        out.extend_from_slice(&chunk);
-    }
-    Err(arg_error(toolong, "string exceeds its limit"))
-}
-
-/// Copy a NULL-terminated array of C-string pointers (an argv or envp) and
-/// its strings out of guest memory, trusting none of the pointers. A null
-/// array pointer is Linux's "no arguments" degenerate case, not a fault.
-fn read_guest_ptr_array(ptr: u64) -> Result<Vec<Vec<u8>>, Error> {
-    if ptr == 0 {
-        return Ok(Vec::new());
-    }
-    let mut out: Vec<Vec<u8>> = Vec::new();
-    loop {
-        if out.len() >= MAX_ARG_COUNT {
-            return Err(arg_error(libc::E2BIG, "argument list too long"));
-        }
-        let mut raw = [0u8; 8];
-        if !copy_from_guest(ptr + (out.len() as u64) * 8, &mut raw) {
-            return Err(arg_error(libc::EFAULT, "unreadable argument pointer"));
-        }
-        let entry = u64::from_ne_bytes(raw);
-        if entry == 0 {
-            return Ok(out);
-        }
-        out.push(read_guest_cstr(entry, MAX_ARG_STRLEN, libc::E2BIG)?);
-    }
-}
 
 /// Default resolution of an exec pathname against its `dirfd` and flags, used
 /// when the handler does not resolve it itself. An absolute path or `AT_FDCWD`
