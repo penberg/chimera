@@ -130,6 +130,7 @@ struct Escapes {
     malloc_zone_unregister: u64,
     malloc_default_zone: u64,
     malloc_get_all_zones: u64,
+    atfork: u64,
     analytics_send: u64,
     analytics_send_lazy: u64,
     analytics_send_event: u64,
@@ -176,6 +177,7 @@ impl Escapes {
             malloc_zone_unregister: symbol(c"malloc_zone_unregister"),
             malloc_default_zone: symbol(c"malloc_default_zone"),
             malloc_get_all_zones: symbol(c"malloc_get_all_zones"),
+            atfork: symbol(c"pthread_atfork"),
             analytics_send: analytics_symbol(c"AnalyticsSendEvent"),
             analytics_send_lazy: analytics_symbol(c"AnalyticsSendEventLazy"),
             analytics_send_event: analytics_symbol(c"analytics_send_event"),
@@ -680,6 +682,14 @@ impl Thread {
             || pc == esc.analytics_send_event
             || pc == esc.analytics_send_event_lazy
         {
+            ret(ts, 0);
+        } else if pc == esc.atfork {
+            // Divert the handlers to the runtime's own list (see
+            // `sys::darwin::GUEST_ATFORK`); `spawn::forked` runs them
+            // translated around a guest fork.
+            let (prepare, parent, child) =
+                unsafe { ((*ts).regs[X0], (*ts).regs[X1], (*ts).regs[X2]) };
+            crate::sys::darwin::guest_atfork_register(prepare, parent, child);
             ret(ts, 0);
         } else if pc == esc.jit_write_protect {
             ret(ts, unsafe { (*ts).regs[X0] });

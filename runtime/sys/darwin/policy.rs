@@ -389,11 +389,16 @@ pub fn syscall(thread: &mut Thread, call: &mut SystemCall, handler: &dyn SystemC
             }
         },
         // Kernel-side fork+exec in one trap: forwarding it would start the
-        // spawned image natively, outside the sandbox. Refused until it is
-        // emulated as fork plus the in-process exec; libc's `posix_spawn`
-        // hands the error back to the guest.
+        // spawned image natively, outside the sandbox. Emulated instead as
+        // fork + the execve re-entry machinery, with the spawn attributes and
+        // file actions applied in the child (see `crate::sys::darwin::spawn`).
         SYS_POSIX_SPAWN => {
-            call.set_result(SyscallResult::Error(libc::ENOTSUP));
+            let args = call.args;
+            let result = match crate::sys::darwin::spawn::spawn(thread, &args) {
+                Ok(()) => SyscallResult::Ok(0),
+                Err(errno) => SyscallResult::Error(errno),
+            };
+            call.set_result(result);
         }
         // Runtime-owned because of its pair-return ABI: the second descriptor
         // comes back in `x1`, which the generic forward path discards.

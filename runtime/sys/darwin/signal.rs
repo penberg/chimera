@@ -242,6 +242,24 @@ impl Signals {
         self.pending.bits.store(0, Ordering::Release);
     }
 
+    /// posix_spawn's `SETSIGDEF`: every signal in `set` reverts to its
+    /// default disposition in the spawned child, whatever it was.
+    pub fn apply_spawn_sigdefault(&mut self, set: u32) {
+        let mut table = self.table.lock().unwrap();
+        for i in 0..NSIG {
+            if set & (1 << i) != 0 {
+                table[i] = GuestSigaction::default();
+                install_host(i + 1, SIG_DFL);
+            }
+        }
+    }
+
+    /// posix_spawn's `SETSIGMASK`: the spawned child starts with exactly this
+    /// blocked mask.
+    pub fn apply_spawn_sigmask(&mut self, set: u32) {
+        self.set_blocked(set);
+    }
+
     /// Reset signal state across `execve` (POSIX): caught handlers revert to
     /// their default, ignored ones stay ignored, the blocked mask and the
     /// pending set are preserved, and the alternate stack is dropped.

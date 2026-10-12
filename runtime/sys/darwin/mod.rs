@@ -2,13 +2,14 @@
 //! the process bootstrap and `execve` (`exec`), the per-thread run loop
 //! (`thread`), the syscall policy and raw-syscall bridge (`policy`,
 //! `syscall`), guest signals and synchronous faults (`signal`, `fault`), the
-//! `fork` trap (`spawn`), and the callbacks a system library delivers on
-//! threads of its own (`callback`, `handoff`).
+//! process-creation traps (`spawn`), and the callbacks a system library
+//! delivers on threads of its own (`callback`, `handoff`).
 //!
 //! The statics below are the process-wide facts the run loop answers for the
 //! guest in place of the shared libSystem and dyld, whose own answers would
 //! describe Chimera: the executed image's path and name, the entry frame, the
-//! image slide, and the guest's view of the malloc zone list.
+//! image slide, the guest's view of the malloc zone list, and the `atfork`
+//! handlers it registered.
 
 use std::{
     os::unix::ffi::OsStrExt,
@@ -136,6 +137,40 @@ pub fn guest_zone_list() -> (u64, u32) {
 
 pub fn clear_guest_zones() {
     *GUEST_ZONES.lock().unwrap() = None;
+}
+
+/// Guest-registered `pthread_atfork` handlers, kept off libpthread's global
+/// list. Registered there, they would be *guest* function pointers on a list
+/// the host's own `fork(3)` wrapper walks natively: the runtime's posix_spawn
+/// emulation forks natively, and an untranslated guest handler faulting
+/// inside the atfork window deadlocks the fault handler against the locks
+/// fork-prepare holds. Keeping them here, the spawn fork never sees them — a
+/// real posix_spawn does not run user atfork handlers either — and the
+/// guest's own fork runs them translated around the trap (see
+/// `spawn::forked`).
+static GUEST_ATFORK: Mutex<Vec<AtforkHandlers>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Copy)]
+pub struct AtforkHandlers {
+    pub prepare: u64,
+    pub parent: u64,
+    pub child: u64,
+}
+
+pub fn guest_atfork_register(prepare: u64, parent: u64, child: u64) {
+    GUEST_ATFORK.lock().unwrap().push(AtforkHandlers {
+        prepare,
+        parent,
+        child,
+    });
+}
+
+pub fn guest_atfork_handlers() -> Vec<AtforkHandlers> {
+    GUEST_ATFORK.lock().unwrap().clone()
+}
+
+pub fn clear_guest_atfork() {
+    GUEST_ATFORK.lock().unwrap().clear();
 }
 
 pub fn image_slide() -> u64 {
