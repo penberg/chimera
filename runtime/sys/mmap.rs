@@ -519,6 +519,74 @@ fn host_page_size() -> usize {
     })
 }
 
+/// A guest-memory read failed or overran its bound while decoding a syscall's
+/// string arguments. Carried as an [`Error::Io`] so the syscall driver hands
+/// the errno to the caller exactly as the kernel's user-copy path would.
+fn arg_error(errno: i32, what: &str) -> Error {
+    Error::io(
+        format!("guest argument: {what}"),
+        std::io::Error::from_raw_os_error(errno),
+    )
+}
+
+/// Copy a NUL-terminated string out of guest memory without trusting the
+/// pointer (see [`copy_from_guest`]), in chunks that stop at host-page
+/// boundaries so a string ending just before an unmapped page is not failed by
+/// over-reading past it. `cap` is the kernel's limit for this kind of string:
+/// filling it without a NUL fails with `toolong` (`ENAMETOOLONG` for a
+/// pathname, `E2BIG` for an argv/envp entry), and an unreadable byte fails
+/// with `EFAULT`, the way the kernel's user-copy would.
+pub fn read_guest_cstr(ptr: u64, cap: usize, toolong: i32) -> Result<Vec<u8>, Error> {
+    let page = host_page_size() as u64;
+    let mut out = Vec::new();
+    let mut addr = ptr;
+    while out.len() < cap {
+        let page_left = (page - (addr % page)) as usize;
+        let mut chunk = vec![0u8; page_left.min(cap - out.len())];
+        if !copy_from_guest(addr, &mut chunk) {
+            return Err(arg_error(libc::EFAULT, "unreadable string"));
+        }
+        if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+            chunk.truncate(nul);
+            out.extend_from_slice(&chunk);
+            return Ok(out);
+        }
+        addr += chunk.len() as u64;
+        out.extend_from_slice(&chunk);
+    }
+    Err(arg_error(toolong, "string exceeds its limit"))
+}
+
+/// Copy a NULL-terminated array of C-string pointers (an argv or envp) and its
+/// strings out of guest memory, trusting none of the pointers. A null array
+/// pointer is the kernels' "no arguments" degenerate case, not a fault. More
+/// than `max_count` entries — or a single string longer than `max_strlen` —
+/// fails with `E2BIG`, the kernel's argument-block bound.
+pub fn read_guest_ptr_array(
+    ptr: u64,
+    max_count: usize,
+    max_strlen: usize,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if ptr == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    loop {
+        if out.len() >= max_count {
+            return Err(arg_error(libc::E2BIG, "argument list too long"));
+        }
+        let mut raw = [0u8; 8];
+        if !copy_from_guest(ptr + (out.len() as u64) * 8, &mut raw) {
+            return Err(arg_error(libc::EFAULT, "unreadable argument pointer"));
+        }
+        let entry = u64::from_ne_bytes(raw);
+        if entry == 0 {
+            return Ok(out);
+        }
+        out.push(read_guest_cstr(entry, max_strlen, libc::E2BIG)?);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
