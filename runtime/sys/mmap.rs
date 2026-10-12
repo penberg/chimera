@@ -509,7 +509,7 @@ fn round_mapping_len(len: usize) -> usize {
     }
 }
 
-fn host_page_size() -> usize {
+pub fn host_page_size() -> usize {
     static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
 
     *PAGE_SIZE.get_or_init(|| {

@@ -45,6 +45,7 @@ use crate::{
         dispatch::{EXIT_KIND_BLOCK, ThreadState},
         x86::sud,
     },
+    sys::mmap::host_page_size,
 };
 
 /// Number of signals (`SIGRTMAX`); signals are numbered `1..=NSIG`.
@@ -69,6 +70,11 @@ const SIGSTOP: u64 = 19;
 /// own self-modifying-code trap handler rather than mirroring the guest's.
 const SIGBUS: u64 = 7;
 const SIGSEGV: u64 = 11;
+
+/// SIGSEGV `si_code`s: nothing is mapped at the address, or the mapping does
+/// not permit the access.
+const SEGV_MAPERR: i32 = 1;
+const SEGV_ACCERR: i32 = 2;
 
 // Guest register-file indices (see `crate::arch::dispatch`). r8..r15 are 8..15.
 const RAX: usize = 0;
@@ -305,6 +311,17 @@ impl PendingSet {
             ptr::copy_nonoverlapping(
                 self.rt_ring[idx][slot].0.get() as *const u8,
                 self.siginfo[idx].0.get() as *mut u8,
+                SIGINFO_SIZE,
+            );
+        }
+    }
+
+    /// Set `signo`'s captured `siginfo_t` for a signal Chimera raises itself.
+    fn set_captured(&self, signo: u32, info: &SigInfo) {
+        unsafe {
+            ptr::copy_nonoverlapping(
+                info as *const SigInfo as *const u8,
+                self.siginfo[signo as usize - 1].0.get() as *mut u8,
                 SIGINFO_SIZE,
             );
         }
@@ -1098,6 +1115,25 @@ impl Signals {
                 install_host(i + 1, SIG_DFL);
             }
         }
+    }
+
+    /// Deliver the SIGSEGV of a guest instruction fetch at `state.rip` that
+    /// faults, with the `siginfo_t` the kernel gives it: the address in
+    /// `si_addr`, and `SEGV_MAPERR` if no page is mapped there or
+    /// `SEGV_ACCERR` if one is.
+    pub fn deliver_fetch_fault(&mut self, state: &mut ThreadState, restart: Option<(u64, u64)>) {
+        let addr = state.rip;
+        let page = addr & !(host_page_size() as u64 - 1);
+        let mut residency = 0u8;
+        let mapped = unsafe { libc::mincore(page as *mut libc::c_void, 1, &mut residency) } == 0;
+        let mut info: SigInfo = unsafe { mem::zeroed() };
+        info.si_signo = SIGSEGV as i32;
+        info.si_code = if mapped { SEGV_ACCERR } else { SEGV_MAPERR };
+        // `si_addr` opens the union, at byte 16.
+        info._pad[1] = addr as i32;
+        info._pad[2] = (addr >> 32) as i32;
+        self.pending.set_captured(SIGSEGV as u32, &info);
+        self.deliver(state, SIGSEGV as u32, restart);
     }
 
     /// Build a signal frame on the guest stack and redirect `state` to the

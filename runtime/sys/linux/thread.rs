@@ -25,9 +25,6 @@ use crate::{
 /// `SIGTRAP`, raised on a guest `int3`.
 const SIGTRAP: u32 = 5;
 
-/// `SIGSEGV`, raised on a guest jump to unmapped memory (a fetch fault).
-const SIGSEGV: u32 = 11;
-
 /// Why [`Thread::run`] returned: the guest terminated, or it `execve`d and the
 /// caller must load the new image and re-enter the thread on it.
 pub enum ExitReason {
@@ -551,7 +548,7 @@ impl Thread {
                 Exit::FetchFault => {
                     let restart = self.restart.take();
                     let state = &mut *self.state;
-                    self.signals.deliver(state, SIGSEGV, restart);
+                    self.signals.deliver_fetch_fault(state, restart);
                 }
                 Exit::Safepoint => {}
             }
