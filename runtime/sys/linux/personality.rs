@@ -31,11 +31,15 @@ use crate::{ForkHold, SyscallResult, SystemCall, SystemCalls, host_syscall};
 
 use crate::sys::fs::{
     delta::XATTR_NAMESPACE,
-    namespace::{Namespace, Resolved, normalize},
+    namespace::{Namespace, Resolved, Scope, normalize},
     vfs::{DirEntry, Errno, File, FileType, Mode, OpenFlags, RenameFlags, Stat, StatFs, Timespec},
 };
 
 use super::hostfs::BACKING_FLOOR;
+
+/// `seccomp(2)` operations (`<linux/seccomp.h>`; libc has no bindings).
+const SECCOMP_SET_MODE_STRICT: u64 = 0;
+const SECCOMP_SET_MODE_FILTER: u64 = 1;
 
 /// Reserve a real kernel descriptor number for a virtual descriptor.
 ///
@@ -200,13 +204,13 @@ impl SystemCalls for Personality {
             libc::SYS_open => self.open(libc::AT_FDCWD, a[0], a[1] as i32, a[2] as u32),
             // openat2 carries its flags/mode in a `struct open_how { u64 flags;
             // u64 mode; u64 resolve; }`; route it like openat so it cannot dodge
-            // the Vfs and the read-only check. The `resolve` field's extra
-            // restrictions are not yet honored (the namespace already confines).
+            // the Vfs and the read-only check.
             libc::SYS_openat2 => {
-                let how = a[2];
-                let flags = unsafe { ptr::read(how as *const u64) } as i32;
-                let mode = unsafe { ptr::read((how as *const u64).add(1)) } as u32;
-                self.open(a[0] as i32, a[1], flags, mode)
+                let how = a[2] as *const u64;
+                let flags = unsafe { ptr::read(how) } as i32;
+                let mode = unsafe { ptr::read(how.add(1)) } as u32;
+                let resolve = unsafe { ptr::read(how.add(2)) };
+                self.openat2(a[0] as i32, a[1], flags, mode, resolve)
             }
             libc::SYS_creat => self.open(
                 libc::AT_FDCWD,
@@ -251,6 +255,14 @@ impl SystemCalls for Personality {
             libc::SYS_close if self.is_virtual(a[0] as i32) => {
                 self.fds.lock().unwrap().close(a[0] as i32).map(|_| 0)
             }
+            // A close outside the table forwards to the host — except into
+            // the runtime's backing space. The guest can read those numbers
+            // out of the host's /proc/self/fd (bwrap closes every fd it did
+            // not open before exec'ing its command), but the descriptors
+            // belong to the runtime, and closing one tears the VFS out from
+            // under the process. Answer EBADF as if the number were free,
+            // the same fiction close_range's clamp maintains.
+            libc::SYS_close if a[0] as i32 >= BACKING_FLOOR => Err(Errno::EBADF),
             // An ioctl on a special file must reach the real device —
             // `grantpt`/`unlockpt`, `TCGETS` (isatty), `TIOCSWINSZ` — or no
             // pty or tty ever works, so those forward to the host on the
@@ -308,14 +320,24 @@ impl SystemCalls for Personality {
             }
 
             // --- path metadata ---
-            libc::SYS_newfstatat => self.newfstatat(a[0] as i32, a[1], a[2], a[3] as i32),
+            // The AT_EMPTY_PATH fd form on a host descriptor falls through to
+            // the host: the target is an object the namespace never resolved
+            // — an inherited or SCM_RIGHTS-passed fd (Rust's `File::metadata`
+            // is `statx(fd, "", AT_EMPTY_PATH)`, and glycin's loader calls it
+            // on the image fd its parent passed over a socketpair) — so it is
+            // not ours to answer.
+            libc::SYS_newfstatat if !self.empty_path_on_host_fd(a[0] as i32, a[1], a[3] as i32) => {
+                self.newfstatat(a[0] as i32, a[1], a[2], a[3] as i32)
+            }
             libc::SYS_stat => {
                 self.fstatat_path(libc::AT_FDCWD, &unsafe { read_cstr(a[0]) }, a[1], true)
             }
             libc::SYS_lstat => {
                 self.fstatat_path(libc::AT_FDCWD, &unsafe { read_cstr(a[0]) }, a[1], false)
             }
-            libc::SYS_statx => self.statx(a[0] as i32, a[1], a[2] as i32, a[4]),
+            libc::SYS_statx if !self.empty_path_on_host_fd(a[0] as i32, a[1], a[2] as i32) => {
+                self.statx(a[0] as i32, a[1], a[2] as i32, a[4])
+            }
             libc::SYS_statfs => self.statfs(a[0], a[1]),
             libc::SYS_access => self.access(libc::AT_FDCWD, a[0], a[1] as i32),
             libc::SYS_faccessat | libc::SYS_faccessat2 => {
@@ -464,6 +486,38 @@ impl SystemCalls for Personality {
                 self.fallocate(a[0] as i32, a[1] as i32, a[2], a[3])
             }
 
+            // A guest-installed seccomp filter is accepted but not installed.
+            // Passing it to the kernel would police the wrong program: every
+            // host syscall in this process is the *runtime's* — glycin's
+            // loader allowlist admits the loader's `openat` but SIGSYS-kills
+            // the `openat2` behind every HostFs resolution — and an emulated
+            // execve never resets it, so one filter poisons the process for
+            // good. Chimera's own sandboxing is this handler; the guest's
+            // filter is self-defense inside it, honored today only as a
+            // successful no-op. (Userspace filter evaluation is the faithful
+            // future.)
+            libc::SYS_seccomp
+                if a[0] == SECCOMP_SET_MODE_STRICT || a[0] == SECCOMP_SET_MODE_FILTER =>
+            {
+                Ok(0)
+            }
+            libc::SYS_prctl if a[0] == libc::PR_SET_SECCOMP as u64 => Ok(0),
+
+            // Mount-table mutations pass through: inside a user namespace
+            // they reshape only the guest's own kernel view, and without one
+            // the kernel refuses them. A success moves the ground out from
+            // under every anchored root handle — bwrap `pivot_root`s into a
+            // freshly mounted tmpfs — so the namespace re-anchors before the
+            // guest looks again.
+            libc::SYS_mount | libc::SYS_umount2 | libc::SYS_pivot_root | libc::SYS_chroot => {
+                let result = host_syscall(call);
+                if matches!(result, SyscallResult::Ok(_)) {
+                    self.ns.reanchor();
+                }
+                call.set_result(result);
+                return;
+            }
+
             // Everything else — including host-fd I/O and syscalls not modeled
             // here — goes to the host kernel unchanged.
             _ => {
@@ -565,6 +619,15 @@ impl Personality {
     /// (host) descriptor, which passes straight through.
     fn is_virtual(&self, fd: i32) -> bool {
         self.fds.lock().unwrap().map.contains_key(&fd)
+    }
+
+    /// `true` when `(dirfd, pathptr, flags)` is the `AT_EMPTY_PATH` fd form
+    /// aimed at a descriptor the table does not own. (`statx` accepts a NULL
+    /// path as the empty path.)
+    fn empty_path_on_host_fd(&self, dirfd: i32, pathptr: u64, flags: i32) -> bool {
+        flags & libc::AT_EMPTY_PATH != 0
+            && (pathptr == 0 || unsafe { read_cstr(pathptr) }.is_empty())
+            && !self.is_virtual(dirfd)
     }
 
     /// Turn a `dirfd` + raw guest path into an absolute, normalized guest path.
@@ -727,9 +790,59 @@ impl Personality {
         self.open_abs(&abs, flags, mode)
     }
 
+    /// `openat2(2)`. `RESOLVE_IN_ROOT` and `RESOLVE_BENEATH` scope the lookup
+    /// to `dirfd`, which the namespace walk has to know: the host kernel
+    /// never sees the guest's dirfd, only the mount-relative path the walk
+    /// produces. The remaining restrictions (`RESOLVE_NO_XDEV`,
+    /// `RESOLVE_NO_MAGICLINKS`, `RESOLVE_NO_SYMLINKS`, `RESOLVE_CACHED`) are
+    /// accepted and not enforced.
+    fn openat2(
+        &self,
+        dirfd: i32,
+        pathptr: u64,
+        flags: i32,
+        mode: u32,
+        resolve: u64,
+    ) -> Result<i64, Errno> {
+        const KNOWN: u64 = libc::RESOLVE_NO_XDEV
+            | libc::RESOLVE_NO_MAGICLINKS
+            | libc::RESOLVE_NO_SYMLINKS
+            | libc::RESOLVE_BENEATH
+            | libc::RESOLVE_IN_ROOT
+            | libc::RESOLVE_CACHED;
+        if resolve & !KNOWN != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let scope = match (
+            resolve & libc::RESOLVE_IN_ROOT != 0,
+            resolve & libc::RESOLVE_BENEATH != 0,
+        ) {
+            (false, false) => return self.open(dirfd, pathptr, flags, mode),
+            (true, false) => Scope::InRoot,
+            (false, true) => Scope::Beneath,
+            (true, true) => return Err(Errno::EINVAL),
+        };
+        let root = if dirfd == libc::AT_FDCWD {
+            self.cwd.lock().unwrap().clone()
+        } else {
+            self.desc(dirfd)?.path.clone()
+        };
+        let raw = unsafe { read_cstr(pathptr) };
+        let follow = flags & libc::O_NOFOLLOW == 0;
+        let r = self
+            .ns
+            .resolve_scoped(&root, scope, Path::new(OsStr::from_bytes(&raw)), follow)?;
+        self.open_resolved(r, flags, mode)
+    }
+
     fn open_abs(&self, abs: &Path, flags: i32, mode: u32) -> Result<i64, Errno> {
         let follow = flags & libc::O_NOFOLLOW == 0;
         let r = self.ns.resolve(abs, follow)?;
+        self.open_resolved(r, flags, mode)
+    }
+
+    fn open_resolved(&self, r: Resolved, flags: i32, mode: u32) -> Result<i64, Errno> {
+        let follow = flags & libc::O_NOFOLLOW == 0;
         // Any write intent against a read-only mount is EROFS — but a plain
         // read keeps working, so stdio/sockets are unaffected. Special files
         // are exempt, as they are on a kernel `mount -o ro`: writing a
@@ -1257,14 +1370,36 @@ impl Personality {
         if r.fs.stat(&r.rel, true)?.file_type != FileType::Directory {
             return Err(Errno::ENOTDIR);
         }
-        *self.cwd.lock().unwrap() = r.abs; // store the canonical, symlink-resolved path
+        self.set_cwd(r.abs); // store the canonical, symlink-resolved path
         Ok(0)
     }
 
     fn fchdir(&self, fd: i32) -> Result<i64, Errno> {
         let path = self.desc(fd)?.path.clone();
-        *self.cwd.lock().unwrap() = path;
+        self.set_cwd(path);
         Ok(0)
+    }
+
+    /// Install a new guest cwd, and mirror it onto the host process. The
+    /// virtual cwd is what every modeled path syscall resolves against, but a
+    /// syscall the Personality does not model passes through with its path
+    /// arguments untouched, and the kernel resolves a relative one against
+    /// the *host* cwd — bwrap's `mount("newroot", …)` after `chdir("/tmp")`
+    /// must find the guest's directory there. Best-effort: a guest cwd with
+    /// no host backing (a synthetic filesystem) leaves the host cwd behind,
+    /// costing only those passthrough relatives.
+    fn set_cwd(&self, abs: PathBuf) {
+        let host = self
+            .ns
+            .resolve(&abs, true)
+            .ok()
+            .and_then(|r| r.fs.host_path(&r.rel));
+        *self.cwd.lock().unwrap() = abs;
+        if let Some(host) = host
+            && let Ok(c) = std::ffi::CString::new(host.as_os_str().as_bytes())
+        {
+            unsafe { libc::chdir(c.as_ptr()) };
+        }
     }
 
     fn chmod_path(&self, dirfd: i32, pathptr: u64, mode: u32, flags: i32) -> Result<i64, Errno> {
