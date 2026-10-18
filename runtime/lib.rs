@@ -65,6 +65,43 @@ pub fn mpk_enabled() -> bool {
     arch::mpk_enabled()
 }
 
+/// How a sandbox executes guest code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Backend {
+    /// Translate guest code into a code cache and run the translation. Every
+    /// instruction the guest executes is one Chimera emitted, so control flow
+    /// is confined along with system calls.
+    #[default]
+    Translator,
+    /// Run guest code natively and trap its system calls with Linux's syscall
+    /// user dispatch (`PR_SET_SYSCALL_USER_DISPATCH`, Linux 5.11+). Only
+    /// system calls are confined, and only from a guest that cooperates: guest
+    /// code that overwrites its thread's selector byte makes system calls the
+    /// kernel lets through. The guest's mask never blocks SIGSYS or
+    /// `SIGRTMAX` on the host, and the guest never receives `SIGRTMAX`, which
+    /// Chimera uses to stop its threads.
+    SyscallUserDispatch,
+}
+
+impl Backend {
+    /// The host protection for guest memory the guest maps or protects with
+    /// `prot`. The translator never executes guest pages in place — the
+    /// dispatcher reads them and runs translated blocks from the code cache —
+    /// so it enforces W^X by replacing `PROT_EXEC` with `PROT_READ`: a stray
+    /// native jump into guest code faults instead of running untranslated,
+    /// and the translator can still read the bytes (an execute-only mapping
+    /// would otherwise become `PROT_NONE`). Syscall user dispatch runs guest
+    /// pages natively, so they keep the protection the guest asked for.
+    fn host_prot(self, prot: libc::c_int) -> libc::c_int {
+        match self {
+            Backend::Translator if prot & libc::PROT_EXEC != 0 => {
+                (prot & !libc::PROT_EXEC) | libc::PROT_READ
+            }
+            _ => prot,
+        }
+    }
+}
+
 /// A sandboxed guest program, configured but not yet running.
 pub struct Sandbox {
     program: PathBuf,
@@ -72,6 +109,7 @@ pub struct Sandbox {
     envs: Option<Vec<(OsString, OsString)>>,
     handler: Box<dyn SystemCalls>,
     code_cache_size: usize,
+    backend: Backend,
 }
 
 impl Sandbox {
@@ -89,6 +127,7 @@ impl Sandbox {
             envs: None,
             handler: Box::new(Passthrough),
             code_cache_size: DEFAULT_CODE_CACHE_SIZE,
+            backend: Backend::default(),
         })
     }
 
@@ -129,6 +168,13 @@ impl Sandbox {
         self
     }
 
+    /// Choose the [`Backend`] that executes guest code. Replaces the default
+    /// [`Backend::Translator`].
+    pub fn backend(&mut self, backend: Backend) -> &mut Self {
+        self.backend = backend;
+        self
+    }
+
     /// Install a system-call handler. Replaces the default [`Passthrough`].
     pub fn system_calls<H: SystemCalls + 'static>(&mut self, handler: H) -> &mut Self {
         self.handler = Box::new(handler);
@@ -158,6 +204,7 @@ impl Sandbox {
             self.envs.as_deref(),
             handler,
             self.code_cache_size,
+            self.backend,
         )?;
         Ok(ExitStatus { code })
     }

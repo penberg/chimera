@@ -39,7 +39,14 @@ use std::{
     },
 };
 
-use crate::{SyscallResult, arch::dispatch::ThreadState};
+use crate::{
+    SyscallResult,
+    arch::{
+        dispatch::{EXIT_KIND_BLOCK, ThreadState},
+        x86::sud,
+    },
+    sys::mmap::host_page_size,
+};
 
 /// Number of signals (`SIGRTMAX`); signals are numbered `1..=NSIG`.
 const NSIG: usize = 64;
@@ -63,6 +70,11 @@ const SIGSTOP: u64 = 19;
 /// own self-modifying-code trap handler rather than mirroring the guest's.
 const SIGBUS: u64 = 7;
 const SIGSEGV: u64 = 11;
+
+/// SIGSEGV `si_code`s: nothing is mapped at the address, or the mapping does
+/// not permit the access.
+const SEGV_MAPERR: i32 = 1;
+const SEGV_ACCERR: i32 = 2;
 
 // Guest register-file indices (see `crate::arch::dispatch`). r8..r15 are 8..15.
 const RAX: usize = 0;
@@ -304,6 +316,17 @@ impl PendingSet {
         }
     }
 
+    /// Set `signo`'s captured `siginfo_t` for a signal Chimera raises itself.
+    fn set_captured(&self, signo: u32, info: &SigInfo) {
+        unsafe {
+            ptr::copy_nonoverlapping(
+                info as *const SigInfo as *const u8,
+                self.siginfo[signo as usize - 1].0.get() as *mut u8,
+                SIGINFO_SIZE,
+            );
+        }
+    }
+
     /// Copy the captured `siginfo_t` for `signo` out of its slot.
     fn captured(&self, signo: u32) -> SigInfo {
         let mut si: SigInfo = unsafe { mem::zeroed() };
@@ -399,10 +422,10 @@ impl PendingSet {
 /// signal to a thread with it unblocked (the guest's masks are mirrored onto
 /// the host) — so catching thread == owning thread, and only that thread's
 /// dispatch loop delivers it.
-extern "C" fn chimera_sigcatch(
+pub extern "C" fn chimera_sigcatch(
     signo: libc::c_int,
     info: *const libc::siginfo_t,
-    _uc: *mut libc::c_void,
+    uc: *mut libc::c_void,
 ) {
     if signo >= 1 && signo as usize <= NSIG {
         // Temporary diagnostic: raw, alloc-free trace of every SIGPWR catch
@@ -437,7 +460,40 @@ extern "C" fn chimera_sigcatch(
                 options(nostack, preserves_flags),
             );
         }
+
+        // Guest code running natively polls nothing, so it is stopped here.
+        sud::preempt(uc, EXIT_KIND_BLOCK);
     }
+}
+
+/// Host signals Chimera itself handles, whose host slot a guest disposition
+/// never takes over, as a bitmask of `1 << (signo - 1)`. The guest's
+/// disposition is still recorded and reported back.
+static RESERVED: AtomicU64 = AtomicU64::new(0);
+
+/// The reserved signals the host mask never blocks, whatever the guest's
+/// mask says. The guest's mask is still recorded and reported back. Any
+/// other reserved signal the guest blocks stays pending in the kernel, where
+/// the guest's `signalfd`, `rt_sigpending`, and `rt_sigtimedwait` see it.
+static UNBLOCKED: AtomicU64 = AtomicU64::new(0);
+
+/// Take `signo`'s host disposition away from the guest: the guest's
+/// disposition is no longer installed on the host.
+pub fn reserve_host_handler(signo: libc::c_int) {
+    RESERVED.fetch_or(1 << (signo - 1), Ordering::Relaxed);
+}
+
+/// [`reserve_host_handler`], and also keep `signo` out of the host mask, for
+/// a signal Chimera must receive even while the guest blocks it.
+pub fn reserve_host_signal(signo: libc::c_int) {
+    reserve_host_handler(signo);
+    UNBLOCKED.fetch_or(1 << (signo - 1), Ordering::Relaxed);
+}
+
+/// Undo [`reserve_host_handler`] or [`reserve_host_signal`].
+pub fn release_host_signal(signo: libc::c_int) {
+    RESERVED.fetch_and(!(1 << (signo - 1)), Ordering::Relaxed);
+    UNBLOCKED.fetch_and(!(1 << (signo - 1)), Ordering::Relaxed);
 }
 
 /// Build a host `sigset_t` holding the signals set in the `mask` bitmask.
@@ -461,7 +517,7 @@ fn host_sigset(mask: u64) -> libc::sigset_t {
 /// must be held pending rather than acted on — so a mask emulated only in
 /// software gets those cases wrong.
 fn mirror_host_blocked(mask: u64) {
-    let set = host_sigset(mask);
+    let set = host_sigset(mask & !UNBLOCKED.load(Ordering::Relaxed));
     unsafe {
         libc::pthread_sigmask(libc::SIG_SETMASK, &set, ptr::null_mut());
     }
@@ -646,7 +702,10 @@ fn install_host(signo: usize, handler: u64) {
     // traps. The guest's disposition for them is still recorded in the table
     // above (so it is reported back and can be honored once guest-fault delivery
     // exists), but it is never installed on the host slot.
-    if signo == SIGSEGV as usize || signo == SIGBUS as usize {
+    if signo == SIGSEGV as usize
+        || signo == SIGBUS as usize
+        || RESERVED.load(Ordering::Relaxed) & (1 << (signo - 1)) != 0
+    {
         return;
     }
     let (host, flags) = match handler {
@@ -662,6 +721,10 @@ fn install_host(signo: usize, handler: u64) {
         sa.sa_sigaction = host;
         sa.sa_flags = flags;
         libc::sigemptyset(&mut sa.sa_mask);
+        if sud::active() {
+            sa.sa_flags |= libc::SA_ONSTACK;
+            libc::sigfillset(&mut sa.sa_mask);
+        }
         libc::sigaction(signo as i32, &sa, ptr::null_mut());
     }
 }
@@ -1052,6 +1115,25 @@ impl Signals {
                 install_host(i + 1, SIG_DFL);
             }
         }
+    }
+
+    /// Deliver the SIGSEGV of a guest instruction fetch at `state.rip` that
+    /// faults, with the `siginfo_t` the kernel gives it: the address in
+    /// `si_addr`, and `SEGV_MAPERR` if no page is mapped there or
+    /// `SEGV_ACCERR` if one is.
+    pub fn deliver_fetch_fault(&mut self, state: &mut ThreadState, restart: Option<(u64, u64)>) {
+        let addr = state.rip;
+        let page = addr & !(host_page_size() as u64 - 1);
+        let mut residency = 0u8;
+        let mapped = unsafe { libc::mincore(page as *mut libc::c_void, 1, &mut residency) } == 0;
+        let mut info: SigInfo = unsafe { mem::zeroed() };
+        info.si_signo = SIGSEGV as i32;
+        info.si_code = if mapped { SEGV_ACCERR } else { SEGV_MAPERR };
+        // `si_addr` opens the union, at byte 16.
+        info._pad[1] = addr as i32;
+        info._pad[2] = (addr >> 32) as i32;
+        self.pending.set_captured(SIGSEGV as u32, &info);
+        self.deliver(state, SIGSEGV as u32, restart);
     }
 
     /// Build a signal frame on the guest stack and redirect `state` to the
