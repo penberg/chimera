@@ -77,7 +77,11 @@ pub enum Backend {
     /// user dispatch (`PR_SET_SYSCALL_USER_DISPATCH`, Linux 5.11+). Only
     /// system calls are confined, and only from a guest that cooperates: guest
     /// code that overwrites its thread's selector byte makes system calls the
-    /// kernel lets through. The guest's mask never blocks SIGSYS or
+    /// kernel lets through. Where the host allows a mapping at address 0
+    /// (`vm.mmap_min_addr` of 0, or `CAP_SYS_RAWIO`) and has protection keys,
+    /// a `syscall` instruction that traps is rewritten in place to call into
+    /// Chimera directly, so later system calls from it raise no signal. The
+    /// guest's mask never blocks SIGSYS or
     /// `SIGRTMAX` on the host, and the guest never receives `SIGRTMAX`, which
     /// Chimera uses to stop its threads.
     SyscallUserDispatch,
@@ -110,6 +114,7 @@ pub struct Sandbox {
     handler: Box<dyn SystemCalls>,
     code_cache_size: usize,
     backend: Backend,
+    strict_null: bool,
 }
 
 impl Sandbox {
@@ -128,6 +133,7 @@ impl Sandbox {
             handler: Box::new(Passthrough),
             code_cache_size: DEFAULT_CODE_CACHE_SIZE,
             backend: Backend::default(),
+            strict_null: true,
         })
     }
 
@@ -175,6 +181,18 @@ impl Sandbox {
         self
     }
 
+    /// Whether a load through a null pointer must fault, as it does natively.
+    /// The default, `true`, lets [`Backend::SyscallUserDispatch`] rewrite
+    /// trapped system calls only on a host with protection keys; `false` lets
+    /// it rewrite on any host that allows a mapping at address 0, where the
+    /// guest and the kernel can then read that mapping through a null
+    /// pointer. Intended for measuring the rewrite where protection keys are
+    /// missing, not for running guests faithfully.
+    pub fn strict_null(&mut self, strict: bool) -> &mut Self {
+        self.strict_null = strict;
+        self
+    }
+
     /// Install a system-call handler. Replaces the default [`Passthrough`].
     pub fn system_calls<H: SystemCalls + 'static>(&mut self, handler: H) -> &mut Self {
         self.handler = Box::new(handler);
@@ -205,6 +223,7 @@ impl Sandbox {
             handler,
             self.code_cache_size,
             self.backend,
+            self.strict_null,
         )?;
         Ok(ExitStatus { code })
     }

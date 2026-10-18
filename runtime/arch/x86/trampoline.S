@@ -302,5 +302,20 @@ guarded_copy_fault:
     xor eax, eax
     ret
 .size guarded_copy, . - guarded_copy
+// fn guarded_cmpxchg16(dst: *mut u8 /* rdi */, old: u16 /* si */,
+//                      new: u16 /* dx */) -> i64
+//
+// Atomically replace the 16-bit word at unvalidated guest address `dst` with
+// `new` if it holds `old`. It lies inside the `guarded_copy` span, so a fault
+// returns 0 through `guarded_copy_fault`. Returns 1 if it stored `new`.
+.globl guarded_cmpxchg16
+.type guarded_cmpxchg16, @function
+guarded_cmpxchg16:
+    mov eax, esi
+    lock cmpxchg word ptr [rdi], dx
+    sete al
+    movzx eax, al
+    ret
+.size guarded_cmpxchg16, . - guarded_cmpxchg16
 .globl guarded_copy_end
 guarded_copy_end:

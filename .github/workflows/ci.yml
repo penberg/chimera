@@ -44,3 +44,14 @@ jobs:
         # regression that breaks syscall user dispatch also fails the probe,
         # which would quietly drop the backend instead of failing the job.
         run: make conformance BACKENDS="dbt sud"
+
+      - name: conformance (sud, rewritten system calls)
+        if: runner.os == 'Linux'
+        # Syscall user dispatch rewrites trapped `syscall` instructions only
+        # where Chimera can map address 0, which the stock mmap_min_addr
+        # forbids, so the step above covers the signal path alone. A
+        # container (`make ci`) cannot lower it and reruns that path.
+        run: |
+          sudo sysctl -w vm.mmap_min_addr=0 || true
+          cargo test -p chimera-runtime --test sud-rewrite --locked
+          make conformance BACKENDS=sud

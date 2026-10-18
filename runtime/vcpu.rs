@@ -47,6 +47,6 @@ pub trait Vcpu: Send {
 pub fn create(backend: Backend, process: Arc<Process>) -> Box<dyn Vcpu> {
     match backend {
         Backend::Translator => Box::new(crate::arch::dispatch::Translator::new(process)),
-        Backend::SyscallUserDispatch => Box::new(SyscallUserDispatch::new()),
+        Backend::SyscallUserDispatch => Box::new(SyscallUserDispatch::new(process)),
     }
 }

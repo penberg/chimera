@@ -220,6 +220,9 @@ pub struct ThreadState {
     /// to Chimera. A runtime signal handler that finds it set has interrupted
     /// guest code and must leave through the native vcpu's exit path.
     pub sud_in_guest: u8,
+    /// Address of the native vcpu's hook for rewritten system calls, which
+    /// the page-0 trampoline jumps to through `gs:[]` ([`super::sud`]).
+    pub sud_hook: u64,
 }
 
 // XSAVE/XRSTOR #GP unless the save area is 64-byte aligned. The struct's
@@ -259,6 +262,7 @@ impl ThreadState {
             riprel_scratch: 0,
             sud_selector: 0,
             sud_in_guest: 0,
+            sud_hook: 0,
         })
     }
 
@@ -358,6 +362,7 @@ impl ThreadState {
             riprel_scratch: 0,
             sud_selector: 0,
             sud_in_guest: 0,
+            sud_hook: 0,
         });
         child.regs[RAX] = 0;
         child.regs[RSP] = child_stack;
@@ -378,6 +383,7 @@ pub fn current_fs_base() -> u64 {
 }
 
 pub const RAX: usize = 0;
+pub const RCX: usize = 2;
 pub const RDX: usize = 3;
 pub const RSI: usize = 4;
 pub const RDI: usize = 5;
@@ -385,3 +391,4 @@ pub const RSP: usize = 7;
 pub const R8: usize = 8;
 pub const R9: usize = 9;
 pub const R10: usize = 10;
+pub const R11: usize = 11;

@@ -204,7 +204,7 @@ mod host {
 
     use super::{SyscallResult, SystemCall, SystemCalls, host_syscall};
     use crate::{
-        arch::dispatch::RSP,
+        arch::{dispatch::RSP, x86::sud},
         sys::{
             linux::{
                 exec::{exec_errno, prepare_exec},
@@ -214,10 +214,14 @@ mod host {
         },
     };
 
-    fn overlaps_code_cache(thread: &Thread, start: u64, len: u64) -> bool {
-        thread
-            .addr_space()
-            .code_contains_range(start as usize, len as usize)
+    /// Whether `[start, start+len)` overlaps memory Chimera keeps for itself
+    /// in the guest's address space: the code cache, or the page-0 trampoline
+    /// of rewritten system calls.
+    fn overlaps_runtime(thread: &Thread, start: u64, len: u64) -> bool {
+        sud::trampoline_overlaps(start, len)
+            || thread
+                .addr_space()
+                .code_contains_range(start as usize, len as usize)
     }
 
     /// Drive one guest syscall. Runtime-owned syscalls are serviced inline
@@ -323,7 +327,7 @@ mod host {
                 call.args[2] = thread.process().backend.host_prot(prot) as u64;
                 let flags = call.args[3] as libc::c_int;
                 if flags & (libc::MAP_FIXED | libc::MAP_FIXED_NOREPLACE) != 0
-                    && overlaps_code_cache(thread, call.args[0], call.args[1])
+                    && overlaps_runtime(thread, call.args[0], call.args[1])
                 {
                     call.set_result(SyscallResult::Error(libc::EPERM));
                     handler.post_syscall(call);
@@ -338,9 +342,10 @@ mod host {
                 {
                     call.args[4] = host_fd as u64;
                 }
+                let replacing = (flags & libc::MAP_FIXED != 0).then(|| thread.addr_space());
                 let result = host_syscall(call);
                 if let SyscallResult::Ok(addr) = result {
-                    let mut space = thread.addr_space();
+                    let mut space = replacing.unwrap_or_else(|| thread.addr_space());
                     space.add_region(addr as usize, call.args[1] as usize);
                     // Reset SMC bookkeeping for the (possibly reused) addresses,
                     // so the new mapping arms from a clean slate.
@@ -349,7 +354,7 @@ mod host {
                 call.set_result(result);
             }
             libc::SYS_mprotect | libc::SYS_pkey_mprotect => {
-                if overlaps_code_cache(thread, call.args[0], call.args[1]) {
+                if overlaps_runtime(thread, call.args[0], call.args[1]) {
                     call.set_result(SyscallResult::Error(libc::EPERM));
                     handler.post_syscall(call);
                     return;
@@ -359,35 +364,34 @@ mod host {
                 // back to the embedder so it can keep policing the host process.
                 let prot = call.args[2] as libc::c_int;
                 call.args[2] = thread.process().backend.host_prot(prot) as u64;
-                if thread
-                    .addr_space()
-                    .contains_region(call.args[0] as usize, call.args[1] as usize)
-                {
+                let (start, len) = (call.args[0] as usize, call.args[1] as usize);
+                let mut space = thread.addr_space();
+                if space.contains_region(start, len) {
                     call.set_result(host_syscall(call));
                 } else {
+                    drop(space);
                     handler.do_syscall(call);
+                    space = thread.addr_space();
                 }
                 // A protection change resets the host page (un-arming it) and may
                 // precede a rewrite of code on a W^X-toggled JIT page, so drop the
                 // affected pages' stale translations.
                 if call.return_value() >= 0 {
-                    thread
-                        .addr_space()
-                        .note_prot(call.args[0] as usize, call.args[1] as usize);
+                    space.note_prot(start, len);
                 }
             }
             libc::SYS_pkey_alloc | libc::SYS_pkey_free => {
                 call.set_result(SyscallResult::Error(libc::EPERM));
             }
             libc::SYS_munmap => {
-                if overlaps_code_cache(thread, call.args[0], call.args[1]) {
+                if overlaps_runtime(thread, call.args[0], call.args[1]) {
                     call.set_result(SyscallResult::Error(libc::EPERM));
                     handler.post_syscall(call);
                     return;
                 }
+                let mut space = thread.addr_space();
                 let result = host_syscall(call);
                 if matches!(result, SyscallResult::Ok(_)) {
-                    let mut space = thread.addr_space();
                     space.remove_region(call.args[0] as usize, call.args[1] as usize);
                     space.note_unmap(call.args[0] as usize, call.args[1] as usize);
                 }
@@ -395,14 +399,15 @@ mod host {
             }
             libc::SYS_mremap => {
                 let flags = call.args[3] as libc::c_int;
-                if overlaps_code_cache(thread, call.args[0], call.args[1])
+                if overlaps_runtime(thread, call.args[0], call.args[1])
                     || (flags & libc::MREMAP_FIXED != 0
-                        && overlaps_code_cache(thread, call.args[4], call.args[2]))
+                        && overlaps_runtime(thread, call.args[4], call.args[2]))
                 {
                     call.set_result(SyscallResult::Error(libc::EPERM));
                     handler.post_syscall(call);
                     return;
                 }
+                let mut space = thread.addr_space();
                 let result = host_syscall(call);
                 if let SyscallResult::Ok(new_start) = result {
                     let flags = call.args[3] as libc::c_int;
@@ -410,7 +415,6 @@ mod host {
                     let old_start = call.args[0] as usize;
                     let old_len = call.args[1] as usize;
                     let new_len = call.args[2] as usize;
-                    let mut space = thread.addr_space();
                     space.remap_region(old_start, old_len, new_start as usize, new_len, dontunmap);
                     // The bytes moved: drop translations at the old addresses
                     // (unless kept by MREMAP_DONTUNMAP) and at the new ones, which

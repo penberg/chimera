@@ -62,7 +62,12 @@ pub struct Process {
     /// space, so cache insertion and region bookkeeping must be serialized. The
     /// lock is held only across a translation, a lookup, or a region update —
     /// never across `dispatch()` or a blocking host syscall, so a thread
-    /// running guest code or parked in the kernel never holds it.
+    /// running guest code or parked in the kernel never holds it. A guest
+    /// `mprotect`, `munmap`, `mremap`, or `MAP_FIXED` `mmap` holds it across
+    /// the host call as well, because rewriting a system call site changes
+    /// the protection of the site's page and puts it back (see
+    /// `sud::SyscallUserDispatch`), and a mapping change landing in between
+    /// would be undone.
     pub addr_space: Mutex<AddressSpace>,
     /// The embedder's system-call handler, shared by every thread of the
     /// process. `SystemCalls` is `Send + Sync` and dispatched by `&self`
@@ -122,6 +127,8 @@ pub struct Process {
     exec_request: Mutex<Option<PreparedExec>>,
     /// How every thread of the process executes guest code.
     pub backend: Backend,
+    /// See [`crate::Sandbox::strict_null`].
+    pub strict_null: bool,
 }
 
 impl Process {
@@ -129,6 +136,7 @@ impl Process {
         handler: Box<dyn SystemCalls>,
         code_cache_size: usize,
         backend: Backend,
+        strict_null: bool,
     ) -> Result<Self, Error> {
         INSTALL_INTERRUPT.call_once(install_interrupt_handler);
         // Own the host SIGSEGV/SIGBUS slot so self-modifying-code write traps are
@@ -146,6 +154,7 @@ impl Process {
             execing: AtomicBool::new(false),
             exec_request: Mutex::new(None),
             backend,
+            strict_null,
         })
     }
 
