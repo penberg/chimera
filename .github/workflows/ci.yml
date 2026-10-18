@@ -40,4 +40,7 @@ jobs:
 
       - name: conformance
         if: runner.os == 'Linux'
-        run: make conformance
+        # Name the backends rather than let the Makefile probe for them: a
+        # regression that breaks syscall user dispatch also fails the probe,
+        # which would quietly drop the backend instead of failing the job.
+        run: make conformance BACKENDS="dbt sud"
