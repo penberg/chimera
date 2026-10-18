@@ -24,24 +24,74 @@
 //! never builds its frame on the guest's stack: the guest's stack pointer may
 //! sit just above a guard page or not point at a stack at all. The translator
 //! sets no alternate stack, so there the flag changes nothing.
+//!
+//! A SIGSYS and the `sigreturn` after it cost far more than the system call
+//! they stop. The vcpu therefore follows lazypoline: the first time a
+//! `syscall` instruction traps, it rewrites the instruction in place into the
+//! 2-byte `call rax`, the substitution zpoline makes ahead of time. `rax`
+//! holds the system call number, so a rewritten site calls into the first
+//! page of memory, which Chimera fills with single-byte `nop`s that slide
+//! into a jump to `chimera_sud_hook`. The hook leaves the guest the way the
+//! SIGSYS handler does, and the run loop sees the same `Exit::Syscall`, but
+//! without entering the kernel. Only sites that really trapped are ever
+//! rewritten, so the rewrite never needs to disassemble anything, and a site
+//! that is never rewritten, in code generated later or on a page that cannot
+//! be patched, still traps. The `call` stores its return address 8 bytes
+//! below the guest's stack pointer, inside the 128-byte red zone a leaf
+//! function may keep data in; `syscall` writes no memory at all.
+//!
+//! Rewriting depends on two things the host may not offer: a mapping at
+//! address 0, which needs `vm.mmap_min_addr` at 0 or `CAP_SYS_RAWIO`, and a
+//! protection key. The key makes the trampoline execute-only, so the guest's
+//! loads and stores through a null pointer fault as they do natively, and so
+//! do the kernel's accesses on its behalf, which fail with `EFAULT`. A host
+//! without either runs every system call through SIGSYS, unless the embedder
+//! gives up strict null faults (`Sandbox::strict_null`): then a trampoline
+//! without a key is mapped anyway, and a load through a null pointer reads
+//! `nop`s, as does the kernel, so `write(fd, NULL, n)` succeeds. Stores still
+//! fault, since the trampoline is never writable. Executing through a
+//! null pointer still reaches the trampoline, so the run loop accepts a call
+//! into it only from a site it rewrote and reports anything else as the fetch
+//! fault it is natively.
+//!
+//! References:
+//! - Adriaan Jacobs, Merve Gülmez, Alicia Andries, Stijn Volckaert, and
+//!   Alexios Voulimeneas. "System Call Interposition Without Compromise."
+//!   *DSN '24*.
+//! - Kenichi Yasukata, Hajime Tazaki, Pierre-Louis Aublin, and Kenta
+//!   Ishiguro. "zpoline: a system call hook mechanism based on binary
+//!   rewriting." *USENIX ATC '23*.
 
 use std::{
     arch::{asm, global_asm},
+    fs,
     mem::{self, offset_of},
     ptr,
     sync::{
-        Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicI32, Ordering},
     },
 };
 
+use iced_x86::{Code, Decoder, DecoderOptions, OpKind, Register};
+
 use crate::{
-    Error, process,
-    sys::linux::signal,
+    Error,
+    process::{self, Process},
+    sys::{
+        linux::signal,
+        mmap::{copy_from_guest, host_page_size},
+    },
     vcpu::{Exit, Vcpu},
 };
 
-use super::dispatch::{EXIT_KIND_BLOCK, EXIT_KIND_SYSCALL, EXIT_KIND_TRAP, ThreadState};
+use super::{
+    dispatch::{
+        EXIT_KIND_BLOCK, EXIT_KIND_SYSCALL, EXIT_KIND_TRAP, R11, RAX, RCX, RSP, ThreadState,
+    },
+    trampoline::guarded_cmpxchg16,
+    translate::{PKEY_DISABLE_ACCESS, read_pkru, write_pkru},
+};
 
 /// `prctl` option and modes (`<linux/prctl.h>`).
 const PR_SET_SYSCALL_USER_DISPATCH: libc::c_int = 59;
@@ -66,6 +116,29 @@ const FP_SW_BYTES: usize = 464;
 /// `exit_kind` of native guest code that branched to an address it cannot
 /// fetch. Raised by the SIGSEGV/SIGBUS handler.
 pub const EXIT_KIND_FETCH_FAULT: u64 = 3;
+
+/// `exit_kind` of native guest code that called into the trampoline, as a
+/// rewritten system call does. Raised by `chimera_sud_hook`.
+const EXIT_KIND_REWRITTEN: u64 = 4;
+
+/// `syscall`, and the `call rax` a trapped one is rewritten into.
+const SYSCALL: u16 = u16::from_le_bytes([0x0f, 0x05]);
+const CALL_RAX: u16 = u16::from_le_bytes([0xff, 0xd0]);
+
+/// Size of the trampoline at address 0. It ends in an 8-byte
+/// `jmp qword ptr gs:[sud_hook]`, so a rewritten site whose number lands in
+/// those last bytes runs the middle of the jump; no system call number comes
+/// near them. A number past the trampoline faults on the fetch, and the run
+/// loop recognizes the call.
+const TRAMPOLINE_SIZE: usize = 4096;
+const TRAMPOLINE_JUMP_LEN: usize = 8;
+
+/// The trampoline's state: [`NO_TRAMPOLINE`], [`NO_PKEY`] for one the guest
+/// can read, or the protection key that makes it execute-only.
+static TRAMPOLINE: AtomicI32 = AtomicI32::new(NO_TRAMPOLINE);
+const NO_TRAMPOLINE: i32 = -2;
+/// `pkey_mprotect`'s key for a mapping with no key of its own.
+const NO_PKEY: i32 = -1;
 
 /// Size of the alternate stack the SIGSYS handler runs on.
 const ALT_STACK_SIZE: usize = 64 * 1024;
@@ -143,6 +216,7 @@ global_asm!(
     TS_SUD_SELECTOR   = const offset_of!(ThreadState, sud_selector),
     TS_SUD_IN_GUEST   = const offset_of!(ThreadState, sud_in_guest),
     EXIT_KIND_BLOCK   = const EXIT_KIND_BLOCK,
+    EXIT_KIND_REWRITTEN = const EXIT_KIND_REWRITTEN,
 );
 
 unsafe extern "C" {
@@ -150,10 +224,20 @@ unsafe extern "C" {
     fn chimera_sud_enter_window();
     fn chimera_sud_enter_end();
     fn chimera_sud_exit();
+    fn chimera_sud_hook();
+    fn chimera_sud_hook_leave();
+    fn chimera_sud_hook_fs_saved();
+    fn chimera_sud_hook_left();
 }
 
 /// A [`Vcpu`] that runs guest code natively under syscall user dispatch.
+///
+/// Rewriting a site holds the process's address-space lock across reading
+/// the site's mapping, making its page writable, and putting the protection
+/// back, and the guest's own mapping changes hold the same lock, so none of
+/// them lands in between.
 pub struct SyscallUserDispatch {
+    process: Arc<Process>,
     /// The SIGSYS handler's alternate stack, mapped on first attach.
     alt_stack: *mut libc::c_void,
     /// The alternate stack the host thread had before the first attach,
@@ -167,8 +251,9 @@ pub struct SyscallUserDispatch {
 unsafe impl Send for SyscallUserDispatch {}
 
 impl SyscallUserDispatch {
-    pub fn new() -> Self {
+    pub fn new(process: Arc<Process>) -> Self {
         Self {
+            process,
             alt_stack: ptr::null_mut(),
             prev_alt_stack: unsafe { mem::zeroed() },
             armed_tid: 0,
@@ -234,7 +319,7 @@ impl Vcpu for SyscallUserDispatch {
         // handlers are in place.
         let tid = unsafe { libc::gettid() };
         if self.armed_tid == 0 {
-            install_handlers();
+            install_handlers(self.process.strict_null);
         } else if self.armed_tid != tid {
             // A fork child attaching again: the parent's other threads, and
             // their vcpus, do not exist here.
@@ -243,17 +328,280 @@ impl Vcpu for SyscallUserDispatch {
             }
         }
         self.armed_tid = tid;
+        state.sud_hook = chimera_sud_hook as *const () as u64;
+        let pkey = TRAMPOLINE.load(Ordering::Relaxed);
+        if pkey >= 0 {
+            write_pkru(read_pkru() | PKEY_DISABLE_ACCESS << (pkey * 2));
+        }
         Ok(())
     }
 
     fn run(&mut self, state: &mut ThreadState) -> Exit {
         unsafe { chimera_sud_enter(state) };
         match state.exit_kind {
-            EXIT_KIND_SYSCALL => Exit::Syscall,
+            EXIT_KIND_SYSCALL => {
+                self.rewrite(state.rip.wrapping_sub(2));
+                Exit::Syscall
+            }
+            EXIT_KIND_REWRITTEN => match self.rewritten_return(state) {
+                Some(next) => complete_rewritten(state, next),
+                None => {
+                    state.rip = stray_target(state);
+                    Exit::FetchFault
+                }
+            },
             EXIT_KIND_TRAP => Exit::Breakpoint,
-            EXIT_KIND_FETCH_FAULT => Exit::FetchFault,
-            _ => Exit::Safepoint,
+            EXIT_KIND_FETCH_FAULT => {
+                // A rewritten site whose number lies past the trampoline
+                // jumps to the number itself.
+                match self.rewritten_return(state) {
+                    Some(next) if state.rip == state.regs[RAX] => complete_rewritten(state, next),
+                    _ => Exit::FetchFault,
+                }
+            }
+            _ => {
+                // A signal that stopped a rewritten system call on its way
+                // to the hook, which changes no register, finds it still at
+                // its site, as it would natively.
+                let hook = chimera_sud_hook as *const () as u64
+                    ..chimera_sud_hook_leave as *const () as u64;
+                if (state.rip < TRAMPOLINE_SIZE as u64 || hook.contains(&state.rip))
+                    && let Some(next) = self.rewritten_return(state)
+                {
+                    state.rip = next - 2;
+                    state.regs[RSP] += 8;
+                }
+                Exit::Safepoint
+            }
         }
+    }
+}
+
+impl SyscallUserDispatch {
+    /// Rewrite the `syscall` at `site`, which has just trapped, into a call
+    /// through the trampoline. Only a site in a private mapping that is
+    /// readable and executable but not writable is rewritten: a writable one
+    /// may be code the guest is still generating, and a shared one would
+    /// carry the rewrite into the file or into other processes. A site
+    /// straddling a cache line is left alone, since the 2-byte store would not
+    /// be atomic for another thread executing it.
+    fn rewrite(&self, site: u64) {
+        if TRAMPOLINE.load(Ordering::Relaxed) == NO_TRAMPOLINE || site % 64 == 63 {
+            return;
+        }
+        let mut space = self.process.addr_space.lock().unwrap();
+        if space.syscall_site(site).is_some() {
+            return;
+        }
+        let page_size = host_page_size() as u64;
+        let page = (site & !(page_size - 1)) as *mut libc::c_void;
+        let text = libc::PROT_READ | libc::PROT_EXEC;
+        let rewritten = rewritable(site)
+            && unsafe { libc::mprotect(page, page_size as usize, text | libc::PROT_WRITE) } == 0
+            && {
+                let stored = unsafe { guarded_cmpxchg16(site as *mut u8, SYSCALL, CALL_RAX) } != 0;
+                unsafe { libc::mprotect(page, page_size as usize, text) };
+                stored
+            };
+        space.record_syscall_site(site, rewritten);
+    }
+
+    /// The return address on top of the guest's stack, if it is that of a
+    /// site Chimera rewrote.
+    fn rewritten_return(&self, state: &ThreadState) -> Option<u64> {
+        let mut ret = [0; 8];
+        if !copy_from_guest(state.regs[RSP], &mut ret) {
+            return None;
+        }
+        let next = u64::from_le_bytes(ret);
+        let site = next.wrapping_sub(2);
+        let space = self.process.addr_space.lock().unwrap();
+        (space.syscall_site(site) == Some(true)).then_some(next)
+    }
+}
+
+/// Finish a system call made through a rewritten site: pop the return
+/// address `next` and leave the register file as `syscall` at the site would
+/// have, with `rcx` and `r11` holding the return address and `rflags`.
+fn complete_rewritten(state: &mut ThreadState, next: u64) -> Exit {
+    state.rip = next;
+    state.regs[RSP] += 8;
+    state.regs[RCX] = next;
+    state.regs[R11] = state.rflags;
+    Exit::Syscall
+}
+
+/// Where guest code that entered the trampoline other than from a rewritten
+/// site was headed, which natively is where its fetch faults. The slide loses
+/// the entry point, so it is recovered from the indirect call whose return
+/// address is on the stack: a call through a null function pointer, say. A
+/// jump leaves no such trace and is reported at address 0.
+fn stray_target(state: &ThreadState) -> u64 {
+    let rsp = state.regs[RSP];
+    let mut ret = [0; 8];
+    if !copy_from_guest(rsp, &mut ret) {
+        return 0;
+    }
+    let ret = u64::from_le_bytes(ret);
+    let value = |reg: Register, _, _| -> Option<u64> {
+        let full = reg.full_register();
+        let value = match full {
+            Register::RAX => state.regs[0],
+            Register::RBX => state.regs[1],
+            Register::RCX => state.regs[2],
+            Register::RDX => state.regs[3],
+            Register::RSI => state.regs[4],
+            Register::RDI => state.regs[5],
+            Register::RBP => state.regs[6],
+            // The call has since pushed its return address.
+            Register::RSP => rsp + 8,
+            Register::R8 => state.regs[8],
+            Register::R9 => state.regs[9],
+            Register::R10 => state.regs[10],
+            Register::R11 => state.regs[11],
+            Register::R12 => state.regs[12],
+            Register::R13 => state.regs[13],
+            Register::R14 => state.regs[14],
+            Register::R15 => state.regs[15],
+            Register::FS => state.guest_fs_base,
+            Register::ES | Register::CS | Register::SS | Register::DS => 0,
+            _ => return None,
+        };
+        Some(if reg.size() == 4 {
+            value as u32 as u64
+        } else {
+            value
+        })
+    };
+    // An indirect call is at most 2 prefixes, opcode, ModRM, SIB, and a
+    // 32-bit displacement.
+    for len in 2..=10 {
+        let start = ret.wrapping_sub(len as u64);
+        let mut bytes = [0; 10];
+        if !copy_from_guest(start, &mut bytes[..len]) {
+            continue;
+        }
+        let call = Decoder::with_ip(64, &bytes[..len], start, DecoderOptions::NONE).decode();
+        if call.code() != Code::Call_rm64 || call.len() != len {
+            continue;
+        }
+        let target = match call.op0_kind() {
+            OpKind::Register => value(call.op0_register(), 0, 0),
+            _ => call.virtual_address(0, 0, value).and_then(|addr| {
+                let mut target = [0; 8];
+                copy_from_guest(addr, &mut target).then(|| u64::from_le_bytes(target))
+            }),
+        };
+        if let Some(target) = target.filter(|&target| target < TRAMPOLINE_SIZE as u64) {
+            return target;
+        }
+    }
+    0
+}
+
+/// Whether the mapping holding `site` may be rewritten (see
+/// [`SyscallUserDispatch::rewrite`]). Pseudo-mappings such as `[vdso]` are
+/// the kernel's and are left alone.
+fn rewritable(site: u64) -> bool {
+    let Ok(maps) = fs::read_to_string("/proc/self/maps") else {
+        return false;
+    };
+    for line in maps.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Some((lo, hi)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) else {
+            continue;
+        };
+        if (lo..hi).contains(&site) {
+            let path = fields.nth(3).unwrap_or("");
+            return perms == "r-xp" && !path.starts_with('[');
+        }
+    }
+    false
+}
+
+/// Whether `[start, start+len)` overlaps the trampoline, which the guest must
+/// not map over, unmap, or reprotect. A guest running natively without
+/// `CAP_SYS_RAWIO` could not map anything there on a stock host either.
+pub fn trampoline_overlaps(start: u64, len: u64) -> bool {
+    TRAMPOLINE.load(Ordering::Relaxed) != NO_TRAMPOLINE && len > 0 && start < TRAMPOLINE_SIZE as u64
+}
+
+/// Map the trampoline at address 0, if the host allows a mapping there and
+/// has a protection key to make it execute-only, or, without `strict_null`,
+/// readable. Every byte is a `nop` except the jump at the end, which reaches
+/// the hook through `gs`: a jump that read its target from the trampoline
+/// would be a load from it, which the key forbids, and one through a
+/// register would clobber a guest value.
+fn map_trampoline(strict_null: bool) {
+    let pkey = match unsafe { libc::syscall(libc::SYS_pkey_alloc, 0, PKEY_DISABLE_ACCESS) } {
+        pkey if pkey >= 0 => pkey as i32,
+        _ if strict_null => return,
+        _ => NO_PKEY,
+    };
+    let page = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            TRAMPOLINE_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    if !page.is_null() {
+        free_pkey(pkey);
+        return;
+    }
+    let mut code = [0x90u8; TRAMPOLINE_SIZE];
+    let disp = offset_of!(ThreadState, sud_hook) as u32;
+    let jump = &mut code[TRAMPOLINE_SIZE - TRAMPOLINE_JUMP_LEN..];
+    jump[..4].copy_from_slice(&[0x65, 0xff, 0x24, 0x25]);
+    jump[4..].copy_from_slice(&disp.to_le_bytes());
+    // Rust has no store through a null pointer, mapped or not.
+    unsafe {
+        asm!(
+            "rep movsb",
+            inout("rdi") 0usize => _,
+            inout("rsi") code.as_ptr() => _,
+            inout("rcx") TRAMPOLINE_SIZE => _,
+            options(nostack, preserves_flags),
+        );
+    }
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_pkey_mprotect,
+            0,
+            TRAMPOLINE_SIZE,
+            libc::PROT_READ | libc::PROT_EXEC,
+            pkey,
+        )
+    };
+    if ret != 0 {
+        unsafe { libc::munmap(ptr::null_mut(), TRAMPOLINE_SIZE) };
+        free_pkey(pkey);
+        return;
+    }
+    TRAMPOLINE.store(pkey, Ordering::Relaxed);
+}
+
+fn unmap_trampoline() {
+    let pkey = TRAMPOLINE.swap(NO_TRAMPOLINE, Ordering::Relaxed);
+    if pkey == NO_TRAMPOLINE {
+        return;
+    }
+    unsafe { libc::munmap(ptr::null_mut(), TRAMPOLINE_SIZE) };
+    free_pkey(pkey);
+}
+
+fn free_pkey(pkey: i32) {
+    if pkey != NO_PKEY {
+        unsafe { libc::syscall(libc::SYS_pkey_free, pkey) };
     }
 }
 
@@ -294,7 +642,10 @@ impl Drop for SyscallUserDispatch {
 /// mask: the only SIGTRAP forced on the guest is an `int3`'s, which kills a
 /// guest that blocks it natively too, and any other blocked SIGTRAP stays
 /// pending in the kernel for the guest's `signalfd`.
-fn install_handlers() {
+///
+/// The first attach also maps the trampoline, so a later sandbox running
+/// alongside shares the first one's `strict_null`.
+fn install_handlers(strict_null: bool) {
     let mut installed = INSTALLED.lock().unwrap();
     if let Some(installed) = installed.as_mut() {
         installed.attached += 1;
@@ -305,6 +656,7 @@ fn install_handlers() {
     signal::reserve_host_signal(libc::SIGSYS);
     signal::reserve_host_signal(process::interrupt_signal());
     process::install_interrupt_handler();
+    map_trampoline(strict_null);
     for (i, (signo, handler)) in HANDLED
         .into_iter()
         .zip([
@@ -340,6 +692,7 @@ fn uninstall_handlers() {
         signal::release_host_signal(signo);
     }
     signal::release_host_signal(process::interrupt_signal());
+    unmap_trampoline();
     ACTIVE.store(false, Ordering::Relaxed);
     *installed = None;
 }
@@ -424,10 +777,21 @@ pub fn preempt(ucontext: *mut libc::c_void, exit_kind: u64) -> bool {
         let rip = gregs[libc::REG_RIP as usize] as u64;
         let window =
             chimera_sud_enter_window as *const () as u64..chimera_sud_enter_end as *const () as u64;
+        let hook_tail =
+            chimera_sud_hook_leave as *const () as u64..chimera_sud_hook_left as *const () as u64;
         if window.contains(&rip) {
             // The entry was interrupted before the guest ran: the register
             // file still describes the guest.
             (*state).exit_kind = EXIT_KIND_BLOCK;
+        } else if hook_tail.contains(&rip) {
+            // The hook has saved everything but rflags and the FP state, and
+            // perhaps the FS base.
+            if rip < chimera_sud_hook_fs_saved as *const () as u64 {
+                (*state).guest_fs_base = guest_fs;
+            }
+            (*state).rflags = gregs[libc::REG_EFL as usize] as u64;
+            save_fpstate(uc.uc_mcontext.fpregs as *const u8, state);
+            (*state).exit_kind = EXIT_KIND_REWRITTEN;
         } else {
             let s = &raw mut *state;
             (*s).regs = [

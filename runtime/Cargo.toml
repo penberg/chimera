@@ -38,3 +38,8 @@ harness = false
 name = "sud-host-handlers"
 path = "tests/sud-host-handlers.rs"
 harness = false
+
+[[test]]
+name = "sud-rewrite"
+path = "tests/sud-rewrite.rs"
+harness = false

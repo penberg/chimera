@@ -69,6 +69,7 @@ unsafe extern "C" {
     fn chimera_fetch_copy_start();
     fn chimera_fetch_fixup();
     pub fn guarded_copy(dst: *mut u8, src: *const u8, len: usize) -> i64;
+    pub fn guarded_cmpxchg16(dst: *mut u8, old: u16, new: u16) -> i64;
     fn guarded_copy_fault();
     fn guarded_copy_end();
 }
@@ -94,8 +95,9 @@ pub fn fetch_copy_span() -> (usize, usize) {
     )
 }
 
-/// Whether `rip` lies inside [`guarded_copy`], so a fault taken there is a
-/// failed read of guest memory rather than a crash in Chimera.
+/// Whether `rip` lies inside [`guarded_copy`] or [`guarded_cmpxchg16`], so a
+/// fault taken there is a failed access to guest memory rather than a crash
+/// in Chimera.
 pub fn in_guarded_copy(rip: usize) -> bool {
     let lo = guarded_copy as *const () as usize;
     let hi = guarded_copy_end as *const () as usize;

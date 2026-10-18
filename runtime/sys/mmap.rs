@@ -2,7 +2,7 @@
 //! guest mappings Chimera owns on the host.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     io, ptr,
     sync::{
         OnceLock,
@@ -49,6 +49,14 @@ pub struct AddressSpace {
     /// does not allocate in the common case.
     granted: HashSet<usize>,
     program_break: Option<usize>,
+    /// Guest `syscall` instructions that trapped under syscall user dispatch,
+    /// by address: `true` for one rewritten into a call through the page-0
+    /// trampoline, `false` for one that cannot be. A site leaves the map when
+    /// its bytes go away with an unmap or a mapping placed over them. A
+    /// protection change keeps a rewritten site, whose bytes it leaves alone,
+    /// but drops a refused one, which may be eligible under the new
+    /// protection.
+    syscall_sites: BTreeMap<u64, bool>,
     /// The reservation the guest's virtualized `brk` lives in; see
     /// [`AddressSpace::init_program_break`].
     break_arena: Option<Region>,
@@ -64,6 +72,7 @@ impl AddressSpace {
             armed: HashSet::new(),
             granted,
             program_break: None,
+            syscall_sites: BTreeMap::new(),
             break_arena: None,
         })
     }
@@ -106,6 +115,7 @@ impl AddressSpace {
     /// skips re-protecting it, and a write to the new code never traps.
     pub fn note_map(&mut self, start: usize, len: usize) {
         self.invalidate_and_disarm(start, len);
+        self.forget_syscall_sites(start, len, |_| true);
     }
 
     /// A guest `mprotect` reset the host protection of `[start, start+len)`
@@ -115,6 +125,7 @@ impl AddressSpace {
     /// cleared.
     pub fn note_prot(&mut self, start: usize, len: usize) {
         self.invalidate_and_disarm(start, len);
+        self.forget_syscall_sites(start, len, |rewritten| !rewritten);
     }
 
     /// Forget a range the guest unmapped: drop its translations and disarm it.
@@ -122,6 +133,31 @@ impl AddressSpace {
     /// addresses starts clean.
     pub fn note_unmap(&mut self, start: usize, len: usize) {
         self.invalidate_and_disarm(start, len);
+        self.forget_syscall_sites(start, len, |_| true);
+    }
+
+    /// Whether the `syscall` instruction at `site` has been rewritten
+    /// (`Some(true)`), found ineligible (`Some(false)`), or not seen.
+    pub fn syscall_site(&self, site: u64) -> Option<bool> {
+        self.syscall_sites.get(&site).copied()
+    }
+
+    pub fn record_syscall_site(&mut self, site: u64, rewritten: bool) {
+        self.syscall_sites.insert(site, rewritten);
+    }
+
+    /// Drop the recorded sites in `[start, start+len)` that `forget` selects.
+    fn forget_syscall_sites(&mut self, start: usize, len: usize, forget: impl Fn(bool) -> bool) {
+        let (start, end) = (start as u64, start.saturating_add(len) as u64);
+        let doomed: Vec<u64> = self
+            .syscall_sites
+            .range(start..end)
+            .filter(|&(_, &rewritten)| forget(rewritten))
+            .map(|(&site, _)| site)
+            .collect();
+        for site in doomed {
+            self.syscall_sites.remove(&site);
+        }
     }
 
     /// Handle a write fault at host/guest address `addr` (they share the address
@@ -263,6 +299,7 @@ impl AddressSpace {
         self.code.reset();
         self.armed.clear();
         self.granted.clear();
+        self.syscall_sites.clear();
     }
 
     /// Reserve the guest's break arena and place the initial program break at

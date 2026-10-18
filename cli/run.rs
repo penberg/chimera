@@ -31,6 +31,19 @@ pub fn run(mut cmd: RunCmd) -> ExitCode {
             None => Backend::default(),
         },
     };
+    // `CHIMERA_SECURE=0` trades faithful null-pointer faults for rewritten
+    // system calls on a host without protection keys (`Sandbox::strict_null`).
+    let secure = match env::var_os("CHIMERA_SECURE").filter(|v| !v.is_empty()) {
+        None => true,
+        Some(value) => match value.to_str() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => {
+                eprintln!("chimera: CHIMERA_SECURE: expected `0` or `1`");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
     // Only a shell Chimera starts on its own gets a badged prompt; a program
     // the user named runs exactly as typed.
     let implicit_shell = cmd.argv.is_empty();
@@ -184,6 +197,7 @@ pub fn run(mut cmd: RunCmd) -> ExitCode {
         sandbox.code_cache_size(mib.saturating_mul(1024 * 1024));
     }
     sandbox.backend(backend);
+    sandbox.strict_null(secure);
 
     let personality = Personality::new(Namespace::with_root(root, MountFlags::NONE));
     sandbox.system_calls(personality);

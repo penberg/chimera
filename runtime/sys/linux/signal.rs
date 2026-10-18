@@ -1125,7 +1125,9 @@ impl Signals {
         let addr = state.rip;
         let page = addr & !(host_page_size() as u64 - 1);
         let mut residency = 0u8;
-        let mapped = unsafe { libc::mincore(page as *mut libc::c_void, 1, &mut residency) } == 0;
+        // Natively nothing is mapped where Chimera keeps its trampoline.
+        let mapped = !sud::trampoline_overlaps(page, 1)
+            && unsafe { libc::mincore(page as *mut libc::c_void, 1, &mut residency) } == 0;
         let mut info: SigInfo = unsafe { mem::zeroed() };
         info.si_signo = SIGSEGV as i32;
         info.si_code = if mapped { SEGV_ACCERR } else { SEGV_MAPERR };

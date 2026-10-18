@@ -39,6 +39,7 @@ pub fn execv(
     handler: Box<dyn SystemCalls>,
     code_cache_size: usize,
     backend: Backend,
+    strict_null: bool,
 ) -> Result<i32, Error> {
     // The first image's argv and envp come from the embedder: argv[0] is the
     // program path, then the supplied args; the environment is the explicit set
@@ -80,7 +81,12 @@ pub fn execv(
     // The process's shared state: the address space, code cache, and the
     // embedder's syscall handler. The first thread is created against it; future
     // `clone(CLONE_VM)` siblings will share clones of this `Arc`.
-    let process = Arc::new(Process::new(handler, code_cache_size, backend)?);
+    let process = Arc::new(Process::new(
+        handler,
+        code_cache_size,
+        backend,
+        strict_null,
+    )?);
     // Publish the process for the synchronous fault handler before any guest
     // code runs, so a self-modifying-code write trap can reach the address
     // space.

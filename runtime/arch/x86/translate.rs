@@ -51,7 +51,7 @@ const IB_HASH_MULT: u64 = 0x9e37_79b9_7f4a_7c15;
 /// canonical or not — so [`CodeCache::clear_ib_table`] additionally repairs
 /// the one slot the all-`0xff` key hashes to (see [`ib_unmatchable`]).
 const IB_EMPTY: u8 = 0xff;
-const PKEY_DISABLE_ACCESS: u32 = 0x1;
+pub const PKEY_DISABLE_ACCESS: u32 = 0x1;
 const PKEY_DISABLE_WRITE: u32 = 0x2;
 const PKEY_UNINIT: i32 = -1;
 const PKEY_ALLOCATING: i32 = -2;
@@ -478,7 +478,7 @@ fn set_pkey_write_disabled(pkey: i32, disabled: bool) {
     write_pkru(pkru);
 }
 
-fn read_pkru() -> u32 {
+pub fn read_pkru() -> u32 {
     let eax: u32;
     let edx: u32;
     unsafe {
@@ -493,7 +493,7 @@ fn read_pkru() -> u32 {
     ((edx as u64) << 32 | eax as u64) as u32
 }
 
-fn write_pkru(pkru: u32) {
+pub fn write_pkru(pkru: u32) {
     unsafe {
         asm!(
             "wrpkru",
